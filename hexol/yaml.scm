@@ -119,9 +119,9 @@ treated as a sequence."
      (display "- " port)
      (display (scalar->yaml item) port)
      (newline port))
-    ;; The codebase's `(key ((k . v) ...))` convention wraps a single
-    ;; map/scalar element in an extra list (cf. kernel `peel-list-wrap`);
-    ;; unwrap it so it renders as one sequence entry, not a nested dash.
+    ;; Defensive: a sequence item that is itself a one-element list (e.g.
+    ;; a hand-authored spec that double-wrapped a single map) renders as
+    ;; that one entry, not a nested dash.
     ((and (pair? item) (null? (cdr item)))
      (emit-seq-item port (car item) pad))
     (else                                  ; genuine nested sequence

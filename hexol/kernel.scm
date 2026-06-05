@@ -145,29 +145,18 @@ a list of (op . after-state) pairs in fire order."
 ;; Walk a nested state by a path of symbols (alist keys) and integers
 ;; (list indices). Returns #f if any step is missing.
 ;;
-;; Quasi-quoted resource alists like `(spec (rules (((host . X)))))`
-;; produce a one-extra-wrap around list values (because `(k v)` reads
-;; as a 2-list, not a dotted pair). When the next step is a list
-;; index, peel that wrap so users can write the intuitive path
-;; `(... rules 0 host)` instead of `(... rules 0 0 host)`.
-(define (peel-list-wrap x)
-  (if (and (pair? x) (null? (cdr x))
-           (pair? (car x))
-           (not (symbol? (car (car x)))))
-      (car x)
-      x))
-
+;; A symbol step looks the key up in an alist (a map); an integer step
+;; indexes into a list. List-valued fields are stored as a plain list of
+;; their elements, so `(... rules 0 host)` reads the host of the first
+;; rule with no special-casing.
 (define (path-get state path)
   "Walk STATE by PATH, a list of symbol alist-keys and integer list
-indices, returning the value found or #f if any step is missing.  Peels
-the extra list wrap produced by quasi-quoted resource alists before
-indexing."
+indices, returning the value found or #f if any step is missing."
   (cond
     ((null? path) state)
     ((integer? (car path))
-     (let ((s (peel-list-wrap state)))
-       (and (list? s) (>= (car path) 0) (< (car path) (length s))
-            (path-get (list-ref s (car path)) (cdr path)))))
+     (and (list? state) (>= (car path) 0) (< (car path) (length state))
+          (path-get (list-ref state (car path)) (cdr path))))
     ((alist? state)
      (let ((entry (assq (car path) state)))
        (and entry (path-get (cdr entry) (cdr path)))))

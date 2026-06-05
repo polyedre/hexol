@@ -252,11 +252,11 @@ to \"NAME.example.com\") and PATH to the NAME Service on PORT."
       `((apiVersion . "networking.k8s.io/v1")
         (kind . "Ingress")
         (metadata ,@(k8s-metadata name namespace labels))
-        (spec (rules (((host . ,h)
-                       (http (paths (((path . ,path)
-                                      (pathType . "Prefix")
-                                      (backend (service (name . ,name)
-                                                        (port (number . ,port))))))))))))))))
+        (spec (rules ((host . ,h)
+                      (http (paths ((path . ,path)
+                                    (pathType . "Prefix")
+                                    (backend (service (name . ,name)
+                                                      (port (number . ,port))))))))))))))
 
 (define* (configmap #:key name data (namespace (current-k8s-namespace)) (labels '()))
   "Return a resource op for a ConfigMap named NAME holding the alist DATA."
@@ -454,10 +454,10 @@ secret named \"<name>-tls\" covering that Ingress's hosts."
     (lambda (r)
       (if (equal? (assq-ref r 'kind) "Ingress")
           (let* ((name  (assq-ref (or (assq-ref r 'metadata) '()) 'name))
-                 (rules (or (assq-ref (or (assq-ref r 'spec) '()) 'rules) '(())))
-                 (hosts (map (lambda (rule) (assq-ref rule 'host)) (car rules))))
-            (deep-merge r `((spec (tls (((hosts ,@hosts)
-                                         (secretName . ,(string-append name "-tls")))))))))
+                 (rules (or (assq-ref (or (assq-ref r 'spec) '()) 'rules) '()))
+                 (hosts (map (lambda (rule) (assq-ref rule 'host)) rules)))
+            (deep-merge r `((spec (tls ((hosts ,@hosts)
+                                        (secretName . ,(string-append name "-tls"))))))))
           r))))
 
 ;; ---------------------------------------------------------------------------
