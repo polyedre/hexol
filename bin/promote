@@ -1,0 +1,161 @@
+#!/usr/bin/env -S guile -L . -e main -s
+!#
+;;; bin/promote — progressive image-tag rollout via the CMDB HTTP API.
+;;;
+;;; Usage:
+;;;   ./bin/promote app=<name> tag=<tag> waves=<wave1:wave2:...> \
+;;;                 [url=http://127.0.0.1:8080] [gate=<shell-cmd>]
+;;;
+;;; A wave is a comma-separated list of region symbols, e.g.
+;;;   waves=alpha5:golf1,bravo1:charlie6,hotel3
+;;;
+;;; For each wave the script:
+;;;   1. POSTs (promote-image <app> "<tag>" <region>) for each region.
+;;;   2. Reads back /state/regions.<region>.apps.<app>.image.tag to verify.
+;;;   3. Runs <gate> as a shell command if provided. Non-zero exit aborts.
+;;;
+;;; Exit code: 0 on success, 1 if a gate fails, 2 on transport/HTTP errors.
+
+(add-to-load-path (dirname (dirname (current-filename))))
+
+(use-modules ((web client) #:renamer (lambda (s)
+                                       (case s
+                                         ((http-post) 'web:http-post)
+                                         ((http-get)  'web:http-get)
+                                         (else s))))
+             (web response)
+             (rnrs bytevectors)
+             (ice-9 format)
+             (ice-9 textual-ports)
+             (ice-9 popen)
+             (srfi srfi-1))
+
+(define (parse-arg arg)
+  (let ((idx (string-index arg #\=)))
+    (unless idx (error "expected key=value, got:" arg))
+    (cons (substring arg 0 idx) (substring arg (+ idx 1)))))
+
+(define (decode-body body)
+  (cond ((not body) "")
+        ((bytevector? body) (utf8->string body))
+        ((string? body) body)
+        (else (format #f "~s" body))))
+
+(define (post-sexp url sexp)
+  (call-with-values
+    (lambda ()
+      (web:http-post url
+                     #:body (string->utf8
+                              (call-with-output-string
+                                (lambda (p) (write sexp p))))
+                     #:headers '((content-type . (application/scheme)))))
+    (lambda (response body)
+      (values (response-code response) (decode-body body)))))
+
+(define (get-url url)
+  (call-with-values
+    (lambda () (web:http-get url))
+    (lambda (response body)
+      (values (response-code response) (decode-body body)))))
+
+(define (post-fact url sexp)
+  (call-with-values (lambda () (post-sexp url sexp))
+    (lambda (code body)
+      (unless (= code 200)
+        (format (current-error-port) "POST failed (~a): ~a~%" code body)
+        (exit 2))
+      body)))
+
+(define (get-path url-base path-str)
+  (call-with-values (lambda () (get-url (string-append url-base "/state/" path-str)))
+    (lambda (code body)
+      (cond ((= code 200) (call-with-input-string body read))
+            ((= code 404) #f)
+            (else
+             (format (current-error-port) "GET failed (~a): ~a~%" code body)
+             (exit 2))))))
+
+(define (parse-waves s)
+  (map (lambda (w)
+         (map string->symbol (string-split w #\,)))
+       (string-split s #\:)))
+
+(define (run-gate gate-cmd wave-idx)
+  (when gate-cmd
+    (format #t "  gate: running ~s~%" gate-cmd)
+    (let ((status (system gate-cmd)))
+      (unless (zero? status)
+        (format (current-error-port)
+                "  gate FAILED for wave ~a (status ~a) — aborting~%"
+                wave-idx status)
+        (exit 1)))
+    (format #t "  gate: ok~%")))
+
+;; A promotion is a `(promote <region> <path> <value>)` fact. <path> is
+;; rooted under the region (e.g. (apps ingress-nginx chart version)).
+(define (kind->path-tail kind)
+  (cond ((string=? kind "image") '(image tag))
+        ((string=? kind "chart") '(chart version))
+        (else (error "unknown kind (want image|chart):" kind))))
+
+(define (verify-path-string region app kind)
+  (let ((tail (kind->path-tail kind)))
+    (string-join
+      (cons "regions"
+            (cons (symbol->string region)
+                  (cons "apps"
+                        (cons app (map symbol->string tail)))))
+      ".")))
+
+(define (promote-wave url kind app tag wave-idx regions)
+  (format #t "wave ~a: regions ~a~%" wave-idx regions)
+  (let ((tail (kind->path-tail kind)))
+    (for-each
+      (lambda (region)
+        (let* ((path (cons 'apps (cons (string->symbol app) tail)))
+               (fact `(promote ,region ,path ,tag)))
+          (format #t "  -> ~s~%" fact)
+          (post-fact (string-append url "/facts") fact)
+          (let ((observed (get-path url (verify-path-string region app kind))))
+            (unless (equal? observed tag)
+              (format (current-error-port)
+                      "  verify FAILED for ~a: expected ~s, got ~s~%"
+                      region tag observed)
+              (exit 2))
+            (format #t "     verified ~a@~a~%" region observed))))
+      regions)))
+
+(define (main args)
+  (let loop ((args (cdr args))
+             (url  "http://127.0.0.1:8080")
+             (kind "image")
+             (app  #f) (tag #f) (waves #f) (gate #f))
+    (cond
+      ((null? args)
+       (unless (and app tag waves)
+         (format (current-error-port)
+                 "missing required: app=, tag=, waves=~%")
+         (exit 2))
+       (let ((parsed-waves (parse-waves waves)))
+         (format #t "promote: kind=~a app=~a tag=~a url=~a~%" kind app tag url)
+         (format #t "waves: ~a~%~%" parsed-waves)
+         (let inner ((ws parsed-waves) (i 1))
+           (cond
+             ((null? ws)
+              (format #t "~%done.~%"))
+             (else
+              (promote-wave url kind app tag i (car ws))
+              (when (and gate (not (null? (cdr ws))))
+                (run-gate gate i))
+              (inner (cdr ws) (+ i 1)))))))
+      (else
+       (let* ((p (parse-arg (car args)))
+              (k (car p)) (v (cdr p)))
+         (cond
+           ((string=? k "url")   (loop (cdr args) v kind app tag waves gate))
+           ((string=? k "kind")  (loop (cdr args) url v app tag waves gate))
+           ((string=? k "app")   (loop (cdr args) url kind v tag waves gate))
+           ((string=? k "tag")   (loop (cdr args) url kind app v waves gate))
+           ((string=? k "waves") (loop (cdr args) url kind app tag v gate))
+           ((string=? k "gate")  (loop (cdr args) url kind app tag waves v))
+           (else (error "unknown arg:" k))))))))

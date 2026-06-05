@@ -1,0 +1,92 @@
+#!/usr/bin/env -S guile -L . -e main -s
+!#
+;;; bin/sync-inventory — push the region table to the CMDB as facts.
+;;;
+;;; Usage:
+;;;   ./bin/sync-inventory [regions=examples/regions.scm] \
+;;;                        [url=http://127.0.0.1:8080]
+;;;
+;;; Posts one `(region <name> <attrs>)` fact per entry in the region
+;;; table. The CMDB library expands each into the full per-region
+;;; subtree using `cmdb/region-render.scm` (which shares its body with
+;;; `examples/inventory.scm`). Facts stay small (~100 bytes each).
+;;;
+;;; The regions table file is expected to define-module
+;;; `(examples regions)` and export `regions`.
+
+(add-to-load-path (dirname (dirname (current-filename))))
+
+(use-modules ((web client) #:renamer (lambda (s)
+                                       (if (eq? s 'http-post) 'web:http-post s)))
+             (web response)
+             (rnrs bytevectors)
+             (ice-9 format))
+
+(define (parse-arg arg)
+  (let ((idx (string-index arg #\=)))
+    (unless idx (error "expected key=value, got:" arg))
+    (cons (substring arg 0 idx) (substring arg (+ idx 1)))))
+
+(define (decode-body body)
+  (cond ((not body) "")
+        ((bytevector? body) (utf8->string body))
+        (else body)))
+
+(define (post-fact url sexp)
+  (call-with-values
+    (lambda ()
+      (web:http-post url
+                     #:body (string->utf8
+                              (call-with-output-string
+                                (lambda (p) (write sexp p))))
+                     #:headers '((content-type . (application/scheme)))))
+    (lambda (response body)
+      (let ((code (response-code response)))
+        (unless (= code 200)
+          (format (current-error-port)
+                  "POST failed (~a): ~a~%" code (decode-body body))
+          (exit 2))))))
+
+(define (load-regions-table regions-path)
+  ;; The file is expected to (define-module (examples regions)) and
+  ;; export `regions`. Use primitive-load + module-ref so we tolerate
+  ;; arbitrary module names like (examples regions-prod).
+  (let* ((port (open-input-file regions-path))
+         (head (read port)))
+    (close-port port)
+    (unless (and (pair? head) (eq? (car head) 'define-module))
+      (error "regions file must start with (define-module ...)" regions-path))
+    (let ((mod-name (cadr head)))
+      (primitive-load regions-path)
+      (module-ref (resolve-module mod-name) 'regions))))
+
+(define (run regions-path url)
+  (format #t "sync: loading region table from ~a~%" regions-path)
+  (let* ((regions  (load-regions-table regions-path))
+         (count    (length regions))
+         (endpoint (string-append url "/facts")))
+    (format #t "sync: ~a regions to push -> ~a~%" count endpoint)
+    (let loop ((rs regions) (n 0))
+      (if (null? rs)
+          (format #t "sync: pushed ~a regions~%" n)
+          (let* ((entry (car rs))
+                 (name  (car entry))
+                 (attrs (cdr entry))
+                 (fact  `(region ,name ,attrs)))
+            (post-fact endpoint fact)
+            (when (zero? (modulo (+ n 1) 10))
+              (format #t "  pushed ~a/~a~%" (+ n 1) count))
+            (loop (cdr rs) (+ n 1)))))))
+
+(define (main args)
+  (let loop ((args  (cdr args))
+             (regs  "examples/regions.scm")
+             (url   "http://127.0.0.1:8080"))
+    (if (null? args)
+        (run regs url)
+        (let* ((p (parse-arg (car args)))
+               (k (car p)) (v (cdr p)))
+          (cond
+            ((string=? k "regions") (loop (cdr args) v url))
+            ((string=? k "url")     (loop (cdr args) regs v))
+            (else (error "unknown arg:" k)))))))

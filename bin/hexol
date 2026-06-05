@@ -1,0 +1,445 @@
+#!/usr/bin/env -S guile -L . -e main -s
+!#
+;;; bin/hexol — the hexol command-line front-end.
+;;;
+;;; Every subcommand bottoms out in the same op record and the same
+;;; `resolve` fold, so all four are views of one computation:
+;;;
+;;;   hexol render [-o FMT] [-q Q] [--path P] INVENTORY  resolve + emit (default)
+;;;   hexol tree                          INVENTORY   the op tree, indented
+;;;   hexol ops                           INVENTORY   top-level ops + source
+;;;   hexol explain [-q Q] PATH           INVENTORY   ops that touched PATH
+;;;
+;;; render formats (-o / --output): sexp (default), json, yaml, terraform, ansible,
+;;; plus any name an inventory file registers with `renders-with`.
+;;;   sexp / json render the whole resolved state;
+;;;   yaml    targets the (kubernetes_resources) manifest stream;
+;;;   terraform targets the (terraform_config) subtree (Terraform JSON config);
+;;;   ansible targets the (ansible_plays) accumulator (a playbook, as JSON);
+;;;   a file-registered name (e.g. sql, ledger) runs that file's own
+;;;     (state -> text) adapter — its accumulated domain output.
+;;;
+;;;   -q / --query K=V,…   seed the resolve with these attributes — the
+;;;                  query the engine folds over (e.g. -q dc=alpha,role=web).
+;;;                  Default is the empty query. Applies to render + explain.
+;;;
+;;;   --path a.b.c   render only that subtree (tokens that parse as
+;;;                  integers are list indices, e.g. regions.alpha5 or
+;;;                  kubernetes_resources.3.spec.replicas).
+;;;
+;;; When --path is omitted and the resolved state has a top-level
+;;; `kubernetes_resources` list, render targets that list — so
+;;;   hexol render -o yaml chart.scm
+;;; emits the manifest stream a `helm template` would, ready for
+;;; `kubectl apply -f -`. Otherwise render targets the whole state.
+;;;
+;;; Examples:
+;;;   hexol render examples/inventory.scm
+;;;   hexol render --path regions.alpha5 examples/inventory.scm
+;;;   hexol render -o yaml examples/kube-prometheus-stack/chart.scm
+;;;   hexol render -o json examples/custom-apps.scm
+;;;   hexol tree examples/custom-apps.scm
+;;;   hexol explain regions.alpha5.network.cni examples/inventory.scm
+
+(add-to-load-path (dirname (dirname (current-filename))))
+
+;; The CLI only needs the kernel — it reads inventories into ops and folds
+;; them; it never authors ops. (The author surface is hx-prefixed now, so it
+;; no longer shadows anything, but there's still no reason to import it here.)
+(use-modules (hexol kernel)
+             (hexol yaml)
+             (hexol terraform)
+             (cmdb json)
+             (srfi srfi-1)
+             (ice-9 match)
+             (ice-9 pretty-print)
+             (ice-9 format))
+
+;; ---------------------------------------------------------------------------
+;; shared helpers
+;; ---------------------------------------------------------------------------
+
+(define (die fmt . args)
+  (apply format (current-error-port) fmt args)
+  (newline (current-error-port))
+  (exit 2))
+
+(define (parse-token s)
+  (or (string->number s) (string->symbol s)))
+
+(define (parse-path s)
+  (map parse-token (string-split s #\.)))
+
+;; "k=v,k=v" -> ((k . v) …): the query attributes seeded as the initial
+;; state, the way `(resolve ops attrs)` is called directly. Values parse
+;; like path tokens (numbers stay numbers, everything else is a symbol);
+;; an empty string is the empty query.
+(define (parse-query s)
+  (if (string=? s "")
+      '()
+      (map (lambda (kv)
+             (let ((eq (string-index kv #\=)))
+               (unless eq (usage-error "bad --query item ~s (want K=V)" kv))
+               (cons (string->symbol (substring kv 0 eq))
+                     (parse-token (substring kv (+ eq 1))))))
+           (string-split s #\,))))
+
+(define (load-ops inv)
+  (unless inv (usage-error "missing INVENTORY file"))
+  (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
+  (load-inventory-file inv))
+
+;; Like `load-ops`, but also collect any (name . renderer) the file
+;; registered via `renders-with` — the optional domain-text adapters
+;; (SQL DDL, ledger-cli text) that `render -o NAME` invokes. tree / ops /
+;; explain don't need these and use plain `load-ops`.
+(define (load-ops+renderers inv)
+  (unless inv (usage-error "missing INVENTORY file"))
+  (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
+  (let ((box (list '())))
+    (let ((ops (parameterize ((current-renderers box))
+                 (load-inventory-file inv))))
+      (values ops (reverse (car box))))))
+
+(define (usage-error fmt . args)
+  (apply format (current-error-port) (string-append fmt "~%") args)
+  (format (current-error-port)
+          "usage: hexol <render|tree|ops|explain> ... INVENTORY  (hexol --help)~%")
+  (exit 2))
+
+;; ---------------------------------------------------------------------------
+;; render
+;; ---------------------------------------------------------------------------
+
+;; What to render: an explicit --path always wins. Otherwise the data
+;; formats (sexp / json) render the WHOLE resolved state, while the
+;; structural formats extract their accumulator — yaml the k8s manifest
+;; list, hcl the Terraform resources — since a manifest stream is only
+;; meaningful for that sub-list.
+(define (render-target fmt state path)
+  (cond
+    (path (path-get state path))
+    ((string=? fmt "terraform") (or (state-get state '(terraform_config)) '()))
+    ;; (ansible_plays) is keyed by host; a playbook is the list of its plays.
+    ((string=? fmt "ansible")
+     (map cdr (or (state-get state '(ansible_plays)) '())))
+    ((and (string=? fmt "yaml") (pair? state) (assq 'kubernetes_resources state))
+     (state-get state '(kubernetes_resources)))
+    (else state)))
+
+;; A sequence of maps (each a k8s resource) prints as a multi-doc stream.
+(define (sequence-of-maps? x)
+  (and (pair? x) (list? x) (every object-shape? x)))
+
+(define (emit-sexp obj) (pretty-print obj))
+
+;; A whole-state sexp dump (no --path) can be hundreds of lines — the very
+;; first thing a newcomer runs. When it's big, nudge toward the drill-down
+;; views on stderr (so piped stdout stays clean).
+(define (size-hint inv text)
+  ;; pretty-print ends with a newline, so the newline count is the line count.
+  (let ((lines (1- (length (string-split text #\newline)))))
+    (when (> lines 80)
+      (format (current-error-port)
+              ";; ~a lines — drill in with `--path KEY`, or see the op tree: hexol tree ~a~%"
+              lines inv))))
+
+(define (emit-json obj) (display (sexp->json-string obj)) (newline))
+
+(define (emit-yaml obj)
+  (if (sequence-of-maps? obj)
+      (emit-yaml-stream (current-output-port) obj)
+      (emit-yaml-document (current-output-port) obj)))
+
+(define (emit-tf obj)
+  (emit-terraform-json (current-output-port) obj))
+
+(define (cmd-render args)
+  (let loop ((args args) (fmt "sexp") (path #f) (query '()) (inv #f))
+    (match args
+      (() (do-render (or inv (usage-error "render: missing INVENTORY file"))
+                     fmt path query))
+      (((or "-o" "--output") f . rest) (loop rest f path query inv))
+      (("--path" p . rest) (loop rest fmt (parse-path p) query inv))
+      (((or "-q" "--query") q . rest) (loop rest fmt path (parse-query q) inv))
+      ((arg . rest)
+       (cond
+         ((string-prefix? "--output=" arg)
+          (loop rest (substring arg 9) path query inv))
+         ((string-prefix? "--path=" arg)
+          (loop rest fmt (parse-path (substring arg 7)) query inv))
+         ((string-prefix? "--query=" arg)
+          (loop rest fmt path (parse-query (substring arg 8)) inv))
+         ((string-prefix? "-" arg) (usage-error "render: unknown flag ~a" arg))
+         (else (loop rest fmt path query arg)))))))
+
+;; The full format list for error messages: the built-ins plus whatever
+;; names this file registered via `renders-with`, joined uniformly.
+(define builtin-formats '("sexp" "json" "yaml" "terraform" "ansible"))
+
+(define (format-list renderers)
+  (string-join (append builtin-formats (map car renderers)) " | "))
+
+(define (do-render inv fmt path query)
+  (call-with-values (lambda () (load-ops+renderers inv))
+    (lambda (ops renderers)
+      (let ((state (resolve ops query))
+            (custom (and (not path) (assoc fmt renderers))))
+        (cond
+          ;; A file-registered renderer wins for its own name. `--path` is a
+          ;; state-subtree selector that only makes sense for the generic
+          ;; formats, so it suppresses the custom renderer.
+          (custom ((cdr custom) state))
+          (else
+           (let ((target (render-target fmt state path)))
+             (when (and path (not target))
+               (die "render: path not found: ~a" path))
+             (cond
+               ((string=? fmt "sexp")
+                (let ((text (call-with-output-string
+                              (lambda (p) (pretty-print target p)))))
+                  (display text)
+                  (unless path (size-hint inv text))))
+               ((string=? fmt "json") (emit-json target))
+               ((string=? fmt "yaml") (emit-yaml target))
+               ((string=? fmt "terraform") (emit-tf target))
+               ((string=? fmt "ansible") (emit-json target))  ; a playbook is valid JSON
+               (else (usage-error "render: unknown output format ~s (~a)"
+                                  fmt (format-list renderers)))))))))))
+
+;; ---------------------------------------------------------------------------
+;; tree — concise op-tree view (walks captured source recursively)
+;; ---------------------------------------------------------------------------
+
+(define (children-of form)
+  (let ((h (car form)) (tail (cdr form)))
+    (cond
+      ((eq? h 'when)  (cdr tail))
+      ((eq? h 'case)  (concatenate (map cdr (cdr tail))))
+      (else '()))))
+
+(define (key-or-path->string k)
+  (cond ((symbol? k) (symbol->string k))
+        ((list? k)   (string-join (map symbol->string k) "."))
+        (else (format #f "~a" k))))
+
+(define (label-from-source form)
+  (let ((h (car form)))
+    (cond
+      ((and (eq? h 'load) (pair? (cdr form)) (string? (cadr form)))
+       (string-append "load " (cadr form)))
+      ((and (eq? h 'resource) (= (length form) 3))
+       (string-append "resource " (cadr form) "/" (caddr form)))
+      ((and (eq? h 'set)    (pair? (cdr form)))
+       (string-append "set "    (key-or-path->string (cadr form))))
+      ((and (eq? h 'append) (pair? (cdr form)))
+       (string-append "append " (key-or-path->string (cadr form))))
+      (else (symbol->string h)))))
+
+(define (prefix bars last?)
+  (string-append
+    (string-concatenate (map (lambda (b) (if b "│  " "   ")) bars))
+    (if last? "└─ " "├─ ")))
+
+(define (line bars last? label) (string-append (prefix bars last?) label))
+
+(define (printable-source? form) (and (pair? form) (symbol? (car form))))
+
+(define (walk-list items bars walk-item)
+  (let ((n (length items)))
+    (let loop ((xs items) (i 0))
+      (unless (null? xs)
+        (walk-item (car xs) bars (= i (- n 1)))
+        (loop (cdr xs) (+ i 1))))))
+
+(define (walk-op op bars last?)
+  (display (line bars last? (or (op-label op) (symbol->string (op-kind op)))))
+  (newline)
+  (walk-op-children op (concatenate (list bars (list (not last?))))))
+
+(define (walk-source form bars last?)
+  (when (printable-source? form)
+    (display (line bars last? (label-from-source form)))
+    (newline)
+    (walk-children form (concatenate (list bars (list (not last?)))))))
+
+(define (walk-op-children op bars)
+  (let ((children (op-children op)))
+    (cond
+      ((not (null? children))
+       (walk-list children bars walk-op))
+      ((and (pair? (op-source op)) (eq? (car (op-source op)) 'load)
+            (pair? (cdr (op-source op))) (string? (cadr (op-source op))))
+       (walk-list (load-inventory-file (cadr (op-source op))) bars walk-op))
+      (else
+       (walk-list (filter printable-source? (children-of (op-source op)))
+                  bars walk-source)))))
+
+(define (walk-children form bars)
+  (cond
+    ((and (pair? form) (eq? (car form) 'load)
+          (pair? (cdr form)) (string? (cadr form)))
+     (walk-list (load-inventory-file (cadr form)) bars walk-op))
+    (else
+     (walk-list (filter printable-source? (children-of form))
+                bars walk-source))))
+
+(define (cmd-tree args)
+  (let ((inv (single-positional "tree" args)))
+    (let ((ops (load-ops inv)))
+      (format #t ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
+      (walk-list ops '() walk-op))))
+
+;; ---------------------------------------------------------------------------
+;; ops — top-level ops with their captured source form
+;; ---------------------------------------------------------------------------
+
+(define (cmd-ops args)
+  (let ((inv (single-positional "ops" args)))
+    (let ((ops (load-ops inv)))
+      (format #t ";; inventory: ~a~%" inv)
+      (format #t ";; ~a top-level ops~%" (length ops))
+      (format #t ";; ----~%")
+      (let loop ((ops ops) (i 1))
+        (unless (null? ops)
+          (let ((op (car ops)))
+            (format #t "~3d. ~a~30t~a~%     " i (op-kind op)
+                    (loc->string (op-loc op)))
+            (pretty-print (op-source op))
+            (loop (cdr ops) (+ i 1))))))))
+
+;; ---------------------------------------------------------------------------
+;; explain — every op that changed a path during the fold
+;; ---------------------------------------------------------------------------
+
+(define (leaf? op) (null? (op-children op)))
+(define (op-display op) (or (op-label op) (symbol->string (op-kind op))))
+
+;; (file . line) -> "file:line", or a hint when unknown.
+(define (loc->string loc)
+  (if (pair? loc)
+      (format #f "~a:~a" (car loc) (cdr loc))
+      "unknown (no source info)"))
+
+(define (trace-hits trace path initial)
+  (let loop ((prev initial) (steps trace) (i 0) (hits '()))
+    (cond
+      ((null? steps) (reverse hits))
+      (else
+       (let* ((step  (car steps))
+              (op    (car step))
+              (after (cdr step))
+              (pv    (path-get prev path))
+              (av    (path-get after path)))
+         (loop after (cdr steps) (+ i 1)
+               (if (and (leaf? op) (not (equal? pv av)))
+                   (cons (list (cons 'step i) (cons 'op op)
+                               (cons 'before pv) (cons 'after av))
+                         hits)
+                   hits)))))))
+
+(define (cmd-explain args)
+  ;; explain [--query K=V,…] PATH INVENTORY  (PATH is the first positional)
+  (let loop ((args args) (path #f) (query '()) (inv #f))
+    (match args
+      (()
+       (unless path (usage-error "explain: missing PATH"))
+       (unless inv  (usage-error "explain: missing INVENTORY file"))
+       (do-explain inv path query))
+      (((or "-q" "--query") q . rest) (loop rest path (parse-query q) inv))
+      ((arg . rest)
+       (cond ((string-prefix? "--query=" arg)
+              (loop rest path (parse-query (substring arg 8)) inv))
+             ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
+             ((not path) (loop rest (parse-path arg) query inv))
+             ((not inv)  (loop rest path query arg))
+             (else (usage-error "explain: unexpected argument ~a" arg)))))))
+
+(define (do-explain inv path query)
+  (let ((ops (load-ops inv)))
+    (call-with-values (lambda () (resolve-with-trace ops query))
+      (lambda (final trace)
+        (let ((hits (trace-hits trace path (list (cons 'attributes query)))))
+          (format #t ";; inventory: ~a~%" inv)
+          (format #t ";; query:     ~s~%" query)
+          (format #t ";; path:      ~s~%" path)
+          (format #t ";; final:     ~s~%" (path-get final path))
+          (format #t ";; ~a op(s) touched this path:~%~%" (length hits))
+          (for-each
+            (lambda (hit)
+              (let ((op (assq-ref hit 'op)))
+                (format #t "  step ~a: ~a~%"
+                        (assq-ref hit 'step) (op-display op))
+                (format #t "    at:     ~a~%" (loc->string (op-loc op)))
+                (format #t "    source: ~s~%" (op-source op))
+                (format #t "    before: ~s~%" (assq-ref hit 'before))
+                (format #t "    after:  ~s~%~%" (assq-ref hit 'after))))
+            hits))))))
+
+;; ---------------------------------------------------------------------------
+;; dispatch
+;; ---------------------------------------------------------------------------
+
+(define (single-positional cmd args)
+  ;; Subcommands that take exactly one positional (the inventory file).
+  (let ((files (filter (lambda (a) (not (string-prefix? "-" a))) args)))
+    (match files
+      ((inv) inv)
+      (() (usage-error "~a: missing INVENTORY file" cmd))
+      (_  (usage-error "~a: expected one INVENTORY file, got ~a" cmd (length files))))))
+
+(define usage-text "\
+hexol — resolve a hexol inventory and view it.
+
+usage:
+  hexol render [-o sexp|json|yaml|terraform|ansible] [-q K=V,…] [--path a.b.c] INVENTORY
+  hexol tree    INVENTORY
+  hexol ops     INVENTORY
+  hexol explain [-q K=V,…] PATH INVENTORY
+
+sexp (default) and json render the whole resolved state. -o yaml targets the
+(kubernetes_resources) list (a `helm template` equivalent); -o tf targets the
+(terraform_config) subtree (Terraform JSON config, a `terraform init`-ready
+*.tf.json file); -o ansible targets the (ansible_plays) accumulator (an Ansible
+playbook, emitted as JSON). -o NAME runs a renderer the inventory registered via
+`renders-with` (e.g. -o sql / -o ledger emit that file's domain text). --path
+overrides the target. -q/--query seeds the resolve with attributes (the query
+the engine folds over), e.g. -q dc=alpha,role=web.")
+
+(define (dispatch args)
+  (match (cdr args)
+    (() (display usage-text) (newline) (exit 0))
+    (((or "-h" "--help" "help")) (display usage-text) (newline) (exit 0))
+    (("render"  . rest) (cmd-render rest))
+    (("tree"    . rest) (cmd-tree rest))
+    (("ops"     . rest) (cmd-ops rest))
+    (("explain" . rest) (cmd-explain rest))
+    ((cmd . _) (usage-error "unknown subcommand: ~a" cmd))))
+
+;; Turn a raised error into one clean stderr line instead of a Guile
+;; backtrace — the common case being a typo or a mistake inside the
+;; inventory the user is editing. Most Guile errors arrive as
+;; (subr message message-args . _); we print the filled-in message.
+;; Set HEXOL_DEBUG=1 to bypass this and get the full backtrace.
+(define (report-error key args)
+  (match args
+    ;; The standard (scm-error) shape: (subr message message-args . _),
+    ;; where subr may be #f. Fill the ~S/~A holes in the message.
+    ((subr (? string? msg) margs . _)
+     (format (current-error-port) "hexol: ")
+     (when subr (format (current-error-port) "~a: " subr))
+     (apply format (current-error-port) msg (or margs '()))
+     (newline (current-error-port)))
+    (_ (format (current-error-port) "hexol: ~a: ~s~%" key args))))
+
+(define (main args)
+  (if (getenv "HEXOL_DEBUG")
+      (dispatch args)
+      (catch #t
+        (lambda () (dispatch args))
+        ;; `exit` (from die / usage-error) raises 'quit — let it through
+        ;; with its own status; everything else is an unexpected error.
+        (lambda (key . rest)
+          (if (eq? key 'quit)
+              (apply exit rest)
+              (begin (report-error key rest) (exit 1)))))))
