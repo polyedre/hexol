@@ -38,10 +38,11 @@
   #:use-module (hexol kernel)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
-  #:re-export (resolve state-get state-set state-append deep-merge
+  #:re-export (resolve state-get state-set state-append state-delete deep-merge
                op? op-kind op-source op-effect apply-op compose-ops for-each-into
                renders-with)
   #:export (hx-ops hx-each hx-merge hx-when hx-case hx-append
+            hx-copy hx-move hx-delete
             $ attr get attrs str fmt
             resource transform-resources annotate-all label-all
             block body
@@ -289,6 +290,28 @@ metadata.labels."
     ((_ k ($ expr))       (op:append-dyn '(k)     (lambda (state) expr) '(append k ($ expr))))
     ((_ k val)            (op:append     '(k)     'val                  '(append k val)))))
 
+;; %copy / %move move a value between paths; %delete removes one. Each path
+;; slot accepts a bare symbol (`nginx`) or a segment list (`(nginx workers)`),
+;; auto-quoted exactly like %append's path.
+(define-syntax %copy
+  (syntax-rules ()
+    ((_ (s ...) (d ...)) (op:copy '(s ...) '(d ...) '(copy (s ...) (d ...))))
+    ((_ (s ...) d)       (op:copy '(s ...) '(d)     '(copy (s ...) d)))
+    ((_ s (d ...))       (op:copy '(s)     '(d ...) '(copy s (d ...))))
+    ((_ s d)             (op:copy '(s)     '(d)     '(copy s d)))))
+
+(define-syntax %move
+  (syntax-rules ()
+    ((_ (s ...) (d ...)) (op:move '(s ...) '(d ...) '(move (s ...) (d ...))))
+    ((_ (s ...) d)       (op:move '(s ...) '(d)     '(move (s ...) d)))
+    ((_ s (d ...))       (op:move '(s)     '(d ...) '(move s (d ...))))
+    ((_ s d)             (op:move '(s)     '(d)     '(move s d)))))
+
+(define-syntax %delete
+  (syntax-rules ()
+    ((_ (k ...)) (op:delete '(k ...) '(delete (k ...))))
+    ((_ k)       (op:delete '(k)     '(delete k)))))
+
 ;; %case: (case expr arm ...) where each arm is ((v ...) body ...) or
 ;; (else body ...). The dispatch expr runs with current-state bound, so
 ;; `attr` and `get` work inside it. Only the first matching arm's ops fold.
@@ -316,6 +339,9 @@ metadata.labels."
 (define-syntax hx-when   (syntax-rules ()  ((_ . a) (%when . a))))
 (define-syntax hx-case   (syntax-rules ()  ((_ . a) (%case . a))))
 (define-syntax hx-append (syntax-rules ()  ((_ . a) (%append . a))))
+(define-syntax hx-copy   (syntax-rules ()  ((_ . a) (%copy . a))))
+(define-syntax hx-move   (syntax-rules ()  ((_ . a) (%move . a))))
+(define-syntax hx-delete (syntax-rules ()  ((_ . a) (%delete . a))))
 (define-syntax attrs     (syntax-rules ()  ((_ . a) (%attrs . a))))
 
 ;; (hx-ops form ...) -> a flat list of ops. Each body slot is either an op

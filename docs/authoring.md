@@ -19,10 +19,34 @@ An "op" is one of:
 | `(hx-when pred body ...)`   | recursively fold `body` if `pred` holds     |
 | `(hx-case expr arm ...)`    | fold the first matching arm's body          |
 | `(hx-append path value)`    | append value to list at path                |
+| `(hx-copy src dst)`         | copy the value at `src` to `dst`            |
+| `(hx-move src dst)`         | move the value at `src` to `dst` (delete `src`) |
+| `(hx-delete path)`          | remove the entry at `path`                  |
 
 All author ops are `hx-`-prefixed so they never shadow Guile's own `when`,
 `append`, `case`, `load`, or srfi-1's `merge`. They compose freely; the
 result of `resolve` is a nested alist.
+
+### Moving and pruning paths
+
+`hx-copy`, `hx-move`, and `hx-delete` operate on whole paths rather than
+merging values in. Each path is a bare symbol (`legacy`) or a segment list
+(`(db host)`), auto-quoted like `hx-append`'s path:
+
+```scheme
+(hx-ops
+  (hx-merge (db (host "localhost") (port 5432) (legacy_password "x")))
+  (hx-copy   (db host) (app db_host))   ; duplicate; src stays
+  (hx-move   (db port) (app db_port))   ; relocate; src removed
+  (hx-delete (db legacy_password)))     ; prune
+```
+
+Because they fold like any other op, **order matters** (a later `hx-merge`
+can re-create a path a `hx-delete` removed, and a `hx-copy` sees whatever
+value exists at `src` *at that point* in the fold). `hx-copy`/`hx-move` on a
+missing `src` are a no-op — they don't create `dst` — and `hx-delete` of a
+missing path leaves the state unchanged. They prune only the named entry,
+nothing else.
 
 ## A worked inventory
 
