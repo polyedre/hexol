@@ -216,8 +216,8 @@ tooling works unchanged, and the gating is no longer opaque:
 
 ```
 ./bin/hexol tree examples/helm-kube-prometheus-stack.scm   # op tree: each when -> its resources
-./bin/hexol render -o yaml examples/helm-kube-prometheus-stack.scm   # -> 35 manifests (multi-doc YAML)
-./bin/hexol explain kubernetes_resources.3.spec.replicas \
+./bin/hexol render -o yaml examples/helm-kube-prometheus-stack.scm   # -> 30 manifests (multi-doc YAML)
+./bin/hexol explain kubernetes_resources.10.spec.replicas \
             examples/helm-kube-prometheus-stack.scm   # which op set this? the Prometheus CR
 ```
 
@@ -254,14 +254,14 @@ evaluate, so a `resource` op emitted by `(app #:replicas 2 …)` is blamed on
 the `app` call, not on a line inside `hexol/k8s.scm`.
 
 ```
-$ ./bin/hexol explain kubernetes_resources.8.spec.replicas \
+$ ./bin/hexol explain kubernetes_resources.10.spec.replicas \
               examples/kubernetes.scm
-;; path:      (kubernetes_resources 8 spec replicas)
+;; path:      (kubernetes_resources 10 spec replicas)
 ;; final:     2
 ;; 1 op(s) touched this path:
 
-  step 11: resource Deployment/loulou
-    at:     examples/kubernetes.scm:36     # the (app … #:replicas 2) call
+  step 13: resource Deployment/loulou
+    at:     examples/kubernetes.scm:39     # the (app … #:replicas 2) call
     before: #f
     after:  2
 ```
