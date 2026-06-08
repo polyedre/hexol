@@ -46,7 +46,7 @@
   #:use-module (json)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
-  #:export (terraform-block terraform-resource terraform-provider
+  #:export (terraform-block terraform-resource terraform-data terraform-provider
             terraform-settings terraform-output
             ref tf-ref tf-interp tf-output
             transform-terraform-resources
@@ -128,6 +128,16 @@ arguments.  `tf-interp' is a kept alias."
      (block-op "resource" (list type name) (body entry ...)
                (list 'terraform-resource type name)
                (string-append "terraform " type "." name)))))
+
+;; data "<type>" "<name>" { … } — a data source. Same body surface as
+;; terraform-resource, but lands under (terraform_config data <type> <name>);
+;; reference its attributes with `(tf-ref "data.<type>" "<name>" "<attr>")`.
+(define-syntax terraform-data
+  (syntax-rules ()
+    ((_ type name entry ...)
+     (block-op "data" (list type name) (body entry ...)
+               (list 'terraform-data type name)
+               (string-append "data " type "." name)))))
 
 ;; provider "<name>" { … } — provider configuration (region, auth_url, …).
 (define-syntax terraform-provider
