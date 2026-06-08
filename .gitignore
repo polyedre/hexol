@@ -8,3 +8,6 @@ openrc
 *.tfstate.*
 deploy/apply.log
 tfplan
+
+# Real, sops-sealed secrets for examples/homelab.scm — never commit.
+examples/homelab.secrets.scm

@@ -81,6 +81,49 @@ In Helm you'd hand-write a `sha256sum` over a rendered template for each
 Deployment; here it's one small library function that does it for *every*
 Deployment automatically.
 
+## Secrets
+
+Secrets live **inline in the inventory**, encrypted at rest with
+[sops](https://github.com/getsops/sops) — no separate `*.sops.yaml` files to
+keep in sync. One `(secrets-store …)` form holds a single sops envelope (one
+data key, one MAC) for every secret; `(secret-ref 'key)` references one at a
+field, and a final `(resolve-secret-refs)` op decrypts the store *once*, at
+render time, and substitutes the plaintext:
+
+```scheme
+(use-modules (hexol k8s) (hexol secrets))
+
+(secrets-store
+  (version "3.12.2") (lastmodified "…") (mac "ENC[…]")
+  (keys (pgp (fp "…") (enc "-----BEGIN PGP MESSAGE-----" …)))
+  (data (db/password . "ENC[AES256_GCM,data:…,type:str]")))
+
+(hx-ops
+  (resource
+    `((apiVersion . "v1") (kind . "Secret")
+      (metadata (name . "db"))
+      (stringData (password . ,(secret-ref 'db/password)))))
+  (resolve-secret-refs))   ; decrypts once, at render time only
+```
+
+`secret-ref` returns a cheap marker, so `tree`/`ops` never shell out to sops —
+only `render` does (and if no key is available it degrades to a clearly-marked
+placeholder rather than failing). Manage the store with the `hexol secret` CLI,
+which decrypts, edits the plaintext, re-seals with sops, and rewrites *only*
+the `(secrets-store …)` form in place:
+
+```sh
+./bin/hexol secret ls               inventory.scm   # list keys (no decrypt)
+./bin/hexol secret set   db/password inventory.scm   # add/replace (value arg or stdin)
+./bin/hexol secret edit  db/password inventory.scm   # $EDITOR round-trip
+./bin/hexol secret get   db/password inventory.scm   # decrypt one to stdout
+./bin/hexol secret rm    db/password inventory.scm
+./bin/hexol secret rekey             inventory.scm   # re-seal to current recipients
+```
+
+See [`docs/authoring.md`](docs/authoring.md#secrets-inline-sops-backed) for the
+load-time-vs-render-time model and the full CLI.
+
 ## Quick start
 
 ```sh

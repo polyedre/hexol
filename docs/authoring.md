@@ -152,6 +152,101 @@ Resolution is a left fold in source order. Two consequences:
 
 See [`model.md`](model.md) for the "load-bearing ordering" discussion.
 
+## Secrets (inline, sops-backed)
+
+`(hexol secrets)` keeps secrets **in the inventory file**, encrypted at rest
+with [sops](https://github.com/getsops/sops), rather than in separate
+`*.sops.yaml` files. There are three pieces:
+
+```scheme
+(use-modules (hexol) (hexol k8s) (hexol secrets))
+
+;; 1. Declare the encrypted store once, at the top level. This is the literal
+;;    sops document, rewritten as a Scheme alist: one envelope (one data key,
+;;    one MAC) covering every secret. You don't hand-write this — the
+;;    `hexol secret` CLI seals it for you (see below).
+(secrets-store
+  (version "3.12.2")
+  (lastmodified "2026-06-08T13:58:43Z")
+  (mac "ENC[AES256_GCM,data:…,type:str]")
+  (keys
+    (pgp
+      (fp "0000000000000000000000000000000000000000")
+      (created-at "2026-06-08T13:58:43Z")
+      (enc
+        "-----BEGIN PGP MESSAGE-----"
+        ""
+        "hQIMA0byVIlLr1maAQ//…"
+        "-----END PGP MESSAGE-----")))
+  (data
+    (db/password . "ENC[AES256_GCM,data:…,type:str]")
+    (api/token   . "ENC[AES256_GCM,data:…,type:str]")))
+
+(hx-ops
+  ;; 2. Reference a secret wherever its plaintext belongs. `secret-ref`
+  ;;    returns a cheap marker — it does NOT decrypt. Here the plaintext is a
+  ;;    Secret's `stringData` (k8s base64-encodes it); the `secret` sugar's
+  ;;    `#:data` expects already-base64 values, so use the `resource` form for
+  ;;    `stringData`.
+  (resource
+    `((apiVersion . "v1") (kind . "Secret")
+      (metadata (name . "db"))
+      (stringData (password . ,(secret-ref 'db/password)))))
+
+  ;; 3. Resolve. Place this op LAST: during `resolve` it walks the final
+  ;;    state, decrypts the store once (memoized), and replaces every marker
+  ;;    with its plaintext.
+  (resolve-secret-refs))
+```
+
+### Why a marker plus a terminal op
+
+Inventory resources are built at *load* time — the quasiquoted
+`,(secret-ref …)` runs when the resource alist is constructed. But you only
+want to shell out to `sops` at *render* time, never for `tree` / `ops` (which
+load the file but never fold). So `secret-ref` bakes a cheap `<secret-ref>`
+marker into the resource, and `resolve-secret-refs` — running only inside
+`resolve` — does the one decryption and substitution. `tree` and `ops` stay
+sops-free.
+
+Decryption is **lazy and memoized**: the first marker resolved forces one
+`sops -d`, and the plaintext is cached for the rest of the render. If `sops`
+is absent, or the decrypt fails because your key isn't present, every marker
+resolves to a `<unresolved secret: KEY>` placeholder with a warning — so the
+inventory still renders into a structurally-valid stream for anyone without
+the secrets (the same graceful skip the old per-file approach had).
+
+### Managing the store: `hexol secret`
+
+You don't edit the `(secrets-store …)` form by hand. Every verb takes the
+inventory as its last argument; the mutating ones decrypt, change the
+plaintext, re-seal with sops, and rewrite **only** the store form's span in
+the file (everything else stays byte-for-byte identical):
+
+```sh
+hexol secret ls               inventory.scm   # list keys — no decrypt
+hexol secret get   db/password inventory.scm   # decrypt one secret to stdout
+hexol secret set   db/password inventory.scm   # add/replace; value from a 3rd arg or stdin
+hexol secret edit  db/password inventory.scm   # decrypt into $EDITOR; reseal on change
+hexol secret rm    db/password inventory.scm   # drop a key
+hexol secret rekey             inventory.scm   # re-seal to the current recipients
+hexol secret init              inventory.scm   # insert an empty (secrets-store (data)) form
+```
+
+Sealing reuses the `sops` creation rule from the nearest `.sops.yaml` found by
+walking up from the inventory's directory — so recipients (PGP keys, age
+recipients) and `encrypted_regex` are configured there, exactly as a normal
+sops project. `set`/`edit`/`rm`/`rekey` need `sops` on `PATH` and a key that
+can decrypt the existing store; `ls` needs neither.
+
+Typical first-time flow for a fresh inventory:
+
+```sh
+hexol secret init inventory.scm                          # add the empty form
+pass db/password | hexol secret set db/password inventory.scm   # seal a value from stdin
+hexol secret ls inventory.scm                            # confirm
+```
+
 ## Repository layout
 
 The engine ships as a Guile module named `hexol`; target libraries are
@@ -177,7 +272,11 @@ hexol/
   sql.scm           # (hexol sql)      — table/column/constraint/index DSL + SQL DDL render
   ansible.scm       # (hexol ansible)  — inventory.yml bridge + state helpers, task/handler
                     #                    (macros over block/body) / as, `play` sink op
-bin/hexol           # the CLI: render / tree / ops / explain
+  secrets.scm       # (hexol secrets)  — inline sops-backed store: (secrets-store …),
+                    #                    (secret-ref 'k), (resolve-secret-refs) render op
+  secret-tool.scm   # (hexol secret-tool) — engine behind `hexol secret`: position-aware
+                    #                    reader + sops seal/decrypt + in-place form rewrite
+bin/hexol           # the CLI: render / tree / ops / explain / secret
 examples/                          # one self-contained file each
   inventory.scm    # region table + per-region body + hx-each (the engine itself)
   regions.scm      # the region table as an importable module (CMDB sync source)

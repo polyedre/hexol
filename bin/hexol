@@ -49,6 +49,7 @@
 (use-modules (hexol kernel)
              (hexol yaml)
              (hexol terraform)
+             (hexol secret-tool)
              (cmdb json)
              (srfi srfi-1)
              (ice-9 match)
@@ -377,6 +378,67 @@
             hits))))))
 
 ;; ---------------------------------------------------------------------------
+;; secret — manage the inline (secrets-store …) in an inventory
+;; ---------------------------------------------------------------------------
+;;
+;; Every verb takes the INVENTORY file as its last positional; the mutating
+;; ones rewrite only the store form's span in place. Plaintext only ever
+;; reaches stdout (`get`) or $EDITOR (`edit`), never the file or a log.
+
+(define secret-usage "\
+usage:
+  hexol secret ls                 INVENTORY
+  hexol secret get  KEY           INVENTORY
+  hexol secret set  KEY [VALUE]   INVENTORY   (VALUE omitted → read stdin)
+  hexol secret edit KEY           INVENTORY   ($EDITOR round-trip)
+  hexol secret rm   KEY           INVENTORY
+  hexol secret rekey              INVENTORY
+  hexol secret init               INVENTORY")
+
+(define (secret-error fmt . args)
+  (apply format (current-error-port) (string-append fmt "~%") args)
+  (format (current-error-port) "~a~%" secret-usage)
+  (exit 2))
+
+;; Pull the positionals out of ARGS (no flags in this command family yet),
+;; expecting exactly N of them; the inventory is always the last.
+(define (secret-positionals verb n args)
+  (let ((pos (filter (lambda (a) (not (string-prefix? "-" a))) args)))
+    (unless (= (length pos) n)
+      (secret-error "secret ~a: expected ~a argument~p, got ~a"
+                    verb n n (length pos)))
+    pos))
+
+(define (cmd-secret args)
+  (match args
+    (() (display secret-usage) (newline) (exit 0))
+    (((or "-h" "--help") . _) (display secret-usage) (newline) (exit 0))
+    (("ls" . rest)
+     (match (secret-positionals "ls" 1 rest) ((inv) (secret-ls inv))))
+    (("get" . rest)
+     (match (secret-positionals "get" 2 rest)
+       ((key inv) (secret-get inv (string->symbol key)))))
+    (("set" . rest)
+     ;; set KEY VALUE INVENTORY  (3 positionals), or set KEY INVENTORY (2 →
+     ;; read the value from stdin).
+     (let ((pos (filter (lambda (a) (not (string-prefix? "-" a))) rest)))
+       (match pos
+         ((key value inv) (secret-set inv (string->symbol key) value))
+         ((key inv)       (secret-set inv (string->symbol key) #f))
+         (_ (secret-error "secret set: want KEY [VALUE] INVENTORY")))))
+    (("edit" . rest)
+     (match (secret-positionals "edit" 2 rest)
+       ((key inv) (secret-edit inv (string->symbol key)))))
+    (("rm" . rest)
+     (match (secret-positionals "rm" 2 rest)
+       ((key inv) (secret-rm inv (string->symbol key)))))
+    (("rekey" . rest)
+     (match (secret-positionals "rekey" 1 rest) ((inv) (secret-rekey inv))))
+    (("init" . rest)
+     (match (secret-positionals "init" 1 rest) ((inv) (secret-init inv))))
+    ((verb . _) (secret-error "secret: unknown verb ~a" verb))))
+
+;; ---------------------------------------------------------------------------
 ;; dispatch
 ;; ---------------------------------------------------------------------------
 
@@ -396,6 +458,7 @@ usage:
   hexol tree    INVENTORY
   hexol ops     INVENTORY
   hexol explain [-q K=V,…] PATH INVENTORY
+  hexol secret  <ls|get|set|edit|rm|rekey|init> … INVENTORY
 
 sexp (default) and json render the whole resolved state. -o yaml targets the
 (kubernetes_resources) list (a `helm template` equivalent); -o tf targets the
@@ -414,6 +477,7 @@ the engine folds over), e.g. -q dc=alpha,role=web.")
     (("tree"    . rest) (cmd-tree rest))
     (("ops"     . rest) (cmd-ops rest))
     (("explain" . rest) (cmd-explain rest))
+    (("secret"  . rest) (cmd-secret rest))
     ((cmd . _) (usage-error "unknown subcommand: ~a" cmd))))
 
 ;; Turn a raised error into one clean stderr line instead of a Guile
