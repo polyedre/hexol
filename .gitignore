@@ -1,3 +1,10 @@
 .direnv/
 *.go
 cmdb.log
+openrc
+*.tf.json
+.terraform/
+*.tfstate
+*.tfstate.*
+deploy/apply.log
+tfplan
