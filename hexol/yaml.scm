@@ -30,12 +30,19 @@ treated as a sequence."
 (define (scalar? x)
   (or (string? x) (number? x) (boolean? x) (symbol? x) (null? x)))
 
+;; YAML 1.1 boolean / null tokens. Downstream parsers (go-yaml, used by
+;; kubectl/sigs.k8s.io/yaml) coerce these *in any case* — `True`, `Yes`, `Off`,
+;; `NULL` — so a string spelling one must be quoted to survive as a string
+;; (e.g. a CRD's `enum: ["True","False","Unknown"]`).
+(define yaml-reserved-words
+  '("true" "false" "null" "yes" "no" "on" "off" "y" "n" "~"))
+
 (define (needs-quote? s)
   ;; Quote a scalar string when it could be misread as another YAML type
   ;; or contains structural characters.
   (or (string=? s "")
       (string->number s)
-      (member s '("true" "false" "null" "yes" "no" "~"))
+      (member (string-downcase s) yaml-reserved-words)
       (string-any (lambda (c) (memv c '(#\: #\# #\{ #\} #\[ #\] #\, #\& #\*
                                         #\? #\| #\< #\> #\= #\! #\% #\@ #\` #\"
                                         #\'))) s)
