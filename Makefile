@@ -12,6 +12,7 @@ help:
 	@echo "  ./bin/hexol render [-o sexp|json|yaml|terraform|ansible] [--query K=V,…] [--path P] INVENTORY"
 	@echo "  ./bin/hexol tree|ops INVENTORY"
 	@echo "  ./bin/hexol explain [--query K=V,…] PATH INVENTORY"
+	@echo "  ./bin/hexol show HASH INVENTORY"
 
 test:
 	$(GUILE) -L . test.scm

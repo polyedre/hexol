@@ -8,7 +8,8 @@
 ;;;   hexol render [-o FMT] [-q Q] [--path P] INVENTORY  resolve + emit (default)
 ;;;   hexol tree                          INVENTORY   the op tree, indented
 ;;;   hexol ops                           INVENTORY   top-level ops + source
-;;;   hexol explain [-q Q] PATH           INVENTORY   ops that touched PATH
+;;;   hexol explain [-q Q] PATH|HASH      INVENTORY   ops that touched PATH
+;;;                                                  (or every path an op changed)
 ;;;
 ;;; render formats (-o / --output): sexp (default), json, yaml, terraform, ansible,
 ;;; plus any name an inventory file registers with `renders-with`.
@@ -119,6 +120,31 @@
 ;; views print). The format string keeps its own trailing ~%.
 (define (note fmt . args)
   (display (o-dim (apply format #f fmt args))))
+
+;; jj-style hash gutter. `show` accepts any unambiguous prefix, so the part of
+;; the hash worth typing is its shortest prefix unique among all addressable
+;; ops; that prefix is highlighted and the rest of the shown short-hash dimmed.
+;; current-uniq holds (hash -> shortest-unique-prefix-length) for the tree
+;; being printed; the default treats every hash as already-unique at 1 char.
+(define (make-uniq-len hashes)
+  (lambda (h)
+    (let ((hlen (string-length h)))
+      (let loop ((l 1))
+        (cond
+          ((> l hlen) hlen)
+          ((= 1 (count (lambda (o) (string-prefix? (substring h 0 l) o)) hashes)) l)
+          (else (loop (+ l 1))))))))
+
+(define current-uniq (make-parameter (lambda (h) 1)))
+
+(define (paint-hash hash)
+  (let* ((shown (substring hash 0 (min hash-width (string-length hash))))
+         (uniq  ((current-uniq) hash)))
+    (if (> uniq (string-length shown))
+        ;; not disambiguable within the shown width — nothing to highlight
+        (o-dim shown)
+        (string-append (paint stdout-color? "35" (substring shown 0 uniq))  ; magenta
+                       (o-dim (substring shown uniq))))))
 
 (define (die fmt . args)
   (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
@@ -311,15 +337,28 @@
         (walk-item (car xs) bars (= i (- n 1)))
         (loop (cdr xs) (+ i 1))))))
 
+;; Width of the short-hash gutter `tree` prints at the start of each op line.
+;; `show` accepts any unambiguous prefix, so this is just the display width.
+(define hash-width 8)
+(define hash-gutter (make-string (+ hash-width 2) #\space))
+
+;; Target width for the human-facing blob views (`show`'s source s-expression
+;; and state-delta values). pretty-print wraps to this minus each view's own
+;; left margin, so the emitted lines land at ~line-width columns.
+(define line-width 120)
+
 (define (walk-op op bars last?)
-  (display (line bars last? (label-paint (or (op-label op) (symbol->string (op-kind op))))))
-  (newline)
+  (format #t "~a  ~a~%"
+          (paint-hash (op-content-hash op))
+          (line bars last? (label-paint (or (op-label op) (symbol->string (op-kind op))))))
   (walk-op-children op (concatenate (list bars (list (not last?))))))
 
 (define (walk-source form bars last?)
+  ;; Source-derived children have no op record (hence no addressable hash);
+  ;; pad the hash gutter so the tree stays aligned.
   (when (printable-source? form)
-    (display (line bars last? (label-paint (label-from-source form))))
-    (newline)
+    (format #t "~a~a~%" hash-gutter
+            (line bars last? (label-paint (label-from-source form))))
     (walk-children form (concatenate (list bars (list (not last?)))))))
 
 (define (walk-op-children op bars)
@@ -346,8 +385,9 @@
 (define (cmd-tree args)
   (let ((inv (single-positional "tree" args)))
     (let ((ops (load-ops inv)))
-      (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
-      (walk-list ops '() walk-op))))
+      (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
+        (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
+        (walk-list ops '() walk-op)))))
 
 ;; ---------------------------------------------------------------------------
 ;; ops — top-level ops with their captured source form
@@ -398,42 +438,307 @@
                    hits)))))))
 
 (define (cmd-explain args)
-  ;; explain [--query K=V,…] PATH INVENTORY  (PATH is the first positional)
-  (let loop ((args args) (path #f) (query '()) (inv #f))
+  ;; explain [--query K=V,…] TARGET INVENTORY  — TARGET is the first positional,
+  ;; either a state PATH (a.b.c) or an op hash prefix (see do-explain).
+  (let loop ((args args) (target #f) (query '()) (inv #f))
     (match args
       (()
-       (unless path (usage-error "explain: missing PATH"))
-       (unless inv  (usage-error "explain: missing INVENTORY file"))
-       (do-explain inv path query))
-      (((or "-q" "--query") q . rest) (loop rest path (parse-query q) inv))
+       (unless target (usage-error "explain: missing PATH or HASH"))
+       (do-explain (inventory-or-default "explain" inv) target query))
+      (((or "-q" "--query") q . rest) (loop rest target (parse-query q) inv))
       ((arg . rest)
        (cond ((string-prefix? "--query=" arg)
-              (loop rest path (parse-query (substring arg 8)) inv))
+              (loop rest target (parse-query (substring arg 8)) inv))
              ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
-             ((not path) (loop rest (parse-path arg) query inv))
-             ((not inv)  (loop rest path query arg))
+             ((not target) (loop rest arg query inv))
+             ((not inv)    (loop rest target query arg))
              (else (usage-error "explain: unexpected argument ~a" arg)))))))
 
-(define (do-explain inv path query)
-  (let ((ops (load-ops inv)))
+;; The state paths OP changed when it fired — the keys of its state delta.
+;; Mirrors show-delta's trace walk, but returns the paths instead of printing.
+(define (op-changed-paths op trace)
+  (let loop ((prev '((attributes))) (steps trace))
+    (cond
+      ((null? steps) '())
+      ((eq? (caar steps) op) (map car (state-diff prev (cdar steps) '())))
+      (else (loop (cdar steps) (cdr steps))))))
+
+;; Print the explain trace for one PATH: its final value and every op that
+;; changed it during the fold.
+(define (explain-path final trace path query)
+  (let ((hits (trace-hits trace path (list (cons 'attributes query)))))
+    (note ";; path:      ~s~%" path)
+    (note ";; final:     ~s~%" (path-get final path))
+    (note ";; ~a op(s) touched this path:~%~%" (length hits))
+    (for-each
+      (lambda (hit)
+        (let ((op (assq-ref hit 'op)))
+          (format #t "  step ~a: ~a~%"
+                  (assq-ref hit 'step) (o-bold (op-display op)))
+          (format #t "    at:     ~a~%" (o-dim (loc->string (op-loc op))))
+          (format #t "    source: ~a~%" (o-dim (format #f "~s" (op-source op))))
+          (format #t "    before: ~a~%" (o-red (format #f "~s" (assq-ref hit 'before))))
+          (format #t "    after:  ~a~%~%" (o-green (format #f "~s" (assq-ref hit 'after))))))
+      hits)))
+
+;; TARGET is a state PATH or an op hash prefix. A dot-free TARGET that matches
+;; an op's content hash is taken as that op (the hash `tree`/`show` print), and
+;; explain traces every path that op changed. Otherwise TARGET is parsed as a
+;; PATH. A hash prefix wins over a single-segment path of the same spelling;
+;; qualify with a `.` (or use the full path) to force path mode.
+(define (do-explain inv target query)
+  (let* ((ops (load-ops inv))
+         (op  (and (not (string-index target #\.))
+                   (let ((ms (hash-matches ops target))) (and (pair? ms) (car ms))))))
     (call-with-values (lambda () (resolve-with-trace ops query))
       (lambda (final trace)
-        (let ((hits (trace-hits trace path (list (cons 'attributes query)))))
-          (format #t ";; inventory: ~a~%" inv)
-          (format #t ";; query:     ~s~%" query)
-          (format #t ";; path:      ~s~%" path)
-          (format #t ";; final:     ~s~%" (path-get final path))
-          (format #t ";; ~a op(s) touched this path:~%~%" (length hits))
-          (for-each
-            (lambda (hit)
-              (let ((op (assq-ref hit 'op)))
-                (format #t "  step ~a: ~a~%"
-                        (assq-ref hit 'step) (op-display op))
-                (format #t "    at:     ~a~%" (loc->string (op-loc op)))
-                (format #t "    source: ~s~%" (op-source op))
-                (format #t "    before: ~s~%" (assq-ref hit 'before))
-                (format #t "    after:  ~s~%~%" (assq-ref hit 'after))))
-            hits))))))
+        (note ";; inventory: ~a~%" inv)
+        (note ";; query:     ~s~%" query)
+        (if op
+            (let ((paths (op-changed-paths op trace)))
+              (note ";; op:        ~a  ~a~%" (op-short-hash op hash-width) (op-display op))
+              (note ";; at:        ~a~%" (loc->string (op-loc op)))
+              (note ";; ~a path~p this op changed:~%~%" (length paths) (length paths))
+              (if (null? paths)
+                  (note ";; (this op fired no leaf delta — it's a wrapper; explain its children)~%")
+                  (for-each (lambda (path) (explain-path final trace path query)) paths)))
+            (explain-path final trace (parse-path target) query))))))
+
+;; ---------------------------------------------------------------------------
+;; show — one op by its content hash (the hash `tree` prints)
+;; ---------------------------------------------------------------------------
+
+;; Every op record in the tree, depth-first (parents before children), so a
+;; hash prefix can be matched against the whole tree, not just the top level.
+(define (tree-op-list ops)
+  (append-map (lambda (op) (cons op (tree-op-list (op-children op)))) ops))
+
+;; Resolve a hash PREFIX against every op in the tree. Returns the list of
+;; matching ops (empty when nothing matches, so callers can fall back to other
+;; addressing). Exits with the candidate list when the prefix is ambiguous —
+;; i.e. it spans more than one distinct content hash.
+(define (hash-matches ops prefix)
+  (let* ((all      (tree-op-list ops))
+         (matches  (filter (lambda (op) (string-prefix? prefix (op-content-hash op)))
+                           all))
+         (distinct (delete-duplicates (map op-content-hash matches) string=?)))
+    (cond
+      ((> (length distinct) 1)
+       (format (current-error-port) "~a~%"
+               (e-red (format #f "hexol: ambiguous prefix ~s — ~a candidates:"
+                              prefix (length distinct))))
+       (for-each
+         (lambda (h)
+           (let ((op (find (lambda (o) (string=? (op-content-hash o) h)) matches)))
+             (format (current-error-port) "  ~a  ~a  ~a~%"
+                     (e-dim (op-short-hash op hash-width)) (op-display op)
+                     (e-dim (format #f "(~a)" (loc->string (op-loc op)))))))
+         distinct)
+       (exit 2))
+      (else matches))))
+
+;; Is X a map-shaped alist (every entry a (symbol . _) pair)? Used to decide
+;; whether to recurse into a state node or treat it as a changed leaf.
+(define (map-alist? x)
+  (and (pair? x) (list? x)
+       (every (lambda (e) (and (pair? e) (symbol? (car e)))) x)))
+
+;; Leaf-level diff of two state nodes: a list of (path before after) for every
+;; path whose value differs. Recurses through map-shaped alists; anything else
+;; (scalars, vectors, plain lists) is compared whole.
+(define (state-diff a b path)
+  (cond
+    ((equal? a b) '())
+    ((and (map-alist? a) (map-alist? b))
+     (let ((keys (delete-duplicates (append (map car a) (map car b)) eq?)))
+       (append-map (lambda (k)
+                     (state-diff (assq-ref a k) (assq-ref b k)
+                                 (append path (list k))))
+                   keys)))
+    (else (list (list path a b)))))
+
+;; Walk the fire-order trace to the step where OP fired (by eq? identity) and
+;; print the state delta it introduced — `before` is the prior step's
+;; after-state. Wrappers (compose/when/case) fire after their children and so
+;; show no delta of their own; that's reported rather than left blank.
+(define (show-delta op trace)
+  (let loop ((prev '((attributes))) (steps trace))
+    (cond
+      ((null? steps)
+       (note ";; state delta: this op did not fire in the resolve~%"))
+      ((eq? (caar steps) op)
+       (let ((diff (state-diff prev (cdar steps) '())))
+         (if (null? diff)
+             (note ";; state delta: none (wrapper/composite — see children)~%")
+             (begin
+               (note ";; state delta (~a path~p):~%" (length diff) (length diff))
+               (for-each
+                 (lambda (d)
+                   (format #t "~a~%~a~%~a~%"
+                           (o-dim (format #f ";;   ~a" (path->string (car d))))
+                           (render-delta-value "-" o-red   (cadr d))
+                           (render-delta-value "+" o-green (caddr d))))
+                 (if (> (length diff) 40) (take diff 40) diff))
+               (when (> (length diff) 40)
+                 (note ";;   … and ~a more path(s)~%" (- (length diff) 40)))))))
+      (else (loop (cdar steps) (cdr steps))))))
+
+;; ---------------------------------------------------------------------------
+;; source blob — `show` prints the op's raw source s-expression. pretty-print
+;; lays it out; this adds light syntax tinting and a 2-space indent so the blob
+;; sits under the `;; source:` header and scans like the rest of the views.
+;; ---------------------------------------------------------------------------
+
+;; Where a bare token ends: the next whitespace, paren/bracket, string quote,
+;; or comment. Used to lift one atom out of the pretty-printed text at a time.
+(define (token-end s i n)
+  (let loop ((j i))
+    (if (>= j n)
+        j
+        (let ((c (string-ref s j)))
+          (if (or (char-whitespace? c)
+                  (memv c '(#\( #\) #\[ #\] #\" #\;)))
+              j
+              (loop (+ j 1)))))))
+
+;; Tint one atom. A symbol heading a list (the operator slot) reads as a
+;; keyword; numbers, booleans/char/vector literals (#…), and :keywords each
+;; get their own hue; everything else is left in the default weight.
+(define (tint-atom tok head?)
+  (cond
+    (head?                          (o-cyan tok))
+    ((string->number tok)           (o-yellow tok))
+    ((string-prefix? "#" tok)       (o-magenta tok))
+    ((string-prefix? ":" tok)       (o-magenta tok))
+    (else                           tok)))
+
+;; Colorize pretty-printed Scheme. A flat character scan, string-aware so we
+;; never paint inside a "literal" (where parens/semicolons aren't syntax). The
+;; token right after an opening paren is the list head; everything else after
+;; an open paren is an argument.
+(define (highlight-sexp s)
+  (if (not stdout-color?)
+      s
+      (let ((out (open-output-string))
+            (n   (string-length s)))
+        (let loop ((i 0) (head? #f))
+          (if (>= i n)
+              (get-output-string out)
+              (let ((c (string-ref s i)))
+                (cond
+                  ;; string literal — consume through the closing quote,
+                  ;; honoring backslash escapes.
+                  ((char=? c #\")
+                   (let scan ((j (+ i 1)))
+                     (cond
+                       ((>= j n)
+                        (display (o-green (substring s i j)) out)
+                        (loop j #f))
+                       ((char=? (string-ref s j) #\\) (scan (+ j 2)))
+                       ((char=? (string-ref s j) #\")
+                        (display (o-green (substring s i (+ j 1))) out)
+                        (loop (+ j 1) #f))
+                       (else (scan (+ j 1))))))
+                  ;; comment to end of line
+                  ((char=? c #\;)
+                   (let ((eol (or (string-index s #\newline i) n)))
+                     (display (o-dim (substring s i eol)) out)
+                     (loop eol #f)))
+                  ;; opening bracket — next atom is the list head
+                  ((or (char=? c #\() (char=? c #\[))
+                   (write-char c out) (loop (+ i 1) #t))
+                  ((or (char=? c #\)) (char=? c #\]))
+                   (write-char c out) (loop (+ i 1) #f))
+                  ;; whitespace carries the head? flag across (so `(\n  foo`
+                  ;; still tints foo as the head)
+                  ((char-whitespace? c)
+                   (write-char c out) (loop (+ i 1) head?))
+                  ;; reader prefixes ' ` , don't consume the head slot
+                  ((memv c '(#\' #\` #\,))
+                   (write-char c out) (loop (+ i 1) head?))
+                  ;; a bare atom
+                  (else
+                   (let* ((j   (token-end s i n))
+                          (tok (substring s i j)))
+                     (display (tint-atom tok head?) out)
+                     (loop j #f))))))))))
+
+;; Pretty-print DATUM, indent every line two spaces, then tint.
+(define (print-source-blob datum)
+  (let* ((raw      (call-with-output-string
+                     (lambda (p)
+                       (pretty-print datum p
+                                     #:width (- line-width 2)
+                                     #:max-expr-width (- line-width 2)))))
+         (indented (string-append
+                     "  "
+                     (string-join (string-split (string-trim-right raw #\newline)
+                                                 #\newline)
+                                  "\n  "))))
+    (display (highlight-sexp indented))
+    (newline)))
+
+;; Render one side of a state-delta entry as `;;` comment lines. A scalar (or
+;; any value pretty-print keeps on one line) stays a single `;;     - val`
+;; line, as before; a compound value is pretty-printed and each line is
+;; comment-prefixed, with the -/+ marker only on the first and continuation
+;; lines aligned under it. The whole value is painted in one hue (red/green)
+;; so the diff direction stays legible — no per-token tinting here.
+(define (render-delta-value marker paint val)
+  (let* ((raw   (string-trim-right
+                  ;; ";;     - " is a 9-char left margin (`;;` + 5 spaces +
+                  ;; marker + space); wrap so the prefixed lines reach line-width.
+                  (call-with-output-string
+                    (lambda (p)
+                      (pretty-print val p
+                                    #:width (- line-width 9)
+                                    #:max-expr-width (- line-width 9))))
+                  #\newline))
+         (lines (string-split raw #\newline)))
+    (paint
+      (string-join
+        (map (lambda (ln idx)
+               (format #f ";;     ~a ~a" (if (= idx 0) marker " ") ln))
+             lines (iota (length lines)))
+        "\n"))))
+
+(define (do-show inv prefix)
+  (let* ((ops     (load-ops inv))
+         (matches (hash-matches ops prefix)))
+    (cond
+      ((null? matches)
+       (die "show: no op matches hash prefix ~s in ~a" prefix inv))
+      (else
+       (let ((op (car matches)))
+         (note ";; inventory: ~a~%" inv)
+         (note ";; hash:      ~a~%" (op-content-hash op))
+         (when (> (length matches) 1)
+           (note ";; note:      ~a ops share this content hash (identical structure)~%"
+                 (length matches)))
+         (note ";; kind:      ~a~%" (op-kind op))
+         (note ";; label:     ~a~%" (op-display op))
+         (note ";; location~p: ~a~%" (length matches)
+               (string-join (map (lambda (o) (loc->string (op-loc o))) matches) ", "))
+         (let ((kids (op-children op)))
+           (unless (null? kids)
+             (note ";; children (~a):~%" (length kids))
+             (for-each (lambda (k)
+                         (note ";;   ~a  ~a~%"
+                               (op-short-hash k hash-width) (op-display k)))
+                       kids)))
+         (note ";; source:~%")
+         (print-source-blob (op-source op))
+         (newline)
+         (call-with-values (lambda () (resolve-with-trace ops '()))
+           (lambda (final trace) (show-delta op trace))))))))
+
+(define (cmd-show args)
+  (let ((pos (filter (lambda (a) (not (string-prefix? "-" a))) args)))
+    (match pos
+      ((hash inv) (do-show inv hash))
+      ((hash) (do-show (inventory-or-default "show" #f) hash))
+      (() (usage-error "show: missing HASH and INVENTORY file"))
+      (_  (usage-error "show: want HASH INVENTORY")))))
 
 ;; ---------------------------------------------------------------------------
 ;; secret — manage the inline (secrets-store …) in an inventory
@@ -528,6 +833,7 @@ usage:
   hexol tree    INVENTORY
   hexol ops     INVENTORY
   hexol explain [-q K=V,…] PATH INVENTORY
+  hexol show    HASH INVENTORY
   hexol secret  <ls|get|set|edit|rm|rekey|init> … INVENTORY
 
 sexp (default) and json render the whole resolved state. -o yaml targets the
@@ -539,9 +845,13 @@ playbook, emitted as JSON). -o NAME runs a renderer the inventory registered via
 overrides the target. -q/--query seeds the resolve with attributes (the query
 the engine folds over), e.g. -q dc=alpha,role=web.
 
+tree prints a stable content hash beside each op; `show HASH` resolves any
+unambiguous prefix of one to that op's kind, label, source, location(s),
+children, and the state delta it introduced during the resolve.
+
 INVENTORY may be omitted on any subcommand when $HEXOL_INVENTORY names it —
-so an exploration loop is just `explain PATH` with the iterated token last
-(up-arrow, edit the last token, re-run).")
+so an exploration loop is just `show HASH` / `explain PATH` with the iterated
+token last (up-arrow, edit the last token, re-run).")
 
 (define (dispatch args)
   (match (cdr args)
@@ -551,6 +861,7 @@ so an exploration loop is just `explain PATH` with the iterated token last
     (("tree"    . rest) (cmd-tree rest))
     (("ops"     . rest) (cmd-ops rest))
     (("explain" . rest) (cmd-explain rest))
+    (("show"    . rest) (cmd-show rest))
     (("secret"  . rest) (cmd-secret rest))
     ((cmd . _) (usage-error "unknown subcommand: ~a" cmd))))
 
