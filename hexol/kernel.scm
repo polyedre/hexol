@@ -13,9 +13,11 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
+  #:use-module (rnrs bytevectors)
   #:export (;; ops
             make-op op? op-kind op-source op-effect op-label op-children op-loc
             current-author-loc stamp-loc relabel
+            op-content-hash op-short-hash
             apply-op resolve compose-ops scope-ops for-each-into
             op:merge op:set op:append op:when op:case
             op:copy op:move op:delete
@@ -105,6 +107,58 @@ children, and source location."
                                 '#,(datum->syntax #'form (cons file (+ line 1)))))
                  form)
              #'form))))))
+
+;; ---------- content hashing ----------
+;;
+;; A stable, content-derived hash for each op — the addressable identity
+;; `hexol tree` prints and `hexol show <hash>` resolves. It is a Merkle hash:
+;; an op's hash folds in its kind, its captured source form, its label, and
+;; the hashes of its children, so editing any op changes its own hash and
+;; its ancestors' (like a git tree) while leaving siblings untouched. The
+;; op's *effect* (an opaque closure) and its source *location* are
+;; deliberately excluded — the hash names what an op DOES structurally, not
+;; where it was written, so moving code between lines does not churn hashes.
+;;
+;; Genuinely identical sibling subtrees (same kind/source/label/children)
+;; share a hash; that is honest — there is nothing to tell them apart — and
+;; `show` reports the ambiguity rather than guessing. The hash is FNV-1a/64
+;; (no crypto needed for addressing, no external dependency); swap
+;; `fnv1a-64` for a gcrypt digest if collision resistance is ever required.
+
+(define %fnv-offset 14695981039346656037)
+(define %fnv-prime  1099511628211)
+(define %u64-mask   (- (expt 2 64) 1))
+
+(define (fnv1a-64 str)
+  "FNV-1a 64-bit hash of STR's UTF-8 bytes, as an exact integer."
+  (let ((bytes (string->utf8 str)))
+    (let loop ((i 0) (h %fnv-offset))
+      (if (>= i (bytevector-length bytes))
+          h
+          (loop (+ i 1)
+                (logand %u64-mask
+                        (* %fnv-prime
+                           (logxor h (bytevector-u8-ref bytes i)))))))))
+
+(define (%hex16 n)
+  "N (a 0..2^64-1 integer) as a 16-char zero-padded lowercase hex string."
+  (let ((s (number->string n 16)))
+    (string-append (make-string (max 0 (- 16 (string-length s))) #\0) s)))
+
+(define (op-content-hash op)
+  "Return OP's stable content hash, a 16-char lowercase hex string, derived
+from its kind, source form, label, and the content hashes of its children."
+  (let* ((child-hashes (map op-content-hash (op-children op)))
+         (canonical (string-append
+                     (symbol->string (op-kind op)) "\x00;"
+                     (format #f "~s" (op-source op)) "\x00;"
+                     (or (op-label op) "") "\x00;"
+                     (string-join child-hashes ","))))
+    (%hex16 (fnv1a-64 canonical))))
+
+(define* (op-short-hash op #:optional (n 8))
+  "The first N (default 8) characters of OP's content hash."
+  (substring (op-content-hash op) 0 n))
 
 ;; ---------- tracing ----------
 ;;

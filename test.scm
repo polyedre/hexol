@@ -249,6 +249,35 @@
        "https://charts.jetstack.io"
        (state-get alpha5 '(helm repos jetstack)))
 
+(format #t "~%kernel: op content hashing~%")
+(let* ((leaf-a  (make-op 'merge '(set foo) identity "set foo"))
+       (leaf-a2 (make-op 'merge '(set foo) identity "set foo"))
+       (leaf-b  (make-op 'merge '(set bar) identity "set bar"))
+       (parent  (make-op 'group '(group) identity #f (list leaf-a leaf-b)))
+       (parent2 (make-op 'group '(group) identity #f (list leaf-a leaf-b)))
+       (parent-reordered (make-op 'group '(group) identity #f (list leaf-b leaf-a))))
+  (check "op-hash deterministic" (op-content-hash leaf-a) (op-content-hash leaf-a2))
+  (check "op-hash is 16 hex chars" 16 (string-length (op-content-hash leaf-a)))
+  (check "op-short-hash default width" 8 (string-length (op-short-hash leaf-a)))
+  (check "op-short-hash is a prefix of the full hash" #t
+         (string-prefix? (op-short-hash leaf-a) (op-content-hash leaf-a)))
+  (check "op-hash differs by source/label" #t
+         (not (string=? (op-content-hash leaf-a) (op-content-hash leaf-b))))
+  (check "op-hash is Merkle: child order changes parent" #t
+         (not (string=? (op-content-hash parent) (op-content-hash parent-reordered))))
+  (check "op-hash stable across identical trees"
+         (op-content-hash parent) (op-content-hash parent2))
+  ;; The hash names what an op does, not where it was written: two ops with
+  ;; identical content but different source locations hash the same.
+  (check "op-hash ignores source location" #t
+         (string=?
+          (op-content-hash
+           (parameterize ((current-author-loc '("a.scm" . 1)))
+             (make-op 'merge '(set foo) identity "set foo")))
+          (op-content-hash
+           (parameterize ((current-author-loc '("b.scm" . 99)))
+             (make-op 'merge '(set foo) identity "set foo"))))))
+
 (format #t "~%~a~%"
         (if (zero? failures)
             "all checks passed"
