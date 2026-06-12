@@ -34,6 +34,7 @@
 
 (define-module (hexol secrets)
   #:use-module (hexol kernel)
+  #:use-module (hexol sh)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (srfi srfi-13)
@@ -42,11 +43,12 @@
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (json)
+  #:re-export (which-cmd)              ; shared PATH helper (defined in (hexol sh))
   #:export (secrets-store secret-ref secret-ref? secret-ref-key
             resolve-secret-refs
             ;; reused by (hexol secret-tool): the same serializer and
             ;; decrypt path the CLI seals/reads the store with.
-            clauses->sops-yaml decrypt-yaml which-cmd secrets-warn))
+            clauses->sops-yaml decrypt-yaml secrets-warn))
 
 ;; ---------- the secret-ref marker ----------
 ;;
@@ -190,19 +192,9 @@ decryption.  Resets any cached plaintext."
 (define (store->sops-yaml) (clauses->sops-yaml registered-store))
 
 ;; ---------- decryption (lazy, memoized) ----------
-
-;; Absolute path of COMMAND on PATH, or #f. (A local copy of k8s's
-;; `which-cmd` so this module needn't depend on (hexol k8s); resolving the
-;; path ourselves keeps a `~/`-prefixed PATH entry from tripping a child
-;; shell.)
-(define (which-cmd command)
-  (let* ((home   (or (getenv "HOME") ""))
-         (expand (lambda (dir)
-                   (if (string-prefix? "~/" dir)
-                       (string-append home (substring dir 1)) dir))))
-    (find (lambda (f) (and (file-exists? f) (access? f X_OK)))
-          (map (lambda (dir) (string-append (expand dir) "/" command))
-               (string-split (or (getenv "PATH") "") #\:)))))
+;;
+;; `which-cmd` (the PATH resolver) is the shared helper from (hexol sh),
+;; re-exported above.
 
 (define (secrets-warn fmt-str . args)
   (apply format (current-error-port)

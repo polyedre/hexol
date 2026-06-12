@@ -27,6 +27,7 @@
 (define-module (hexol k8s)
   #:use-module (hexol kernel)
   #:use-module (hexol surface)
+  #:use-module (hexol sh)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
   #:use-module (ice-9 format)
@@ -34,7 +35,10 @@
   #:use-module (ice-9 textual-ports)
   #:use-module (json)
   #:re-export (resource transform-resources annotate-all label-all
-               compose-ops)
+               compose-ops
+               ;; the shared PATH helper (defined in (hexol sh)), part of the
+               ;; external-manifest plumbing below.
+               which-cmd)
   #:export (;; namespace scope
             with-namespace current-k8s-namespace namespace
             ;; compact resources spec
@@ -46,7 +50,7 @@
             service-account role role-binding
             cluster-role cluster-role-binding cluster-rbac
             ;; external manifests (render-time splice into kubernetes_resources)
-            which-cmd json-manifests remote-manifest
+            json-manifests remote-manifest
             ;; composites
             app public-app worker
             ;; derive a Service from a workload
@@ -405,20 +409,8 @@ ClusterRoleBinding all sharing NAME — slots into a (when …) body."
 ;; (kubernetes_resources). `which-cmd` + `json-manifests` are the shared
 ;; plumbing; `remote-manifest` is the ready-made op for raw upstream YAML.
 ;; A consumer builds the others (a `helm template …` op, a `sops -d …` op) on
-;; the same two helpers.
-
-;; Absolute path of COMMAND on PATH, or #f. We resolve it ourselves (rather
-;; than rely on the shell) so a `cmd | yq …` pipe can call binaries by absolute
-;; path — robust even when PATH carries an unexpanded leading `~/` entry, which
-;; a bare command name in a child shell would miss.
-(define (which-cmd command)
-  "Return the absolute path of COMMAND on PATH, or #f if not found/executable."
-  (let* ((home   (or (getenv "HOME") ""))
-         (expand (lambda (dir)
-                   (if (string-prefix? "~/" dir) (string-append home (substring dir 1)) dir))))
-    (find (lambda (f) (and (file-exists? f) (access? f X_OK)))
-          (map (lambda (dir) (string-append (expand dir) "/" command))
-               (string-split (or (getenv "PATH") "") #\:)))))
+;; the same two helpers. `which-cmd` is the shared PATH resolver from
+;; (hexol sh), re-exported above.
 
 ;; guile-json renders JSON objects as string-keyed alists, arrays as vectors,
 ;; and JSON null as the symbol `null`; resource alists use symbol keys and
