@@ -217,8 +217,7 @@
 (define (cmd-render args)
   (let loop ((args args) (fmt "sexp") (path #f) (query '()) (inv #f))
     (match args
-      (() (do-render (or inv (usage-error "render: missing INVENTORY file"))
-                     fmt path query))
+      (() (do-render (inventory-or-default "render" inv) fmt path query))
       (((or "-o" "--output") f . rest) (loop rest f path query inv))
       (("--path" p . rest) (loop rest fmt (parse-path p) query inv))
       (((or "-q" "--query") q . rest) (loop rest fmt path (parse-query q) inv))
@@ -501,12 +500,24 @@ usage:
 ;; dispatch
 ;; ---------------------------------------------------------------------------
 
+;; The inventory is invariant across an exploration session but is every
+;; subcommand's last positional — exactly the token you must cursor back past
+;; to edit the leading HASH/PATH you're actually iterating on. Let $HEXOL_INVENTORY
+;; stand in when the positional is omitted, so the iterated token lands last
+;; and an up-arrow + edit-last is enough.
+(define (inventory-or-default cmd inv)
+  (or inv
+      (and=> (getenv "HEXOL_INVENTORY")
+             (lambda (v) (and (not (string-null? v)) v)))
+      (usage-error "~a: missing INVENTORY file (or set $HEXOL_INVENTORY)" cmd)))
+
 (define (single-positional cmd args)
-  ;; Subcommands that take exactly one positional (the inventory file).
+  ;; Subcommands that take exactly one positional (the inventory file), which
+  ;; may be supplied via $HEXOL_INVENTORY instead.
   (let ((files (filter (lambda (a) (not (string-prefix? "-" a))) args)))
     (match files
       ((inv) inv)
-      (() (usage-error "~a: missing INVENTORY file" cmd))
+      (() (inventory-or-default cmd #f))
       (_  (usage-error "~a: expected one INVENTORY file, got ~a" cmd (length files))))))
 
 (define usage-text "\
@@ -526,7 +537,11 @@ sexp (default) and json render the whole resolved state. -o yaml targets the
 playbook, emitted as JSON). -o NAME runs a renderer the inventory registered via
 `renders-with` (e.g. -o sql / -o ledger emit that file's domain text). --path
 overrides the target. -q/--query seeds the resolve with attributes (the query
-the engine folds over), e.g. -q dc=alpha,role=web.")
+the engine folds over), e.g. -q dc=alpha,role=web.
+
+INVENTORY may be omitted on any subcommand when $HEXOL_INVENTORY names it —
+so an exploration loop is just `explain PATH` with the iterated token last
+(up-arrow, edit the last token, re-run).")
 
 (define (dispatch args)
   (match (cdr args)
