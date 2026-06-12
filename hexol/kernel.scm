@@ -29,7 +29,9 @@
             ;; loader (exposed so other modules can override path resolution)
             load-inventory-file
             ;; optional per-file render adapters
-            current-renderers renders-with))
+            current-renderers renders-with
+            ;; optional per-file apply adapters (effects)
+            current-appliers applies-with))
 
 ;; ---------- op record ----------
 
@@ -515,6 +517,33 @@ the inventory file currently being loaded.  The CLI exposes it as `hexol
 render -o NAME`.  A no-op when no collector is bound."
   (let ((box (current-renderers)))
     (when box (set-car! box (cons (cons name proc) (car box)))))
+  *unspecified*)
+
+;; ---------- optional per-file apply adapters (effects) ----------
+;;
+;; The mirror of `renders-with`, but for *effects* rather than text. Where a
+;; renderer is a (state -> writes text) view, an applier is a (state dry? ->
+;; performs effects) procedure: it reads its slice of the resolved state and
+;; pushes it to the world (a `tofu apply`, a `kubectl apply`). The *inventory*
+;; registers each one under a NAME with `applies-with`, and `hexol apply` runs
+;; them in *registration order* — the order the `applies-with` calls appear in
+;; the file — against a single `resolve`. An explicit ORDER may be passed to
+;; override that placement. Selecting a subset (`--only NAME`) is just a filter
+;; on the registered set (order preserved); `--dry-run` is threaded through as
+;; the applier's second argument so each delegates to its tool's native
+;; dry-run. As with `renders-with`, the collector parameter is #f outside
+;; `apply`, so `applies-with` is a harmless no-op for render/tree/ops and the
+;; ops contract is unchanged.
+
+(define current-appliers (make-parameter #f))
+
+(define* (applies-with name proc #:optional (order #f))
+  "Register PROC, a (state dry? -> performs effects) applier, under string
+NAME.  Appliers run in registration order under `hexol apply'; pass an
+explicit ORDER (a number) only to override that placement.  A no-op when no
+collector is bound."
+  (let ((box (current-appliers)))
+    (when box (set-car! box (cons (list name order proc) (car box)))))
   *unspecified*)
 
 ;; ---------- loader ----------

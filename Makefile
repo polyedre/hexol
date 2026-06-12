@@ -21,7 +21,7 @@ test:
 	$(GUILE) -L . test/cmdb-server.scm
 
 build:
-	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol ansible) (hexol ledger) (hexol sql) (cmdb json)) (display "build ok\n"))'
+	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (cmdb json)) (display "build ok\n"))'
 
 clean:
 	rm -rf ~/.cache/guile/ccache/*$(CURDIR)*

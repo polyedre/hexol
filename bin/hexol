@@ -195,6 +195,17 @@
                  (load-inventory-file inv))))
       (values ops (reverse (car box))))))
 
+;; Like `load-ops`, but also collect any (name order proc) the file
+;; registered via `applies-with` — the effect adapters `apply` runs. Mirrors
+;; `load-ops+renderers`; only `apply` needs these.
+(define (load-ops+appliers inv)
+  (unless inv (usage-error "missing INVENTORY file"))
+  (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
+  (let ((box (list '())))
+    (let ((ops (parameterize ((current-appliers box))
+                 (load-inventory-file inv))))
+      (values ops (reverse (car box))))))
+
 (define (usage-error fmt . args)
   (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
   (format (current-error-port) "~a~%"
@@ -299,6 +310,66 @@
                ((string=? fmt "ansible") (emit-json target))  ; a playbook is valid JSON
                (else (usage-error "render: unknown output format ~s (~a)"
                                   fmt (format-list renderers)))))))))))
+
+;; ---------------------------------------------------------------------------
+;; apply — run the inventory's registered appliers (effects) against ONE
+;; resolved state, in order. `render` makes artifacts; `apply` pushes them.
+;; ---------------------------------------------------------------------------
+;;
+;;   hexol apply [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] INVENTORY
+;;
+;; Resolve once, run the appliers an inventory registered with `applies-with`
+;; in registration order, optionally keep only the named ones, and call each (proc state
+;; dry?). No hexol-level prompt — appliers lean on their tool's own gate
+;; (`tofu apply` prompts). --dry-run delegates to each tool's native dry-run
+;; and is meant to be paired with --only (a whole-pipeline dry-run is
+;; incoherent: the k8s dry-run needs the cluster the terraform phase builds).
+
+(define (parse-only s) (string-split s #\,))
+
+(define (cmd-apply args)
+  (let loop ((args args) (only #f) (dry? #f) (query '()) (inv #f))
+    (match args
+      (() (do-apply (inventory-or-default "apply" inv) only dry? query))
+      (("--dry-run" . rest) (loop rest only #t query inv))
+      (((or "--only" "-o") names . rest) (loop rest (parse-only names) dry? query inv))
+      (((or "-q" "--query") q . rest) (loop rest only dry? (parse-query q) inv))
+      ((arg . rest)
+       (cond
+         ((string-prefix? "--only=" arg) (loop rest (parse-only (substring arg 7)) dry? query inv))
+         ((string-prefix? "-" arg) (usage-error "apply: unknown flag ~a" arg))
+         (else (loop rest only dry? query arg)))))))
+
+(define (do-apply inv only dry? query)
+  (call-with-values (lambda () (load-ops+appliers inv))
+    (lambda (ops appliers)
+      (when (null? appliers)
+        (die "apply: ~a registers no appliers (use applies-with in the inventory)" inv))
+      ;; Validate every requested name before doing anything irreversible.
+      (when only
+        (for-each (lambda (name)
+                    (unless (assoc name appliers)
+                      (die "apply: no applier named ~s (have: ~a)"
+                           name (string-join (map car appliers) ", "))))
+                  only))
+      ;; Default order is registration order: stamp each applier with its
+      ;; position, and let an explicit `applies-with` order (when given)
+      ;; override that key. A stable sort then preserves registration order
+      ;; among appliers that share (or omit) an order.
+      (let* ((ordered (map (lambda (a i) (list (car a) (or (cadr a) i) (caddr a)))
+                           appliers (iota (length appliers))))
+             (chosen  (if only
+                          (filter (lambda (a) (member (car a) only)) ordered)
+                          ordered))
+             (sorted  (stable-sort chosen (lambda (a b) (< (cadr a) (cadr b)))))
+             (state   (resolve ops query)))   ; resolve ONCE; all appliers share it
+        (for-each
+          (lambda (a)
+            (format (current-error-port) ";; apply: ~a~a~%"
+                    (car a) (if dry? " (dry-run)" ""))
+            (force-output (current-error-port))
+            ((caddr a) state dry?))
+          sorted)))))
 
 ;; ---------------------------------------------------------------------------
 ;; tree — concise op-tree view (walks captured source recursively)
@@ -853,6 +924,9 @@ usage:
  (make-action "render" (cmd-is "render") (delegating-runner cmd-render)
    "render [-o sexp|json|yaml|terraform|ansible] [-q K=V,…] [--path a.b.c] INVENTORY"))
 (register-action!
+ (make-action "apply" (cmd-is "apply") (delegating-runner cmd-apply)
+   "apply  [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] INVENTORY"))
+(register-action!
  (make-action "tree" (cmd-is "tree") (delegating-runner cmd-tree)
    "tree    INVENTORY"))
 (register-action!
@@ -906,6 +980,12 @@ playbook, emitted as JSON). -o NAME runs a renderer the inventory registered via
 `renders-with` (e.g. -o sql / -o ledger emit that file's domain text). --path
 overrides the target. -q/--query seeds the resolve with attributes (the query
 the engine folds over), e.g. -q dc=alpha,role=web.
+
+apply runs the effect adapters an inventory registers with `applies-with`
+(e.g. tofu apply, kubectl apply), in their registered order, against one
+resolved state. --only NAME[,NAME…] runs just those; --dry-run delegates to
+each tool's native dry-run (pair it with --only). Appliers prompt via their
+own tool; there is no separate hexol confirmation.
 
 tree prints a stable content hash beside each op; `show HASH` resolves any
 unambiguous prefix of one to that op's kind, label, source, location(s),

@@ -40,7 +40,7 @@
   #:use-module (ice-9 format)
   #:re-export (resolve state-get state-set state-append state-delete deep-merge
                op? op-kind op-source op-effect apply-op compose-ops for-each-into
-               renders-with)
+               renders-with applies-with)
   #:export (hx-ops hx-each hx-merge hx-when hx-case hx-append
             hx-copy hx-move hx-delete
             $ attr get attrs str fmt

@@ -53,6 +53,7 @@
                                  ; remote-manifest — the external-manifest plumbing)
              (hexol terraform)   ; Terraform language vocabulary
              (hexol yaml)        ; emit-yaml-document — to build Talos user_data + helm values
+             (hexol apply)       ; terraform-applier / kubectl-applier — the `hexol apply` effects
              (hexol secrets)     ; secrets-store / secret-ref / resolve-secret-refs — inline sops
              (ice-9 textual-ports) ; get-string-all — read the SSH key / helm values file
              (srfi srfi-1)
@@ -633,6 +634,26 @@ template` and appends every manifest it emits to (kubernetes_resources)."
           (ovh/applicationKey         . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
           (ovh/applicationSecret      . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
           (wireguard/wg0.conf         . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")))))
+
+;; ---------------------------------------------------------------------------
+;; appliers (effects) — what `hexol apply` runs, in order, from the state
+;; ---------------------------------------------------------------------------
+;;
+;; `render` turns this inventory into artifacts; `apply` pushes them to the
+;; world. Each applier reads the resolved state directly — no intermediate
+;; file the user has to render and manage — and shells out to its tool. They
+;; run in the order registered here (terraform, then kubernetes), so the infra
+;; is built and its kubeconfig dumped to `deploy/kubeconfig` before the cluster
+;; is applied against it:
+;;
+;;   hexol apply examples/homelab.scm                  # whole bootstrap
+;;   hexol apply --only kubernetes examples/homelab.scm  # re-apply the cluster
+;;   hexol apply --only terraform --dry-run …          # tofu plan only
+;;
+;; No hexol-level prompt: `tofu apply` gates itself; kubectl applies directly.
+(terraform-applier #:workdir "deploy" #:binary "tofu"
+                   #:output->file '(("kubeconfig" . "deploy/kubeconfig")))
+(kubectl-applier #:kubeconfig "deploy/kubeconfig" #:server-side #t)
 
 ;; ---------------------------------------------------------------------------
 ;; the homelab
