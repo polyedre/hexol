@@ -425,6 +425,19 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                         "/releases/download/~a/experimental-install.yaml")
          gateway-api-version)))
 
+;; cert-manager's CRDs, pulled from the chart's standalone CRD bundle and
+;; applied as a pre-step — so the ClusterIssuer / Certificate CRs below
+;; validate at apply time even though cert-manager *itself* is installed by
+;; Flux (asynchronously). The Flux HelmRelease runs with crds disabled, so the
+;; two never fight over CRD ownership. Same pattern as `gateway-api-crds`;
+;; pinned to the chart version below.
+(define cert-manager-version "v1.15.1")
+(define (cert-manager-crds)
+  (remote-manifest "cert-manager-crds"
+    (fmt (string-append "https://github.com/cert-manager/cert-manager"
+                        "/releases/download/~a/cert-manager.crds.yaml")
+         cert-manager-version)))
+
 ;; Secrets are no longer spliced from per-secret `*.sops.yaml` files; they live
 ;; in one inline `(secrets-store …)` (below), referenced at each field with
 ;; `(secret-ref 'key)` and decrypted once at render time by the terminal
@@ -615,7 +628,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
        (dir   (if here (dirname here) "."))
        (local (string-append dir "/homelab.secrets.scm")))
   (if (file-exists? local)
-      (load local)                          ; real store wins (last registration)
+      (primitive-load local)                ; real store wins (last registration)
       (secrets-store                        ; committed, self-contained dummy
         (version "3.12.2")
         (lastmodified "1970-01-01T00:00:00Z")
@@ -744,14 +757,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     #:subnet "talos" #:ext-net (cfg 'ext-net)
     #:listeners
     (list (lb-listener "kube-api" #:port 6443 #:monitor #t #:backends (node-backends))
-          (lb-listener "ingress-http"  #:port 80
-                       #:member-port (cfg 'ingress-http-hostport)  #:backends (node-backends))
-          (lb-listener "ingress-https" #:port 443
-                       #:member-port (cfg 'ingress-https-hostport) #:backends (node-backends))
-          ;; the VPN: a UDP listener forwarding 51820 to the WireGuard pod
-          ;; (host-networked on every node).
-          (lb-listener "wireguard" #:port (cfg 'wg-port) #:protocol "UDP"
-                       #:backends (node-backends))))
+          (lb-listener "ingress-http"  #:port 80 #:member-port (cfg 'ingress-http-hostport)  #:backends (node-backends))
+          (lb-listener "ingress-https" #:port 443 #:member-port (cfg 'ingress-https-hostport) #:backends (node-backends))
+          (lb-listener "wireguard" #:port (cfg 'wg-port) #:protocol "UDP" #:backends (node-backends))))
 
   ;; DNS. PUBLIC names resolve to the LB's floating IP: `api.<domain>` (kube-API
   ;; 6443), `vpn.<domain>` (the WireGuard UDP endpoint), and `jellyfin.<domain>`
@@ -759,6 +767,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; resolves to the private node IPs — routable only over the VPN — so every
   ;; other app is private by default (reached on the private Gateway via the
   ;; node network). Explicit records beat the wildcard, so the public names win.
+  ;; TODO: Move this to a map too
   (dns-a "api"      (str "api." (cfg 'domain))
          #:target (ref openstack_networking_floatingip_v2 api address))
   (dns-a "vpn"      (str "vpn." (cfg 'domain))
@@ -778,7 +787,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     (depends_on (list "openstack_networking_floatingip_associate_v2.cp-1")))
 
   ;; Pull the kubeconfig + talosconfig back out as Terraform outputs.
-  (terraform-data "talos_cluster_kubeconfig" "this"
+  ;; talos_cluster_kubeconfig is the *resource* (the data source of the same
+  ;; name is deprecated and slated for removal); it fetches the kubeconfig once
+  ;; the bootstrap has run and stores it in state.
+  (terraform-resource "talos_cluster_kubeconfig" "this"
     (client_configuration (ref talos_machine_secrets this client_configuration))
     (node       (tf-ref "openstack_networking_floatingip_v2" "cp-1" "address"))
     (depends_on (list "talos_machine_bootstrap.this")))
@@ -790,7 +802,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (terraform-output "api_endpoint"
     (value (ref openstack_networking_floatingip_v2 api address)))
   (terraform-output "kubeconfig"
-    (value (tf-ref "data.talos_cluster_kubeconfig" "this" "kubeconfig_raw"))
+    (value (ref talos_cluster_kubeconfig this kubeconfig_raw))
     (sensitive #t))
   (terraform-output "talosconfig"
     (value (tf-ref "data.talos_client_configuration" "this" "talos_config"))
@@ -893,11 +905,13 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (namespace "vpn" #:labels '((pod-security.kubernetes.io/enforce . "privileged")))
   ;; wg0.conf (server key + peers) comes from the inline secrets-store,
   ;; resolved into this Secret's stringData at render time.
+  ;; TODO: This should use the standard library of k8s.scm. Patch it if needed
   (resource
     `((apiVersion . "v1") (kind . "Secret")
       (metadata (namespace . "vpn") (name . "wireguard-config"))
       (type . "Opaque")
       (stringData (wg0.conf . ,(secret-ref 'wireguard/wg0.conf)))))
+  ;; TODO: This should use the standard library of k8s.scm. Patch it if needed
   (resource
     `((apiVersion . "apps/v1") (kind . "DaemonSet")
       (metadata (namespace . "vpn") (name . "wireguard") (labels (app . "wireguard")))
@@ -922,6 +936,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                   ((name . "modules") (hostPath (path . "/lib/modules")))))))))
 
   ;; --- Flux: the GitOps controller that reconciles everything below ---
+  ;; TODO: Move with-namespace here
   (helm-template #:name "flux2" #:namespace "flux-system"
     #:chart "flux2" #:repo "https://fluxcd-community.github.io/helm-charts"
     #:version "2.14.0")
@@ -930,11 +945,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 
   ;; chart sources (helm-repository defaults to the flux-system namespace,
   ;; declared up front for the bootstrap above — no with-namespace needed).
-  (helm-repository #:name "jetstack"             #:url "https://charts.jetstack.io")
-  (helm-repository #:name "prometheus-community"
-                   #:url "https://prometheus-community.github.io/helm-charts")
-  (helm-repository #:name "cert-manager-webhook-ovh"
-                   #:url "https://aureq.github.io/cert-manager-webhook-ovh/")
+  (helm-repository #:name "jetstack" #:url "https://charts.jetstack.io")
+  (helm-repository #:name "prometheus-community" #:url "https://prometheus-community.github.io/helm-charts")
+  (helm-repository #:name "cert-manager-webhook-ovh" #:url "https://aureq.github.io/cert-manager-webhook-ovh/")
 
   ;; --- cert-manager (Flux): ACME wildcard cert for *.<domain> ---
   ;; The cert is a *wildcard* (`*.<domain>`), which Let's Encrypt only issues
@@ -945,9 +958,15 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; namespace it belongs to) and spliced inline — encrypted at rest in the repo,
   ;; yet `-o yaml` stays a complete, self-contained stream that carries no
   ;; plaintext secret on disk. `groupName` must match the webhook chart + solver.
+  ;;
+  ;; CRDs are pre-applied by `(cert-manager-crds)` below, so this release runs
+  ;; with `crds.enabled #f` — Flux owns the controller, the pre-step owns the
+  ;; CRDs, and the ClusterIssuer/Certificate CRs validate without waiting for
+  ;; Flux to reconcile the chart.
+  (cert-manager-crds)
   (helm-release #:name "cert-manager" #:repo "jetstack"
-    #:chart "cert-manager" #:version "v1.15.1" #:target-namespace "cert-manager"
-    #:values '((crds (enabled . #t))))
+    #:chart "cert-manager" #:version cert-manager-version #:target-namespace "cert-manager"
+    #:values '((crds (enabled . #f))))
   (helm-release #:name "cert-manager-webhook-ovh" #:repo "cert-manager-webhook-ovh"
     #:chart "cert-manager-webhook-ovh" #:version "0.9.10" #:target-namespace "cert-manager"
     #:values `((groupName . ,(str "acme." (cfg 'domain)))))
@@ -1035,4 +1054,5 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; Decrypt the inline secrets-store and substitute every (secret-ref …) with
   ;; its plaintext.  Placed last so it sees every resource; runs only during
   ;; render, never for `tree`/`ops`.
-  (resolve-secret-refs))
+  (resolve-secret-refs)
+  (checksum-config))
