@@ -476,26 +476,32 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
               (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
               (service-account #f))
   "Return a bundle op for a typical internal app: a Deployment plus a
-matching Service, both named NAME running IMAGE on PORT."
+matching Service derived from it with `expose', both named NAME running IMAGE
+on PORT.  The Service's selector and ports track the workload's actual labels
+and container ports, so they can never drift from the Deployment."
   (compose-ops 'app `(app ,name)
-    (list (deployment #:name name #:image image #:port port #:replicas replicas
-                      #:namespace namespace #:env env #:env-from env-from #:volumes volumes
-                      #:resources resources #:privileged privileged
-                      #:service-account service-account)
-          (service #:name name #:port port #:namespace namespace))))
+    (list (expose
+            (deployment #:name name #:image image #:port port #:replicas replicas
+                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                        #:resources resources #:privileged privileged
+                        #:service-account service-account)))))
 
 (define* (public-app #:key name image (port 8080) (replicas 2) (namespace (current-k8s-namespace))
                      (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                     (service-account #f))
-  "Return a bundle op for an internet-facing app: a Deployment, a Service,
-and an Ingress, all named NAME running IMAGE on PORT."
+                     (service-account #f) (host #f))
+  "Return a bundle op for an internet-facing app: a Deployment, a matching
+Service derived from it with `expose', and an Ingress, all named NAME running
+IMAGE on PORT.  The Service's selector and ports track the workload's actual
+labels and container ports, so they can never drift from the Deployment.  The
+Ingress routes #:HOST (defaulting to \"NAME.example.com\") — pass #:host to use
+a subdomain that differs from the app name."
   (compose-ops 'public-app `(public-app ,name)
-    (list (deployment #:name name #:image image #:port port #:replicas replicas
-                      #:namespace namespace #:env env #:env-from env-from #:volumes volumes
-                      #:resources resources #:privileged privileged
-                      #:service-account service-account)
-          (service #:name name #:port port #:namespace namespace)
-          (ingress #:name name #:port port #:namespace namespace))))
+    (list (expose
+            (deployment #:name name #:image image #:port port #:replicas replicas
+                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                        #:resources resources #:privileged privileged
+                        #:service-account service-account))
+          (ingress #:name name #:port port #:namespace namespace #:host host))))
 
 (define* (worker #:key name image (replicas 1) (namespace (current-k8s-namespace))
                  (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
@@ -514,9 +520,11 @@ running IMAGE with no exposed port and no Service."
 ;;
 ;; `(expose (deployment ...))` folds the workload op, then reads the
 ;; resource it produced and appends a matching Service: same name +
-;; namespace, selector (app . <name>), one Service port per distinct
-;; container port found across all containers. A single port is named
-;; "http"; with several it's "port-<n>". No ports found -> no Service.
+;; namespace, a selector copied verbatim from the workload's own
+;; spec.selector.matchLabels (so it selects exactly the pods that workload
+;; owns), and one Service port per distinct container port found across all
+;; containers. A single port is named "http"; with several it's "port-<n>".
+;; No ports found -> no Service.
 
 ;; `append` is shadowed by the surface op-macro in this module; gather with
 ;; concatenate.
@@ -531,11 +539,19 @@ running IMAGE with no exposed port and no Service."
 
 (define (service-from-workload wl)
   "Build a Service resource alist from the workload alist WL: same name and
-namespace, selector (app . <name>), one Service port per distinct container
-port (named \"http\" if one, \"port-<n>\" if several)."
+namespace, one Service port per distinct container port (named \"http\" if one,
+\"port-<n>\" if several), and a selector copied verbatim from the workload's
+own spec.selector.matchLabels — so the Service selects exactly the pods the
+workload owns (falling back to (app . <name>) if the workload declares no
+matchLabels)."
   (let* ((meta  (or (assq-ref wl 'metadata) '()))
          (name  (assq-ref meta 'name))
          (ns    (assq-ref meta 'namespace))
+         (selector (or (assq-ref (or (assq-ref (or (assq-ref wl 'spec) '())
+                                                'selector)
+                                     '())
+                                 'matchLabels)
+                       `((app . ,name))))
          (ports (delete-duplicates (collect-container-ports wl)))
          (multi (> (length ports) 1))
          (port-entries
@@ -546,7 +562,7 @@ port (named \"http\" if one, \"port-<n>\" if several)."
     `((apiVersion . "v1")
       (kind . "Service")
       (metadata ,@(if ns `((namespace . ,ns)) '()) (name . ,name) (labels (app . ,name)))
-      (spec (selector (app . ,name))
+      (spec (selector ,@selector)
             (ports ,@port-entries)))))
 
 (define (expose workload-op)
