@@ -60,9 +60,68 @@
 ;; shared helpers
 ;; ---------------------------------------------------------------------------
 
+;; ---------------------------------------------------------------------------
+;; color — ANSI styling, gated per-port on a TTY and the NO_COLOR convention
+;; ---------------------------------------------------------------------------
+;; Coloring is decoration only: it never reaches piped output (the port isn't
+;; a terminal then) and honors NO_COLOR. stdout and stderr are gated
+;; independently, so `… 2>&1 | less` strips both. The data renders (sexp /
+;; json / yaml / terraform / ansible) are left untouched — only the
+;; human-facing views (tree / ops / explain / show) and diagnostics paint.
+
+(define no-color? (and (getenv "NO_COLOR") #t))
+(define (port-color? port) (and (not no-color?) (isatty? port)))
+(define stdout-color? (port-color? (current-output-port)))
+(define stderr-color? (port-color? (current-error-port)))
+
+;; Build the ESC byte explicitly: Guile's string \x escape is version-
+;; dependent (2.2+ wants a `\xHH;` terminator and consumes it; 3.0 in some
+;; builds reads `\x1b` greedily and leaves a stray `;` in the string, which
+;; turns ESC[…m into a malformed ESC;[…m that no terminal renders).
+(define esc (string (integer->char 27)))
+(define (paint on? code s)
+  (if on? (string-append esc "[" code "m" s esc "[0m") s))
+
+;; stdout painters (the views)
+(define (o-dim s)   (paint stdout-color? "2"  s))
+(define (o-bold s)  (paint stdout-color? "1"  s))
+(define (o-red s)   (paint stdout-color? "31" s))
+(define (o-green s) (paint stdout-color? "32" s))
+(define (o-yellow s)  (paint stdout-color? "33" s))
+(define (o-cyan s)    (paint stdout-color? "36" s))
+(define (o-magenta s) (paint stdout-color? "35" s))
+;; stderr painters (diagnostics)
+(define (e-dim s)   (paint stderr-color? "2"  s))
+(define (e-red s)   (paint stderr-color? "31" s))
+
+;; Tint a tree/ops label by its leading keyword so the views scan at a glance.
+;; Keying on the displayed label (rather than the internal op-kind) keeps the
+;; palette aligned with what the reader actually sees — `module`, `data`,
+;; `terraform`, etc. A bare one-word label is a section/group op and reads as
+;; bold; an unrecognized keyword is left unpainted.
+(define (label-paint label)
+  (let* ((sp   (string-index label #\space))
+         (head (if sp (substring label 0 sp) label))
+         (code (cond
+                 ((string=? head "module")    "36")   ; cyan
+                 ((string=? head "resource")  "32")   ; green
+                 ((string=? head "terraform") "32")   ; green — raw TF resource
+                 ((string=? head "data")      "34")   ; blue
+                 ((string=? head "provider")  "35")   ; magenta
+                 ((string=? head "set")       "33")   ; yellow
+                 ((string=? head "append")    "33")   ; yellow
+                 ((string=? head "load")      "35")   ; magenta
+                 ((not sp)                    "1")    ; bare group/section op → bold
+                 (else #f))))
+    (if code (paint stdout-color? code label) label)))
+
+;; A `;;`-prefixed informational line on stdout (the comment-style headers the
+;; views print). The format string keeps its own trailing ~%.
+(define (note fmt . args)
+  (display (o-dim (apply format #f fmt args))))
+
 (define (die fmt . args)
-  (apply format (current-error-port) fmt args)
-  (newline (current-error-port))
+  (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
   (exit 2))
 
 (define (parse-token s)
@@ -103,9 +162,9 @@
       (values ops (reverse (car box))))))
 
 (define (usage-error fmt . args)
-  (apply format (current-error-port) (string-append fmt "~%") args)
-  (format (current-error-port)
-          "usage: hexol <render|tree|ops|explain> ... INVENTORY  (hexol --help)~%")
+  (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
+  (format (current-error-port) "~a~%"
+          (e-dim "usage: hexol <render|tree|ops|explain> ... INVENTORY  (hexol --help)"))
   (exit 2))
 
 ;; ---------------------------------------------------------------------------
@@ -141,9 +200,9 @@
   ;; pretty-print ends with a newline, so the newline count is the line count.
   (let ((lines (1- (length (string-split text #\newline)))))
     (when (> lines 80)
-      (format (current-error-port)
-              ";; ~a lines — drill in with `--path KEY`, or see the op tree: hexol tree ~a~%"
-              lines inv))))
+      (format (current-error-port) "~a~%"
+              (e-dim (format #f ";; ~a lines — drill in with `--path KEY`, or see the op tree: hexol tree ~a"
+                             lines inv))))))
 
 (define (emit-json obj) (display (sexp->json-string obj)) (newline))
 
@@ -242,7 +301,7 @@
     (string-concatenate (map (lambda (b) (if b "│  " "   ")) bars))
     (if last? "└─ " "├─ ")))
 
-(define (line bars last? label) (string-append (prefix bars last?) label))
+(define (line bars last? label) (string-append (o-dim (prefix bars last?)) label))
 
 (define (printable-source? form) (and (pair? form) (symbol? (car form))))
 
@@ -254,13 +313,13 @@
         (loop (cdr xs) (+ i 1))))))
 
 (define (walk-op op bars last?)
-  (display (line bars last? (or (op-label op) (symbol->string (op-kind op)))))
+  (display (line bars last? (label-paint (or (op-label op) (symbol->string (op-kind op))))))
   (newline)
   (walk-op-children op (concatenate (list bars (list (not last?))))))
 
 (define (walk-source form bars last?)
   (when (printable-source? form)
-    (display (line bars last? (label-from-source form)))
+    (display (line bars last? (label-paint (label-from-source form))))
     (newline)
     (walk-children form (concatenate (list bars (list (not last?)))))))
 
@@ -288,7 +347,7 @@
 (define (cmd-tree args)
   (let ((inv (single-positional "tree" args)))
     (let ((ops (load-ops inv)))
-      (format #t ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
+      (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
       (walk-list ops '() walk-op))))
 
 ;; ---------------------------------------------------------------------------
@@ -298,14 +357,14 @@
 (define (cmd-ops args)
   (let ((inv (single-positional "ops" args)))
     (let ((ops (load-ops inv)))
-      (format #t ";; inventory: ~a~%" inv)
-      (format #t ";; ~a top-level ops~%" (length ops))
-      (format #t ";; ----~%")
+      (note ";; inventory: ~a~%" inv)
+      (note ";; ~a top-level ops~%" (length ops))
+      (note ";; ----~%")
       (let loop ((ops ops) (i 1))
         (unless (null? ops)
           (let ((op (car ops)))
             (format #t "~3d. ~a~30t~a~%     " i (op-kind op)
-                    (loc->string (op-loc op)))
+                    (o-dim (loc->string (op-loc op))))
             (pretty-print (op-source op))
             (loop (cdr ops) (+ i 1))))))))
 
@@ -396,8 +455,8 @@ usage:
   hexol secret init               INVENTORY")
 
 (define (secret-error fmt . args)
-  (apply format (current-error-port) (string-append fmt "~%") args)
-  (format (current-error-port) "~a~%" secret-usage)
+  (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
+  (format (current-error-port) "~a~%" (e-dim secret-usage))
   (exit 2))
 
 ;; Pull the positionals out of ARGS (no flags in this command family yet),
@@ -490,11 +549,12 @@ the engine folds over), e.g. -q dc=alpha,role=web.")
     ;; The standard (scm-error) shape: (subr message message-args . _),
     ;; where subr may be #f. Fill the ~S/~A holes in the message.
     ((subr (? string? msg) margs . _)
-     (format (current-error-port) "hexol: ")
-     (when subr (format (current-error-port) "~a: " subr))
-     (apply format (current-error-port) msg (or margs '()))
-     (newline (current-error-port)))
-    (_ (format (current-error-port) "hexol: ~a: ~s~%" key args))))
+     (format (current-error-port) "~a" (e-red "hexol: "))
+     (when subr (format (current-error-port) "~a" (e-red (format #f "~a: " subr))))
+     (format (current-error-port) "~a~%"
+             (e-red (apply format #f msg (or margs '())))))
+    (_ (format (current-error-port) "~a~%"
+               (e-red (format #f "hexol: ~a: ~s" key args))))))
 
 (define (main args)
   (if (getenv "HEXOL_DEBUG")
