@@ -12,11 +12,13 @@
 ;;; things. Each action is still a view of one computation — the same op record
 ;;; and the same `resolve` fold:
 ;;;
-;;;   hexol render [-o FMT] [-q Q] [--path P] INVENTORY  resolve + emit (default)
-;;;   hexol tree                          INVENTORY   the op tree, indented
-;;;   hexol ops                           INVENTORY   top-level ops + source
-;;;   hexol explain [-q Q] PATH|HASH      INVENTORY   ops that touched PATH
+;;;   hexol render [-o FMT] [-q Q] [--path P] [-i INV]  resolve + emit (default)
+;;;   hexol tree                          [-i INV]   the op tree, indented
+;;;   hexol ops                           [-i INV]   top-level ops + source
+;;;   hexol explain [-q Q] PATH|HASH      [-i INV]   ops that touched PATH
 ;;;                                                  (or every path an op changed)
+;;;
+;;; The inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
 ;;;
 ;;; render formats (-o / --output): sexp (default), json, yaml, terraform, ansible,
 ;;; plus any name an inventory file registers with `renders-with`.
@@ -209,7 +211,7 @@
 (define (usage-error fmt . args)
   (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
   (format (current-error-port) "~a~%"
-          (e-dim (format #f "usage: hexol <~a> ... INVENTORY  (hexol --help)" (verb-list))))
+          (e-dim (format #f "usage: hexol <~a> … [-i INVENTORY]  (hexol --help)" (verb-list))))
   (exit 2))
 
 ;; ---------------------------------------------------------------------------
@@ -260,22 +262,24 @@
   (emit-terraform-json (current-output-port) obj))
 
 (define (cmd-render args)
-  (let loop ((args args) (fmt "sexp") (path #f) (query '()) (inv #f))
-    (match args
-      (() (do-render (inventory-or-default "render" inv) fmt path query))
-      (((or "-o" "--output") f . rest) (loop rest f path query inv))
-      (("--path" p . rest) (loop rest fmt (parse-path p) query inv))
-      (((or "-q" "--query") q . rest) (loop rest fmt path (parse-query q) inv))
-      ((arg . rest)
-       (cond
-         ((string-prefix? "--output=" arg)
-          (loop rest (substring arg 9) path query inv))
-         ((string-prefix? "--path=" arg)
-          (loop rest fmt (parse-path (substring arg 7)) query inv))
-         ((string-prefix? "--query=" arg)
-          (loop rest fmt path (parse-query (substring arg 8)) inv))
-         ((string-prefix? "-" arg) (usage-error "render: unknown flag ~a" arg))
-         (else (loop rest fmt path query arg)))))))
+  (call-with-values (lambda () (extract-inventory "render" args))
+    (lambda (inv rest)
+      (let loop ((args rest) (fmt "sexp") (path #f) (query '()))
+        (match args
+          (() (do-render (inventory-or-default "render" inv) fmt path query))
+          (((or "-o" "--output") f . rest) (loop rest f path query))
+          (("--path" p . rest) (loop rest fmt (parse-path p) query))
+          (((or "-q" "--query") q . rest) (loop rest fmt path (parse-query q)))
+          ((arg . rest)
+           (cond
+             ((string-prefix? "--output=" arg)
+              (loop rest (substring arg 9) path query))
+             ((string-prefix? "--path=" arg)
+              (loop rest fmt (parse-path (substring arg 7)) query))
+             ((string-prefix? "--query=" arg)
+              (loop rest fmt path (parse-query (substring arg 8))))
+             ((string-prefix? "-" arg) (usage-error "render: unknown flag ~a" arg))
+             (else (usage-error "render: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
 ;; The full format list for error messages: the built-ins plus whatever
 ;; names this file registered via `renders-with`, joined uniformly.
@@ -316,7 +320,7 @@
 ;; resolved state, in order. `render` makes artifacts; `apply` pushes them.
 ;; ---------------------------------------------------------------------------
 ;;
-;;   hexol apply [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] INVENTORY
+;;   hexol apply [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] [-i INVENTORY]
 ;;
 ;; Resolve once, run the appliers an inventory registered with `applies-with`
 ;; in registration order, optionally keep only the named ones, and call each (proc state
@@ -328,17 +332,19 @@
 (define (parse-only s) (string-split s #\,))
 
 (define (cmd-apply args)
-  (let loop ((args args) (only #f) (dry? #f) (query '()) (inv #f))
-    (match args
-      (() (do-apply (inventory-or-default "apply" inv) only dry? query))
-      (("--dry-run" . rest) (loop rest only #t query inv))
-      (((or "--only" "-o") names . rest) (loop rest (parse-only names) dry? query inv))
-      (((or "-q" "--query") q . rest) (loop rest only dry? (parse-query q) inv))
-      ((arg . rest)
-       (cond
-         ((string-prefix? "--only=" arg) (loop rest (parse-only (substring arg 7)) dry? query inv))
-         ((string-prefix? "-" arg) (usage-error "apply: unknown flag ~a" arg))
-         (else (loop rest only dry? query arg)))))))
+  (call-with-values (lambda () (extract-inventory "apply" args))
+    (lambda (inv rest)
+      (let loop ((args rest) (only #f) (dry? #f) (query '()))
+        (match args
+          (() (do-apply (inventory-or-default "apply" inv) only dry? query))
+          (("--dry-run" . rest) (loop rest only #t query))
+          (((or "--only" "-o") names . rest) (loop rest (parse-only names) dry? query))
+          (((or "-q" "--query") q . rest) (loop rest only dry? (parse-query q)))
+          ((arg . rest)
+           (cond
+             ((string-prefix? "--only=" arg) (loop rest (parse-only (substring arg 7)) dry? query))
+             ((string-prefix? "-" arg) (usage-error "apply: unknown flag ~a" arg))
+             (else (usage-error "apply: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
 (define (do-apply inv only dry? query)
   (call-with-values (lambda () (load-ops+appliers inv))
@@ -462,7 +468,7 @@
                 bars walk-source))))
 
 (define (cmd-tree args)
-  (let ((inv (single-positional "tree" args)))
+  (let ((inv (inventory-only "tree" args)))
     (let ((ops (load-ops inv)))
       (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
         (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
@@ -473,7 +479,7 @@
 ;; ---------------------------------------------------------------------------
 
 (define (cmd-ops args)
-  (let ((inv (single-positional "ops" args)))
+  (let ((inv (inventory-only "ops" args)))
     (let ((ops (load-ops inv)))
       (note ";; inventory: ~a~%" inv)
       (note ";; ~a top-level ops~%" (length ops))
@@ -517,21 +523,22 @@
                    hits)))))))
 
 (define (cmd-explain args)
-  ;; explain [--query K=V,…] TARGET INVENTORY  — TARGET is the first positional,
-  ;; either a state PATH (a.b.c) or an op hash prefix (see do-explain).
-  (let loop ((args args) (target #f) (query '()) (inv #f))
-    (match args
-      (()
-       (unless target (usage-error "explain: missing PATH or HASH"))
-       (do-explain (inventory-or-default "explain" inv) target query))
-      (((or "-q" "--query") q . rest) (loop rest target (parse-query q) inv))
-      ((arg . rest)
-       (cond ((string-prefix? "--query=" arg)
-              (loop rest target (parse-query (substring arg 8)) inv))
-             ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
-             ((not target) (loop rest arg query inv))
-             ((not inv)    (loop rest target query arg))
-             (else (usage-error "explain: unexpected argument ~a" arg)))))))
+  ;; explain [-q K=V,…] TARGET  — TARGET is the sole positional, either a state
+  ;; PATH (a.b.c) or an op hash prefix (see do-explain). Inventory is -i/env.
+  (call-with-values (lambda () (extract-inventory "explain" args))
+    (lambda (inv rest)
+      (let loop ((args rest) (target #f) (query '()))
+        (match args
+          (()
+           (unless target (usage-error "explain: missing PATH or HASH"))
+           (do-explain (inventory-or-default "explain" inv) target query))
+          (((or "-q" "--query") q . rest) (loop rest target (parse-query q)))
+          ((arg . rest)
+           (cond ((string-prefix? "--query=" arg)
+                  (loop rest target (parse-query (substring arg 8))))
+                 ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
+                 ((not target) (loop rest arg query))
+                 (else (usage-error "explain: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
 ;; The state paths OP changed when it fired — the keys of its state delta.
 ;; Mirrors show-delta's trace walk, but returns the paths instead of printing.
@@ -812,73 +819,72 @@
            (lambda (final trace) (show-delta op trace))))))))
 
 (define (cmd-show args)
-  (let ((pos (filter (lambda (a) (not (string-prefix? "-" a))) args)))
-    (match pos
-      ((hash inv) (do-show inv hash))
-      ((hash) (do-show (inventory-or-default "show" #f) hash))
-      (() (usage-error "show: missing HASH and INVENTORY file"))
-      (_  (usage-error "show: want HASH INVENTORY")))))
+  (call-with-values (lambda () (extract-inventory "show" args))
+    (lambda (inv rest)
+      (match rest
+        ((hash) (if (string-prefix? "-" hash)
+                    (usage-error "show: unknown flag ~a" hash)
+                    (do-show (inventory-or-default "show" inv) hash)))
+        (() (usage-error "show: missing HASH"))
+        (_  (usage-error "show: want a single HASH (inventory is -i/--inventory)"))))))
 
 ;; ---------------------------------------------------------------------------
 ;; secret — manage the inline (secrets-store …) in an inventory
 ;; ---------------------------------------------------------------------------
 ;;
-;; Every verb takes the INVENTORY file as its last positional; the mutating
-;; ones rewrite only the store form's span in place. Plaintext only ever
-;; reaches stdout (`get`) or $EDITOR (`edit`), never the file or a log.
+;; Like every verb, the inventory is -i/--inventory (or $HEXOL_INVENTORY), never
+;; a positional — so a secret verb's positionals are purely its domain tokens
+;; (KEY, VALUE). The mutating verbs rewrite only the store form's span in place;
+;; plaintext only ever reaches stdout (`get`) or $EDITOR (`edit`), never the
+;; file or a log.
 
 (define secret-usage "\
 usage:
-  hexol secret ls                 INVENTORY
-  hexol secret get  KEY           INVENTORY
-  hexol secret set  KEY [VALUE]   INVENTORY   (VALUE omitted → read stdin)
-  hexol secret edit KEY           INVENTORY   ($EDITOR round-trip)
-  hexol secret rm   KEY           INVENTORY
-  hexol secret rekey              INVENTORY
-  hexol secret init               INVENTORY")
+  hexol secret ls               [-i INVENTORY]
+  hexol secret get  KEY         [-i INVENTORY]
+  hexol secret set  KEY [VALUE] [-i INVENTORY]   (VALUE omitted → read stdin)
+  hexol secret edit KEY         [-i INVENTORY]   (one value, $EDITOR round-trip)
+  hexol secret edit             [-i INVENTORY]   (whole store as an editable alist)
+  hexol secret rm   KEY         [-i INVENTORY]
+  hexol secret rekey            [-i INVENTORY]
+  hexol secret init             [-i INVENTORY]
+
+The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 
 (define (secret-error fmt . args)
   (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
   (format (current-error-port) "~a~%" (e-dim secret-usage))
   (exit 2))
 
-;; Pull the positionals out of ARGS (no flags in this command family yet),
-;; expecting exactly N of them; the inventory is always the last.
-(define (secret-positionals verb n args)
-  (let ((pos (filter (lambda (a) (not (string-prefix? "-" a))) args)))
-    (unless (= (length pos) n)
-      (secret-error "secret ~a: expected ~a argument~p, got ~a"
-                    verb n n (length pos)))
-    pos))
-
 (define (cmd-secret args)
   (match args
     (() (display secret-usage) (newline) (exit 0))
     (((or "-h" "--help") . _) (display secret-usage) (newline) (exit 0))
-    (("ls" . rest)
-     (match (secret-positionals "ls" 1 rest) ((inv) (secret-ls inv))))
-    (("get" . rest)
-     (match (secret-positionals "get" 2 rest)
-       ((key inv) (secret-get inv (string->symbol key)))))
-    (("set" . rest)
-     ;; set KEY VALUE INVENTORY  (3 positionals), or set KEY INVENTORY (2 →
-     ;; read the value from stdin).
-     (let ((pos (filter (lambda (a) (not (string-prefix? "-" a))) rest)))
-       (match pos
-         ((key value inv) (secret-set inv (string->symbol key) value))
-         ((key inv)       (secret-set inv (string->symbol key) #f))
-         (_ (secret-error "secret set: want KEY [VALUE] INVENTORY")))))
-    (("edit" . rest)
-     (match (secret-positionals "edit" 2 rest)
-       ((key inv) (secret-edit inv (string->symbol key)))))
-    (("rm" . rest)
-     (match (secret-positionals "rm" 2 rest)
-       ((key inv) (secret-rm inv (string->symbol key)))))
-    (("rekey" . rest)
-     (match (secret-positionals "rekey" 1 rest) ((inv) (secret-rekey inv))))
-    (("init" . rest)
-     (match (secret-positionals "init" 1 rest) ((inv) (secret-init inv))))
-    ((verb . _) (secret-error "secret: unknown verb ~a" verb))))
+    ((verb . rest)
+     (call-with-values (lambda () (extract-inventory (string-append "secret " verb) rest))
+       (lambda (inv vrest)
+         (let* ((pos (filter (lambda (a) (not (string-prefix? "-" a))) vrest))
+                (sym string->symbol)
+                ;; Inventory or a secret-usage error (secret-error, not the
+                ;; generic usage-error, so the secret usage block is shown).
+                (inv* (lambda ()
+                        (or inv (env-inventory)
+                            (secret-error "secret ~a: no inventory — pass -i FILE or set $HEXOL_INVENTORY"
+                                          verb)))))
+           (match (cons verb pos)
+             (("ls")            (secret-ls (inv*)))
+             (("get" key)       (secret-get (inv*) (sym key)))
+             (("set" key value) (secret-set (inv*) (sym key) value))
+             (("set" key)       (secret-set (inv*) (sym key) #f))   ; value from stdin
+             (("edit" key)      (secret-edit (inv*) (sym key)))     ; one value
+             (("edit")          (secret-edit-all (inv*)))           ; whole store
+             (("rm" key)        (secret-rm (inv*) (sym key)))
+             (("rekey")         (secret-rekey (inv*)))
+             (("init")          (secret-init (inv*)))
+             ((v . _)
+              (if (member v '("ls" "get" "set" "edit" "rm" "rekey" "init"))
+                  (secret-error "secret ~a: wrong arguments — see usage" v)
+                  (secret-error "secret: unknown verb ~a" v))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; actions — the verb registry
@@ -922,25 +928,25 @@ usage:
 
 (register-action!
  (make-action "render" (cmd-is "render") (delegating-runner cmd-render)
-   "render [-o sexp|json|yaml|terraform|ansible] [-q K=V,…] [--path a.b.c] INVENTORY"))
+   "render [-o sexp|json|yaml|terraform|ansible] [-q K=V,…] [--path a.b.c] [-i INVENTORY]"))
 (register-action!
  (make-action "apply" (cmd-is "apply") (delegating-runner cmd-apply)
-   "apply  [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] INVENTORY"))
+   "apply  [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] [-i INVENTORY]"))
 (register-action!
  (make-action "tree" (cmd-is "tree") (delegating-runner cmd-tree)
-   "tree    INVENTORY"))
+   "tree    [-i INVENTORY]"))
 (register-action!
  (make-action "ops" (cmd-is "ops") (delegating-runner cmd-ops)
-   "ops     INVENTORY"))
+   "ops     [-i INVENTORY]"))
 (register-action!
  (make-action "explain" (cmd-is "explain") (delegating-runner cmd-explain)
-   "explain [-q K=V,…] PATH|HASH INVENTORY"))
+   "explain [-q K=V,…] PATH|HASH [-i INVENTORY]"))
 (register-action!
  (make-action "show" (cmd-is "show") (delegating-runner cmd-show)
-   "show    HASH INVENTORY"))
+   "show    HASH [-i INVENTORY]"))
 (register-action!
  (make-action "secret" (cmd-is "secret") (delegating-runner cmd-secret)
-   "secret  <ls|get|set|edit|rm|rekey|init> … INVENTORY"))
+   "secret  <ls|get|set|edit|rm|rekey|init> … [-i INVENTORY]"))
 
 ;; A "|"-joined verb list for terse usage lines.
 (define (verb-list) (string-join (map action-name *actions*) "|"))
@@ -949,25 +955,47 @@ usage:
 ;; dispatch — the frame: help, then run the first matching action
 ;; ---------------------------------------------------------------------------
 
-;; The inventory is invariant across an exploration session but is every
-;; subcommand's last positional — exactly the token you must cursor back past
-;; to edit the leading HASH/PATH you're actually iterating on. Let $HEXOL_INVENTORY
-;; stand in when the positional is omitted, so the iterated token lands last
-;; and an up-arrow + edit-last is enough.
-(define (inventory-or-default cmd inv)
-  (or inv
-      (and=> (getenv "HEXOL_INVENTORY")
-             (lambda (v) (and (not (string-null? v)) v)))
-      (usage-error "~a: missing INVENTORY file (or set $HEXOL_INVENTORY)" cmd)))
+;; The inventory is invariant across an exploration session, so it is NOT a
+;; positional on any verb: pass it with -i/--inventory (or --inventory=FILE),
+;; or set $HEXOL_INVENTORY once for the session. That leaves every verb's
+;; positionals carrying only the domain token you actually iterate on
+;; (PATH / HASH / KEY) — no trailing inventory to cursor back past, and no
+;; KEY-vs-INVENTORY ambiguity to resolve.
 
-(define (single-positional cmd args)
-  ;; Subcommands that take exactly one positional (the inventory file), which
-  ;; may be supplied via $HEXOL_INVENTORY instead.
-  (let ((files (filter (lambda (a) (not (string-prefix? "-" a))) args)))
-    (match files
-      ((inv) inv)
-      (() (inventory-or-default cmd #f))
-      (_  (usage-error "~a: expected one INVENTORY file, got ~a" cmd (length files))))))
+;; $HEXOL_INVENTORY when set to a non-empty value, else #f. The shared stand-in
+;; every verb falls back to when -i/--inventory is omitted.
+(define (env-inventory)
+  (and=> (getenv "HEXOL_INVENTORY")
+         (lambda (v) (and (not (string-null? v)) v))))
+
+(define (inventory-or-default cmd inv)
+  (or inv (env-inventory)
+      (usage-error "~a: no inventory — pass -i/--inventory FILE or set $HEXOL_INVENTORY" cmd)))
+
+;; Pull -i/--inventory FILE (and --inventory=FILE) out of ARGS wherever it
+;; appears, and return (values INV REST): INV is the file or #f, REST is ARGS
+;; with the flag and its value removed, so each command then parses only its
+;; own flags and domain positionals. CMD names the verb for error messages.
+(define (extract-inventory cmd args)
+  (let loop ((args args) (inv #f) (acc '()))
+    (match args
+      (() (values inv (reverse acc)))
+      (((or "-i" "--inventory")) (usage-error "~a: missing FILE after ~a" cmd (car args)))
+      (((or "-i" "--inventory") f . rest) (loop rest f acc))
+      ((arg . rest)
+       (if (string-prefix? "--inventory=" arg)
+           (loop rest (substring arg 12) acc)
+           (loop rest inv (cons arg acc)))))))
+
+;; For verbs whose only input is the inventory (tree, ops): resolve it from
+;; -i/--inventory or $HEXOL_INVENTORY and reject any stray argument.
+(define (inventory-only cmd args)
+  (call-with-values (lambda () (extract-inventory cmd args))
+    (lambda (inv rest)
+      (unless (null? rest)
+        (usage-error "~a: unexpected argument ~a (this verb takes only -i/--inventory)"
+                     cmd (car rest)))
+      (inventory-or-default cmd inv))))
 
 ;; The prose tail of `hexol --help`; the verb synopses above it are generated
 ;; from *actions* so the help can never drift from the registered set.
@@ -991,9 +1019,10 @@ tree prints a stable content hash beside each op; `show HASH` resolves any
 unambiguous prefix of one to that op's kind, label, source, location(s),
 children, and the state delta it introduced during the resolve.
 
-INVENTORY may be omitted on any subcommand when $HEXOL_INVENTORY names it —
-so an exploration loop is just `show HASH` / `explain PATH` with the iterated
-token last (up-arrow, edit the last token, re-run).")
+The inventory is never a positional: pass it with -i/--inventory FILE, or set
+$HEXOL_INVENTORY once for the session. So a verb's positional is purely its
+domain token, and an exploration loop is just `show HASH` / `explain PATH` —
+the iterated token is the only positional (up-arrow, edit it, re-run).")
 
 (define (show-help)
   (display "hexol — resolve a hexol inventory and view it.\n\nusage:\n")

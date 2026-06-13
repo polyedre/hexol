@@ -29,7 +29,7 @@
   #:use-module (ice-9 binary-ports)
   #:use-module (rnrs bytevectors)
   #:use-module (json)
-  #:export (secret-ls secret-get secret-set secret-edit
+  #:export (secret-ls secret-get secret-set secret-edit secret-edit-all
             secret-rm secret-rekey secret-init))
 
 ;; ---------- clause accessors (a store form's cdr is a plain alist) ----------
@@ -357,6 +357,89 @@
                (reseal! path start end next)
                (format (current-error-port) "✓ updated ~a — sealed ~a secret~p → ~a~%"
                        key (length next) (length next) path)))))))))
+
+;; ---------- whole-store edit (the decrypted alist in $EDITOR) ----------
+;;
+;; `edit` with no KEY opens the *entire* decrypted store as one editable
+;; s-expression — an alist of (KEY . "VALUE") — so you can add, remove, and
+;; change keys in place, then save to re-encrypt the whole thing. It is the
+;; plaintext counterpart of the sealed `(data …)' clause: same shape, just
+;; decrypted. Comment lines are ignored; the value side is a Scheme string, so
+;; a multi-line secret round-trips as "line1\nline2". The plaintext lives only
+;; in a 0600 temp file (mkstemp!) deleted the moment the editor exits — the
+;; same exposure window as single-key `edit`.
+
+;; Render the plaintext map ((kstr . val) …) as the editable alist text, keys
+;; sorted so diffs are stable. Keys print as symbols and values via ~s, so the
+;; whole thing reads back unambiguously even for `/`-bearing keys or odd chars.
+(define (render-plain-sexp plain)
+  (let ((sorted (sort plain (lambda (a b) (string<? (car a) (car b))))))
+    (call-with-output-string
+     (lambda (p)
+       (format p ";;; hexol secret edit — the decrypted store as an editable alist.~%")
+       (format p ";;;~%")
+       (format p ";;; Each entry is (KEY . \"VALUE\"): KEY a symbol, VALUE a string.~%")
+       (format p ";;; Add, remove, or change entries freely, then save — the whole~%")
+       (format p ";;; store is re-encrypted from exactly what you leave below. These~%")
+       (format p ";;; comment lines are ignored. This file is plaintext on disk and is~%")
+       (format p ";;; deleted the moment the editor exits.~%")
+       (if (null? sorted)
+           (format p "()~%")
+           (begin
+             (format p "(~%")
+             (for-each (lambda (kv)
+                         (format p "  (~s . ~s)~%" (string->symbol (car kv)) (cdr kv)))
+                       sorted)
+             (format p ")~%")))))))
+
+;; Parse the edited alist text back into a plaintext map ((kstr . val) …),
+;; validating shape and rejecting duplicate keys (a silent last-wins would
+;; quietly drop a secret).
+(define (parse-plain-sexp text)
+  (let* ((port (open-input-string text))
+         (form (read port)))
+    (when (eof-object? form)
+      (fail "the edited store is empty — expected a list of (KEY . \"VALUE\") pairs"))
+    (unless (list? form)
+      (fail "the edited store must be a list of (KEY . \"VALUE\") pairs, got ~s" form))
+    (let ((extra (read port)))
+      (unless (eof-object? extra)
+        (fail "unexpected extra form after the store alist: ~s" extra)))
+    (let ((pairs (map (lambda (e)
+                        (unless (and (pair? e) (symbol? (car e)) (string? (cdr e)))
+                          (fail "bad entry ~s — each must be (SYMBOL . \"STRING\")" e))
+                        (cons (symbol->string (car e)) (cdr e)))
+                      form)))
+      (let ((ks (map car pairs)))
+        (unless (= (length ks) (length (delete-duplicates ks string=?)))
+          (fail "duplicate key in the edited store — keys must be unique")))
+      pairs)))
+
+(define (secret-edit-all path)
+  (call-with-values (lambda () (require-store path))
+    (lambda (clauses start end text)
+      (let* ((plain  (load-plaintext clauses))
+             (editor (or (getenv "EDITOR") "vi"))
+             (tmpl   (string-copy "/tmp/hexol-edit-XXXXXX"))
+             (tp     (mkstemp! tmpl)))
+        (display (render-plain-sexp plain) tp)
+        (close-port tp)
+        (let ((status (system (string-append editor " " tmpl))))
+          (unless (zero? (status:exit-val status))
+            (delete-file tmpl)
+            (fail "$EDITOR exited non-zero — leaving the store unchanged")))
+        (let ((new-text (call-with-input-file tmpl get-string-all)))
+          (delete-file tmpl)                       ; plaintext off disk before we parse
+          (let* ((next (parse-plain-sexp new-text))
+                 (norm (lambda (m) (sort (map (lambda (kv) (cons (car kv) (cdr kv))) m)
+                                         (lambda (a b) (string<? (car a) (car b)))))))
+            (cond
+              ((equal? (norm next) (norm plain))
+               (format (current-error-port) ";; store unchanged — nothing to seal~%"))
+              (else
+               (reseal! path start end next)
+               (format (current-error-port) "✓ sealed ~a secret~p → ~a~%"
+                       (length next) (length next) path)))))))))
 
 (define (secret-rekey path)
   (call-with-values (lambda () (require-store path))
