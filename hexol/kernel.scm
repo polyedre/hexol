@@ -31,7 +31,9 @@
             ;; optional per-file render adapters
             current-renderers renders-with
             ;; optional per-file apply adapters (effects)
-            current-appliers applies-with))
+            current-appliers applies-with
+            ;; optional per-file CLI verbs (actions)
+            current-actions defines-action))
 
 ;; ---------- op record ----------
 
@@ -544,6 +546,34 @@ explicit ORDER (a number) only to override that placement.  A no-op when no
 collector is bound."
   (let ((box (current-appliers)))
     (when box (set-car! box (cons (list name order proc) (car box)))))
+  *unspecified*)
+
+;; ---------- optional per-file CLI verbs (actions) ----------
+;;
+;; The third collector, alongside `renders-with` and `applies-with`. Where a
+;; renderer is a state view and an applier is a step in the `hexol apply`
+;; pipeline, an *action* is a standalone CLI verb the inventory contributes —
+;; `hexol destroy`, `hexol diff`, whatever the inventory wants. The CLI tries
+;; its built-in verbs first (so an inventory can never shadow `render` /
+;; `secret`); only when none match does it load the inventory collecting these
+;; and look for a matching custom verb.
+;;
+;; An action is a (state args -> performs effects) procedure: STATE is the
+;; inventory resolved once by the CLI, ARGS the post-verb argument list with
+;; `-i'/`-q' already stripped, so the action owns its own flags (a `--dry-run'
+;; is the action's to interpret — by convention spelled like `apply's). SYNOPSIS
+;; is the one-line usage `hexol --help' shows. As with the other two collectors,
+;; the parameter is #f outside the CLI's action-discovery load, so
+;; `defines-action' is a harmless no-op for render/apply/tree/ops.
+
+(define current-actions (make-parameter #f))
+
+(define* (defines-action name proc #:optional (synopsis #f))
+  "Register PROC, a (state args -> performs effects) action, as the CLI verb
+NAME, with optional one-line SYNOPSIS for `hexol --help'.  Built-in verbs take
+precedence over inventory actions.  A no-op when no collector is bound."
+  (let ((box (current-actions)))
+    (when box (set-car! box (cons (list name synopsis proc) (car box)))))
   *unspecified*)
 
 ;; ---------- loader ----------

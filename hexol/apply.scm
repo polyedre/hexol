@@ -44,6 +44,12 @@
 ;;;
 ;;; (`applies-with' is still the primitive underneath `appliers'; use it
 ;;; directly to register a single one-off applier.)
+;;;
+;;; This module also offers `terraform-destroyer', which returns not an applier
+;;; but a CLI *action* — a (state args -> effects) procedure an inventory
+;;; registers with `defines-action'/`actions' to contribute its own `hexol'
+;;; verb (e.g. `hexol destroy'). An action is a standalone verb, not a pipeline
+;;; step: it never runs during `hexol apply', only when its verb is named.
 
 (define-module (hexol apply)
   #:use-module (hexol kernel)
@@ -53,8 +59,8 @@
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 format)
-  #:export (terraform-applier kubectl-applier
-            appliers wait-for check report cmd sh-ok?))
+  #:export (terraform-applier kubectl-applier terraform-destroyer
+            appliers actions wait-for check report cmd sh-ok?))
 
 ;; ---------- shell helpers ----------
 
@@ -179,6 +185,16 @@ never fails.  Runs even under DRY?."
     ((_ (name proc) ...)
      (begin (applies-with name proc) ...))))
 
+;; The sugar over a set of CLI actions (custom `hexol' verbs the inventory
+;; contributes), paralleling `appliers'.  Each entry is (NAME SYNOPSIS PROC):
+;; PROC evaluates to a `(state args -> effects)' action, SYNOPSIS the one-line
+;; usage `hexol --help' shows.  Expands to plain `defines-action' calls, so it
+;; is a no-op outside the CLI's action discovery just like the primitive.
+(define-syntax actions
+  (syntax-rules ()
+    ((_ (name synopsis proc) ...)
+     (begin (defines-action name proc synopsis) ...))))
+
 ;; ---------- terraform applier ----------
 
 (define* (terraform-applier #:key (workdir "deploy") (binary "tofu")
@@ -214,6 +230,23 @@ init and after the outputs are written; name the result in an `appliers' form."
                (log ";; apply[terraform]: output ~a -> ~a~%" (car pair) (cdr pair))))
            output->file))))
     (run-checks (as-checks post) state dry?)))
+
+;; ---------- terraform destroyer (a CLI action, not a pipeline step) ----------
+
+(define* (terraform-destroyer #:key (workdir "deploy") (binary "tofu"))
+  "Return an *action* (a (state args -> effects) CLI verb, not an applier) that
+tears the terraform-managed infra down: `BINARY -chdir=WORKDIR destroy', gated
+by the tool's own y/N prompt.  With `--dry-run' in ARGS it runs `plan -destroy'
+instead.  Register it with `defines-action'/`actions' so it becomes its own
+explicit `hexol' verb — never a step in a bare `hexol apply'."
+  (lambda (state args)
+    (let ((tf    (find-binary binary))
+          (chdir (string-append "-chdir=" workdir)))
+      (if (member "--dry-run" args)
+          (begin (log ";; destroy: ~a ~a plan -destroy~%" binary chdir)
+                 (run* tf chdir "plan" "-destroy"))
+          (begin (log ";; destroy: ~a ~a destroy~%" binary chdir)
+                 (run* tf chdir "destroy"))))))
 
 ;; ---------- kubectl applier ----------
 

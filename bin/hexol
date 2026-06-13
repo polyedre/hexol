@@ -207,6 +207,18 @@
                  (load-inventory-file inv))))
       (values ops (reverse (car box))))))
 
+;; Like `load-ops`, but also collect any (name synopsis proc) the file
+;; registered via `defines-action` — the custom CLI verbs an inventory
+;; contributes. Mirrors `load-ops+appliers`; only the action fallback in
+;; `dispatch` (and `--help`'s listing) needs these.
+(define (load-ops+actions inv)
+  (unless inv (usage-error "missing INVENTORY file"))
+  (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
+  (let ((box (list '())))
+    (let ((ops (parameterize ((current-actions box))
+                 (load-inventory-file inv))))
+      (values ops (reverse (car box))))))
+
 (define (usage-error fmt . args)
   (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
   (format (current-error-port) "~a~%"
@@ -885,6 +897,14 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 ;; cmd-* handler. `help` deliberately stays OUT of this set — it lists the
 ;; verbs by reading them back off *actions* and must work before any inventory
 ;; loads, so it lives in the dispatch frame instead.
+;;
+;; *actions* holds the BUILT-IN verbs (fixed at load). An inventory can ALSO
+;; contribute verbs: `defines-action NAME PROC` (sugar: `actions`) registers a
+;; (state args -> effects) procedure, and when `dispatch` finds no built-in
+;; match it loads the inventory collecting these and runs the one named SUBCMD
+;; (see `run-inventory-action`). Built-ins are tried first, so an inventory can
+;; only ADD verbs, never shadow a core one. This is how an inventory ships its
+;; own teardown/diff/bootstrap verb — e.g. examples/homelab.scm's `destroy`.
 
 (define-record-type <action>
   (make-action name predicate runner synopsis)
@@ -965,6 +985,22 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
            (loop rest (substring arg 12) acc)
            (loop rest inv (cons arg acc)))))))
 
+;; Pull -q/--query Q (and --query=Q) out of ARGS wherever it appears, parse it,
+;; and return (values QUERY REST) — the parsed query alist (empty when absent)
+;; and ARGS with the flag and its value removed. The custom-action fallback
+;; strips -q itself (to seed the resolve) and hands the action the remaining
+;; args, so an inventory verb owns every flag except the shared -i/-q.
+(define (extract-query args)
+  (let loop ((args args) (query '()) (acc '()))
+    (match args
+      (() (values query (reverse acc)))
+      (((or "-q" "--query")) (usage-error "missing Q after ~a" (car args)))
+      (((or "-q" "--query") q . rest) (loop rest (parse-query q) acc))
+      ((arg . rest)
+       (if (string-prefix? "--query=" arg)
+           (loop rest (parse-query (substring arg 8)) acc)
+           (loop rest query (cons arg acc)))))))
+
 ;; For verbs whose only input is the inventory (tree, ops): resolve it from
 ;; -i/--inventory or $HEXOL_INVENTORY and reject any stray argument.
 (define (inventory-only cmd args)
@@ -1002,9 +1038,54 @@ $HEXOL_INVENTORY once for the session. So a verb's positional is purely its
 domain token, and an exploration loop is just `show HASH` / `explain PATH` —
 the iterated token is the only positional (up-arrow, edit it, re-run).")
 
+;; Best-effort list of the custom verbs an inventory registers, as
+;; (name synopsis proc) triples — for `--help` and the no-match fallback.
+;; Returns '() when no inventory is resolvable; any error loading it (a broken
+;; inventory shouldn't break `--help`) is swallowed to '() too.
+(define (inventory-actions inv)
+  (if (and inv (file-exists? inv))
+      (catch #t
+        (lambda () (call-with-values (lambda () (load-ops+actions inv))
+                     (lambda (ops actions) actions)))
+        (lambda _ '()))
+      '()))
+
+;; The no-built-in-match fallback: a custom verb the inventory contributes via
+;; `defines-action`. Resolve the inventory (from -i/$HEXOL_INVENTORY; without one
+;; there's nothing to dispatch to, so the original unknown-subcommand error
+;; stands), find the action named SUBCMD, strip -q to seed the resolve, and run
+;; it once against the resolved state with the remaining args. Built-ins always
+;; win — this only runs when none matched — so an inventory can never shadow a
+;; core verb.
+(define (run-inventory-action subcmd args)
+  ;; ARGS leads with the verb itself (as the dispatcher hands it on); drop it so
+  ;; the action sees only its own flags/positionals, the way the cmd-* handlers
+  ;; receive `(cdr args)`.
+  (call-with-values (lambda () (extract-inventory subcmd (cdr args)))
+    (lambda (inv rest)
+      (let ((inv (or inv (env-inventory))))
+        (unless inv (usage-error "unknown subcommand: ~a" subcmd))
+        (call-with-values (lambda () (load-ops+actions inv))
+          (lambda (ops actions)
+            (let ((a (assoc subcmd actions)))
+              (unless a (usage-error "unknown subcommand: ~a" subcmd))
+              (call-with-values (lambda () (extract-query rest))
+                (lambda (query arest)
+                  (let ((state (resolve ops query)))
+                    ((caddr a) state arest)))))))))))
+
 (define (show-help)
   (display "hexol — resolve a hexol inventory and view it.\n\nusage:\n")
   (for-each (lambda (a) (format #t "  hexol ~a~%" (action-synopsis a))) *actions*)
+  ;; Inventory-contributed verbs, when an inventory is resolvable (via
+  ;; $HEXOL_INVENTORY here, since --help carries no -i). Listed under their own
+  ;; heading so they read as belonging to this inventory, not to hexol itself.
+  (let ((custom (inventory-actions (env-inventory))))
+    (unless (null? custom)
+      (format #t "~%inventory actions (~a):~%" (env-inventory))
+      (for-each (lambda (a)
+                  (format #t "  hexol ~a~%" (or (cadr a) (car a))))
+                custom)))
   (newline)
   (display usage-footer)
   (newline))
@@ -1018,7 +1099,11 @@ the iterated token is the only positional (up-arrow, edit it, re-run).")
             (act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
        (if act
            ((action-runner act) rest)
-           (usage-error "unknown subcommand: ~a" subcmd))))))
+           ;; No built-in verb matched — fall through to a custom verb the
+           ;; inventory may register (so an inventory can ADD verbs but never
+           ;; shadow a built-in). With no resolvable inventory this re-raises
+           ;; the unknown-subcommand usage error.
+           (run-inventory-action subcmd rest))))))
 
 ;; Turn a raised error into one clean stderr line instead of a Guile
 ;; backtrace — the common case being a typo or a mistake inside the
