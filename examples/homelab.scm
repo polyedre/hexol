@@ -53,7 +53,8 @@
                                  ; remote-manifest — the external-manifest plumbing)
              (hexol terraform)   ; Terraform language vocabulary
              (hexol yaml)        ; emit-yaml-document — to build Talos user_data + helm values
-             (hexol apply)       ; terraform-applier / kubectl-applier — the `hexol apply` effects
+             (hexol apply)       ; appliers / terraform-applier / kubectl-applier + checks
+                                 ; (wait-for / check / report / cmd) — the `hexol apply` effects
              (hexol secrets)     ; secrets-store / secret-ref / resolve-secret-refs — inline sops
              (ice-9 textual-ports) ; get-string-all — read the SSH key / helm values file
              (srfi srfi-1)
@@ -653,20 +654,60 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; ---------------------------------------------------------------------------
 ;;
 ;; `render` turns this inventory into artifacts; `apply` pushes them to the
-;; world. Each applier reads the resolved state directly — no intermediate
-;; file the user has to render and manage — and shells out to its tool. They
-;; run in the order registered here (terraform, then kubernetes), so the infra
-;; is built and its kubeconfig dumped to `deploy/kubeconfig` before the cluster
-;; is applied against it:
+;; world. The `appliers` form names a sequence and runs it in order: each entry
+;; reads the resolved state directly — no intermediate file to render and
+;; manage — and shells out to its tool. The infra is built and its kubeconfig
+;; dumped to `deploy/kubeconfig` first, so the cluster applies against it:
 ;;
-;;   hexol apply examples/homelab.scm                  # whole bootstrap
-;;   hexol apply --only kubernetes examples/homelab.scm  # re-apply the cluster
-;;   hexol apply --only terraform --dry-run …          # tofu plan only
+;;   hexol apply examples/homelab.scm                       # whole bootstrap
+;;   hexol apply --only check-api,kubernetes examples/homelab.scm  # re-apply cluster
+;;   hexol apply --only terraform --dry-run …               # tofu plan only
+;;
+;; Between deploy steps sit checks (ordinary appliers whose effect is
+;; observation, not mutation): `check-vms` asserts the control-plane VMs are
+;; ACTIVE after terraform; `check-api` is a *gate* — the kubeconfig points at the
+;; LB VIP via DNS, so it blocks until the kube-API actually answers there (DNS
+;; propagation + Octavia health-check settling) before manifests apply.
+;; `check-nodes` is a *smoke test*, non-fatal, after the apply. As standalone
+;; entries both are `--only`-selectable; name `check-api` alongside `kubernetes`
+;; to keep the gate when re-applying just the cluster. (A gate that must *never*
+;; be skipped by `--only kubernetes` could instead ride along as the kubectl
+;; applier's #:pre.)
 ;;
 ;; No hexol-level prompt: `tofu apply` gates itself; kubectl applies directly.
-(terraform-applier #:workdir "deploy" #:binary "tofu"
-                   #:output->file '(("kubeconfig" . "deploy/kubeconfig")))
-(kubectl-applier #:kubeconfig "deploy/kubeconfig" #:server-side #t)
+(define (kubectl* . args)
+  (apply cmd "kubectl" "--kubeconfig=deploy/kubeconfig" args))
+
+(appliers
+  ("terraform"
+   (terraform-applier #:workdir "deploy" #:binary "tofu"
+                      #:output->file '(("kubeconfig" . "deploy/kubeconfig"))))
+
+  ;; Infra smoke test: every control-plane VM reached ACTIVE. `tofu apply` blocks
+  ;; on ACTIVE already, so this mostly guards re-applies and a partial/`-target`
+  ;; build. Uses the `openstack` CLI with the same OS_*/openrc creds tofu used;
+  ;; the one-liner is true iff the unique status of the `<cluster>-cp-*` servers
+  ;; is exactly ACTIVE (empty — none found — fails too).
+  ("check-vms"
+   (check "OpenStack control-plane VMs ACTIVE"
+          (cmd "sh" "-c"
+               (str "test \"$(openstack server list --name " (cfg 'cluster-name)
+                    "-cp -f value -c Status | sort -u)\" = ACTIVE"))
+          #:needs "openstack"))
+
+  ("check-api"
+   (wait-for "kube-API reachable via the LB"
+             (kubectl* "get" "--raw=/readyz")
+             #:timeout 180 #:interval 5))
+
+  ("kubernetes"
+   (kubectl-applier #:kubeconfig "deploy/kubeconfig" #:server-side #t))
+
+  ("check-nodes"
+   (check "all nodes Ready (Cilium up)"
+          (kubectl* "wait" "node" "--all"
+                    "--for=condition=Ready" "--timeout=10s")
+          #:fatal? #f)))
 
 ;; ---------------------------------------------------------------------------
 ;; the homelab
