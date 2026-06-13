@@ -728,7 +728,29 @@ template` and appends every manifest it emits to (kubernetes_resources)."
    (check "all nodes Ready (Cilium up)"
           (kubectl* "wait" "node" "--all"
                     "--for=condition=Ready" "--timeout=10s")
-          #:fatal? #f)))
+          #:fatal? #f))
+
+  ;; A homelab action (not a hexol CLI verb): tear the infrastructure down with
+  ;; `tofu destroy`.  It is just another applier — a (state dry? -> effects)
+  ;; lambda registered here — so it has no kernel/CLI footprint; invoke it
+  ;; deliberately and in isolation:
+  ;;
+  ;;   hexol apply --only destroy --dry-run …   # tofu plan -destroy (preview)
+  ;;   HEXOL_DESTROY=1 hexol apply --only destroy …   # the real teardown
+  ;;
+  ;; Every applier also runs on a bare `hexol apply`, which would otherwise let
+  ;; the pipeline reach this step and tear down what it just built — so destroy
+  ;; refuses unless HEXOL_DESTROY is set.  tofu's own "Enter a value: yes" prompt
+  ;; still gates the actual destruction.
+  ("destroy"
+   (lambda (state dry?)
+     (let ((tofu (or (which-cmd "tofu") (error "destroy: tofu not on PATH"))))
+       (cond
+         (dry? (system* tofu "-chdir=deploy" "plan" "-destroy"))
+         ((getenv "HEXOL_DESTROY") (system* tofu "-chdir=deploy" "destroy"))
+         (else
+          (format (current-error-port)
+                  ";; destroy: skipped — set HEXOL_DESTROY=1 and use --only destroy~%")))))))
 
 ;; ---------------------------------------------------------------------------
 ;; the homelab
