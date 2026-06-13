@@ -1,32 +1,41 @@
 ;;; hexol/k8s.scm — the Kubernetes library.
 ;;;
-;;; A `(hexol k8s)` submodule: sugar constructors that each return a
-;;; `resource` op (so they drop straight into an `(inventory ...)`), plus
-;;; the composites and cross-cutting transforms that were previously
-;;; inlined in examples/kubernetes.scm.
+;;; A `(hexol k8s)` submodule: schema-driven record-body constructors (built
+;;; on `define-construct`) that each return a `resource` op (so they drop
+;;; straight into an `(inventory ...)`), plus the composites and cross-cutting
+;;; transforms.
 ;;;
-;;; Resource sugar (each returns one op):
-;;;   (deployment #:name #:image ...)   -> Deployment
-;;;   (daemonset  #:name #:image ...)   -> DaemonSet
-;;;   (service    #:name #:port ...)    -> Service
-;;;   (ingress    #:name #:port ...)    -> Ingress
-;;;   (configmap  #:name #:data ...)    -> ConfigMap
-;;;   (secret     #:name #:data ...)    -> Secret
-;;;   (custom-resource #:api #:kind ...) -> any CRD (Prometheus, etc.)
-;;;   (service-monitor #:name ...)      -> monitoring.coreos.com ServiceMonitor
+;;; Resource sugar (each returns one op) — positional name, then `(key value)`
+;;; entries; values are evaluated Scheme, the schema fills defaults / validates
+;;; / reports unknown keys with a suggestion:
+;;;   (deployment "api" (image "…") (port 8080) …)   -> Deployment
+;;;   (daemonset  "node" (image "…") …)              -> DaemonSet
+;;;   (service    "api" (port 80) …)                 -> Service
+;;;   (ingress    "api" (port 80) …)                 -> Ingress
+;;;   (configmap  "cfg" (data (K "v") …))            -> ConfigMap
+;;;   (secret     "sec" (data (K "v") …))            -> Secret
+;;;   (custom-resource (api "…") (kind "…") (name "…") (spec …)) -> any CRD
+;;;   (service-monitor "api" …)                      -> ServiceMonitor
 ;;;
-;;; Composites (return a compose-ops bundle of several resources):
-;;;   (app ...) (public-app ...) (worker ...)
+;;; Volume / env source refs (small helpers, evaluate-default-safe — they do
+;;; NOT clash with the `secret`/`configmap` resource constructors):
+;;;   (cm  "name")               configMap source
+;;;   (sec "name")               secret source
+;;;   (pvc "name")               PersistentVolumeClaim source
+;;;   (mount <source> "/path")   a volume mount: pair a source with a path
+;;;     (env-from (cm "api-config"))            ; whole-source env injection
+;;;     (volumes  (mount (sec "tls") "/etc/tls")); mounted volume
 ;;;
-;;; Transforms / policy (return ops over the resource list):
-;;;   (tls-all) (checksum-config) (compliance-all registry)
+;;; Composites (a compose-ops bundle):  (app …) (public-app …) (worker …)
+;;; Transforms / policy:  (tls-all) (checksum-config) (compliance-all registry)
 ;;;
-;;; Selector convention: every workload/service keys on (app . <name>);
-;;; layer org-wide labels on top with surface's `label-all`.
+;;; Selector convention: every workload/service keys on (app . <name>); layer
+;;; org-wide labels on top with surface's `label-all`.
 
 (define-module (hexol k8s)
   #:use-module (hexol kernel)
   #:use-module (hexol surface)
+  #:use-module (hexol construct)
   #:use-module (hexol sh)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
@@ -36,8 +45,6 @@
   #:use-module (json)
   #:re-export (resource transform-resources annotate-all label-all
                compose-ops
-               ;; the shared PATH helper (defined in (hexol sh)), part of the
-               ;; external-manifest plumbing below.
                which-cmd)
   #:export (;; namespace scope
             with-namespace current-k8s-namespace namespace
@@ -46,8 +53,10 @@
             ;; resource sugar
             deployment daemonset service ingress configmap secret
             custom-resource service-monitor
+            ;; volume / env source refs
+            cm sec pvc mount
             ;; RBAC
-            service-account role role-binding
+            service-account role role-binding rule
             cluster-role cluster-role-binding cluster-rbac
             ;; external manifests (render-time splice into kubernetes_resources)
             json-manifests remote-manifest
@@ -65,58 +74,30 @@
 ;; ---------------------------------------------------------------------------
 ;; namespace scope
 ;; ---------------------------------------------------------------------------
-;;
-;; Every constructor defaults its #:namespace to (current-k8s-namespace).
-;; `with-namespace` binds that parameter while the body's ops are
-;; *constructed* — the namespace bakes into each resource alist at build
-;; time — then bundles them into one op (so it nests, composes inside a
-;; `when`, and inner scopes win lexically). An explicit #:namespace on a
-;; constructor still overrides.
-;;
-;;   (with-namespace "monitoring"
-;;     (deployment #:name "grafana" #:image "grafana:11")   ; -> ns monitoring
-;;     (when (on? '(x)) (service #:name "grafana" #:port 80)))
 
 (define current-k8s-namespace (make-parameter "default"))
 
-;; A Namespace resource named NAME (with the conventional
-;; kubernetes.io/metadata.name label, plus any extra #:labels).
-(define* (namespace name #:key (labels '()))
-  "Return a resource op for a Namespace named NAME."
+(define* (%namespace name #:key (labels '()))
   (resource `((apiVersion . "v1") (kind . "Namespace")
               (metadata (name . ,name)
                         (labels (kubernetes.io/metadata.name . ,name) ,@labels)))))
 
-;; Build-time scope over the kernel's `scope-ops`: bind the namespace while
-;; the body's resources are constructed, then bundle them into one op. The
-;; Namespace itself is *prepended* to the bundle, so scoping a body into a
-;; namespace also creates it — and it lands in the rendered stream before the
-;; resources scoped into it (`kubectl apply -f -` sees the namespace first).
-;; Callers therefore needn't declare the namespace separately; scope each
-;; namespace in exactly one `with-namespace` to avoid a duplicate Namespace.
+(define-construct namespace
+  #:head name
+  #:fields ((labels #:map))
+  #:build (%namespace name #:labels labels))
+
+;; Build-time scope over the kernel's `scope-ops`. Prepends the Namespace
+;; resource to the bundle so scoping a body into a namespace also creates it.
 (define-syntax-rule (with-namespace ns body ...)
   (scope-ops 'with-namespace (current-k8s-namespace ns) "namespace "
-    (namespace ns) body ...))
+    (%namespace ns) body ...))
 
 ;; ---------------------------------------------------------------------------
 ;; compact resources spec
 ;; ---------------------------------------------------------------------------
-;;
-;; `(res "CPU/MEM")` -> a k8s resources alist. Each side is "req" or
-;; "req-lim"; `*` (or empty) omits that bound. A MEM side with no "-" sets
-;; limit = request (memory limit should equal request); a CPU side with no
-;; "-" leaves the limit unset (best practice — and our compliance rule
-;; allows an unset cpu limit). Examples:
-;;
-;;   (res "100m-*/128Mi")       => requests cpu 100m, mem 128Mi; limit mem 128Mi
-;;   (res "100m-500m/128Mi-256Mi") => requests cpu 100m mem 128Mi; limits cpu 500m mem 256Mi
-;;   (res "*/256Mi")            => requests mem 256Mi; limit mem 256Mi (no cpu)
-;;
-;; Anywhere a constructor takes #:resources, a string is parsed through
-;; `res`; an alist is used as-is.
 
 (define (%bound part single-copies?)
-  ;; -> (request-or-#f . limit-or-#f)
   (let* ((toks (string-split part #\-))
          (norm (lambda (t) (if (or (string=? t "*") (string=? t "")) #f t)))
          (req  (norm (car toks)))
@@ -127,9 +108,7 @@
 
 (define (res spec)
   "Parse a compact resources SPEC string \"CPU/MEM\" into a k8s resources
-alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound.  A
-MEM side without \"-\" sets limit = request; a CPU side without \"-\" leaves
-the limit unset.  E.g. \"100m-500m/128Mi-256Mi\"."
+alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
   (let* ((sides (string-split spec #\/))
          (cpu (%bound (list-ref sides 0) #f))
          (mem (%bound (if (> (length sides) 1) (list-ref sides 1) "*") #t))
@@ -150,14 +129,11 @@ the limit unset.  E.g. \"100m-500m/128Mi-256Mi\"."
 ;; shared building blocks
 ;; ---------------------------------------------------------------------------
 
-;; `namespace` #f omits the field — for cluster-scoped resources
-;; (ClusterRole, ClusterRoleBinding).
 (define* (k8s-metadata name namespace #:optional (extra-labels '()))
   `(,@(if namespace `((namespace . ,namespace)) '())
     (name . ,name)
     (labels (app . ,name) ,@extra-labels)))
 
-;; env-from is a list of refs like '((configMap "api-config") (secret "api-secret"))
 (define (envFrom-entries refs)
   (map (lambda (ref)
          (let ((kind (car ref)) (n (cadr ref)))
@@ -166,9 +142,6 @@ the limit unset.  E.g. \"100m-500m/128Mi-256Mi\"."
                  (else (error "unknown env-from kind:" kind)))))
        refs))
 
-;; volumes is a list like
-;;   '((configMap "api-config" "/etc/api") (secret "api-secret" "/etc/sec")
-;;     (pvc "data" "/var/lib/data"))
 (define (volume-name kind res-name)
   (string-append (symbol->string kind) "-" res-name))
 
@@ -190,17 +163,10 @@ the limit unset.  E.g. \"100m-500m/128Mi-256Mi\"."
            `((name . ,(volume-name kind n)) (mountPath . ,path))))
        refs))
 
-;; One container's alist. Optional sections are omitted when empty, so the
-;; rendered YAML stays clean (no `envFrom: {}` etc.).
-;; `env` is a list of raw container env entries spliced as-is, e.g.
-;;   '(((name . "DOMAIN") (value . "https://…"))
-;;     ((name . "POD_NS") (valueFrom (fieldRef (fieldPath . "metadata.namespace")))))
-;; — for individual variables (and valueFrom refs); whole-source injection is
-;; `env-from`.
 (define* (container-alist #:key name image (port 0) (args '()) (command '())
                           (env '()) (env-from '()) (volumes '()) (resources '())
                           (privileged #f))
-  (let ((resources (normalize-resources resources)))   ; "100m-*/128Mi" or alist
+  (let ((resources (normalize-resources resources)))
     `((name . ,name)
       (image . ,image)
       ,@(if (null? command) '() `((command ,@command)))
@@ -212,8 +178,6 @@ the limit unset.  E.g. \"100m-500m/128Mi-256Mi\"."
       ,@(if (null? resources) '() `((resources ,@resources)))
       ,@(if privileged `((securityContext (privileged . #t))) '()))))
 
-;; A Deployment / DaemonSet body. `replicas` #f omits the field (DaemonSets
-;; have no replicas).
 (define* (workload-alist #:key kind name image (port 0) (replicas #f)
                          (namespace (current-k8s-namespace)) (env '()) (env-from '()) (volumes '())
                          (resources '()) (privileged #f) (args '()) (command '())
@@ -236,41 +200,72 @@ the limit unset.  E.g. \"100m-500m/128Mi-256Mi\"."
                   ,@(if (null? volumes) '() `((volumes ,@(volume-entries volumes)))))))))
 
 ;; ---------------------------------------------------------------------------
+;; volume / env source refs
+;; ---------------------------------------------------------------------------
+;;
+;; Evaluate-default-safe builders for the workload `env-from` / `volumes`
+;; surface. `cm`/`sec`/`pvc` name a source; `mount` pairs a source with a
+;; mount path. They produce the internal tuples `workload-alist` consumes —
+;; `(configMap name)` / `(secret name)` / `(pvc name)` and, with a path,
+;; `(kind name path)`.
+
+(define (cm name)  (list 'configMap name))
+(define (sec name) (list 'secret name))
+(define (pvc name) (list 'pvc name))
+(define (mount source path) (append source (list path)))
+
+;; ---------------------------------------------------------------------------
 ;; resource sugar
 ;; ---------------------------------------------------------------------------
 
-(define* (deployment #:key name image (port 8080) (replicas 1) (namespace (current-k8s-namespace))
-                     (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                     (args '()) (command '()) (service-account #f) (labels '()))
-  "Return a resource op for a Deployment named NAME running IMAGE.  Accepts
-the common pod knobs (#:port #:replicas #:namespace #:env #:env-from #:volumes
-#:resources #:privileged #:args #:command #:service-account #:labels).  #:env
-is a list of raw container env entries; #:volumes also accepts (pvc CLAIM PATH)
-to mount a PersistentVolumeClaim."
+(define* (%deployment #:key name image (port 8080) (replicas 1) (namespace (current-k8s-namespace))
+                      (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
+                      (args '()) (command '()) (service-account #f) (labels '()))
   (resource (workload-alist #:kind "Deployment" #:name name #:image image #:port port
                             #:replicas replicas #:namespace namespace #:env env #:env-from env-from
                             #:volumes volumes #:resources resources #:privileged privileged
                             #:args args #:command command #:service-account service-account
                             #:labels labels)))
 
-(define* (daemonset #:key name image (port 0) (namespace (current-k8s-namespace))
-                    (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                    (args '()) (command '()) (service-account #f)
-                    (host-network #f) (host-pid #f) (labels '()))
-  "Return a resource op for a DaemonSet named NAME running IMAGE.  Like
-`deployment' but with no replicas and with extra node-level knobs
-(#:host-network #:host-pid)."
+(define-construct deployment
+  #:head name
+  #:fields ((image #:required) (port #:default 8080) (replicas #:default 1)
+            (namespace #:default (current-k8s-namespace))
+            (env #:list) (env-from #:list) (volumes #:list)
+            (resources #:default '()) (privileged #:flag)
+            (args #:list) (command #:list)
+            (service-account #:default #f) (labels #:map))
+  #:build (%deployment #:name name #:image image #:port port #:replicas replicas
+                       #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                       #:resources resources #:privileged privileged #:args args #:command command
+                       #:service-account service-account #:labels labels))
+
+(define* (%daemonset #:key name image (port 0) (namespace (current-k8s-namespace))
+                     (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
+                     (args '()) (command '()) (service-account #f)
+                     (host-network #f) (host-pid #f) (labels '()))
   (resource (workload-alist #:kind "DaemonSet" #:name name #:image image #:port port
                             #:replicas #f #:namespace namespace #:env env #:env-from env-from
                             #:volumes volumes #:resources resources #:privileged privileged
                             #:args args #:command command #:service-account service-account
                             #:host-network host-network #:host-pid host-pid #:labels labels)))
 
-(define* (service #:key name port (target-port port) (port-name "http")
-                  (namespace (current-k8s-namespace)) (type #f) (selector-name #f) (labels '()))
-  "Return a resource op for a Service named NAME exposing PORT.  Selects
-(app . NAME) by default (override with #:selector-name); #:target-port,
-#:port-name, #:type, and #:labels tune the rest."
+(define-construct daemonset
+  #:head name
+  #:fields ((image #:required) (port #:default 0)
+            (namespace #:default (current-k8s-namespace))
+            (env #:list) (env-from #:list) (volumes #:list)
+            (resources #:default '()) (privileged #:flag)
+            (args #:list) (command #:list) (service-account #:default #f)
+            (host-network #:flag) (host-pid #:flag) (labels #:map))
+  #:build (%daemonset #:name name #:image image #:port port #:namespace namespace
+                      #:env env #:env-from env-from #:volumes volumes #:resources resources
+                      #:privileged privileged #:args args #:command command
+                      #:service-account service-account #:host-network host-network
+                      #:host-pid host-pid #:labels labels))
+
+(define* (%service #:key name port (target-port port) (port-name "http")
+                   (namespace (current-k8s-namespace)) (type #f) (selector-name #f) (labels '()))
   (let ((sel (or selector-name name)))
     (resource
       `((apiVersion . "v1")
@@ -280,9 +275,15 @@ to mount a PersistentVolumeClaim."
               ,@(if type `((type . ,type)) '())
               (ports ((name . ,port-name) (port . ,port) (targetPort . ,target-port))))))))
 
-(define* (ingress #:key name port (host #f) (namespace (current-k8s-namespace)) (path "/") (labels '()))
-  "Return a resource op for an Ingress named NAME routing HOST (defaulting
-to \"NAME.example.com\") and PATH to the NAME Service on PORT."
+(define-construct service
+  #:head name
+  #:fields ((port #:required) (target-port #:default port) (port-name #:default "http")
+            (namespace #:default (current-k8s-namespace))
+            (type #:default #f) (selector-name #:default #f) (labels #:map))
+  #:build (%service #:name name #:port port #:target-port target-port #:port-name port-name
+                    #:namespace namespace #:type type #:selector-name selector-name #:labels labels))
+
+(define* (%ingress #:key name port (host #f) (namespace (current-k8s-namespace)) (path "/") (labels '()))
   (let ((h (or host (string-append name ".example.com"))))
     (resource
       `((apiVersion . "networking.k8s.io/v1")
@@ -294,17 +295,26 @@ to \"NAME.example.com\") and PATH to the NAME Service on PORT."
                                     (backend (service (name . ,name)
                                                       (port (number . ,port))))))))))))))
 
-(define* (configmap #:key name data (namespace (current-k8s-namespace)) (labels '()))
-  "Return a resource op for a ConfigMap named NAME holding the alist DATA."
+(define-construct ingress
+  #:head name
+  #:fields ((port #:required) (host #:default #f)
+            (namespace #:default (current-k8s-namespace)) (path #:default "/") (labels #:map))
+  #:build (%ingress #:name name #:port port #:host host #:namespace namespace
+                    #:path path #:labels labels))
+
+(define* (%configmap #:key name data (namespace (current-k8s-namespace)) (labels '()))
   (resource
     `((apiVersion . "v1")
       (kind . "ConfigMap")
       (metadata ,@(k8s-metadata name namespace labels))
       (data ,@data))))
 
-(define* (secret #:key name data (namespace (current-k8s-namespace)) (type "Opaque") (labels '()))
-  "Return a resource op for a Secret named NAME of TYPE (default \"Opaque\")
-holding the alist DATA."
+(define-construct configmap
+  #:head name
+  #:fields ((data #:map) (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (%configmap #:name name #:data data #:namespace namespace #:labels labels))
+
+(define* (%secret #:key name data (namespace (current-k8s-namespace)) (type "Opaque") (labels '()))
   (resource
     `((apiVersion . "v1")
       (kind . "Secret")
@@ -312,56 +322,80 @@ holding the alist DATA."
       (type . ,type)
       (data ,@data))))
 
-;; Generic custom resource (CRD instance). `spec` is the spec alist.
-(define* (custom-resource #:key api kind name (namespace (current-k8s-namespace)) (spec '()) (labels '()))
-  "Return a resource op for an arbitrary CRD instance of API/KIND named
-NAME with the given SPEC alist."
+(define-construct secret
+  #:head name
+  #:fields ((data #:map) (namespace #:default (current-k8s-namespace))
+            (type #:default "Opaque") (labels #:map))
+  #:build (%secret #:name name #:data data #:namespace namespace #:type type #:labels labels))
+
+(define* (%custom-resource #:key api kind name (namespace (current-k8s-namespace)) (spec '()) (labels '()))
   (resource
     `((apiVersion . ,api)
       (kind . ,kind)
       (metadata ,@(k8s-metadata name namespace labels))
       (spec ,@spec))))
 
-;; A prometheus-operator ServiceMonitor selecting (app . <name>).
-(define* (service-monitor #:key name (port "http") (path "/metrics")
-                          (interval "30s") (namespace (current-k8s-namespace)) (labels '()))
-  "Return a resource op for a prometheus-operator ServiceMonitor named NAME
-that scrapes PORT at PATH every INTERVAL, selecting (app . NAME)."
-  (custom-resource
+(define-construct custom-resource
+  #:head name
+  #:fields ((api #:required) (kind #:required)
+            (namespace #:default (current-k8s-namespace)) (spec #:map) (labels #:map))
+  #:build (%custom-resource #:api api #:kind kind #:name name
+                            #:namespace namespace #:spec spec #:labels labels))
+
+(define* (%service-monitor #:key name (port "http") (path "/metrics")
+                           (interval "30s") (namespace (current-k8s-namespace)) (labels '()))
+  (%custom-resource
     #:api "monitoring.coreos.com/v1" #:kind "ServiceMonitor"
     #:name name #:namespace namespace #:labels labels
     #:spec `((selector (matchLabels (app . ,name)))
              (endpoints ((port . ,port) (path . ,path) (interval . ,interval))))))
 
+(define-construct service-monitor
+  #:head name
+  #:fields ((port #:default "http") (path #:default "/metrics") (interval #:default "30s")
+            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (%service-monitor #:name name #:port port #:path path #:interval interval
+                            #:namespace namespace #:labels labels))
+
 ;; ---------------------------------------------------------------------------
 ;; RBAC
 ;; ---------------------------------------------------------------------------
 ;;
-;; A `policy-rule` is a plain alist, e.g.
-;;   `((apiGroups "") (resources "pods" "services") (verbs "get" "list" "watch"))
-;; `cluster-role`'s #:rules is a list of those.
+;; A `rule` is a record-body sub-construct producing a policy-rule alist:
+;;   (rule (api-groups "") (resources "pods" "services") (verbs "get" "list"))
+;;     => ((apiGroups "") (resources "pods" "services") (verbs "get" "list"))
 
-(define* (service-account #:key name (namespace (current-k8s-namespace)) (labels '()))
-  "Return a resource op for a ServiceAccount named NAME."
+(define-construct rule
+  #:head ()
+  #:fields ((api-groups #:list) (resources #:list) (verbs #:list))
+  #:build `((apiGroups ,@api-groups) (resources ,@resources) (verbs ,@verbs)))
+
+(define* (%service-account #:key name (namespace (current-k8s-namespace)) (labels '()))
   (resource
     `((apiVersion . "v1")
       (kind . "ServiceAccount")
       (metadata ,@(k8s-metadata name namespace labels)))))
 
-(define* (role #:key name (namespace (current-k8s-namespace)) (rules '()) (labels '()))
-  "Return a resource op for a namespaced Role named NAME with the given policy
-RULES (a list of rule alists).  The namespaced counterpart of `cluster-role'."
+(define-construct service-account
+  #:head name
+  #:fields ((namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (%service-account #:name name #:namespace namespace #:labels labels))
+
+(define* (%role #:key name (namespace (current-k8s-namespace)) (rules '()) (labels '()))
   (resource
     `((apiVersion . "rbac.authorization.k8s.io/v1")
       (kind . "Role")
       (metadata ,@(k8s-metadata name namespace labels))
       (rules ,@rules))))
 
-(define* (role-binding #:key name (namespace (current-k8s-namespace)) role
-                       service-account (sa-namespace namespace) (labels '()))
-  "Return a resource op for a namespaced RoleBinding named NAME binding ROLE (a
-Role in NAMESPACE) to SERVICE-ACCOUNT in SA-NAMESPACE.  The namespaced
-counterpart of `cluster-role-binding'."
+(define-construct role
+  #:head name
+  #:fields ((rule #:repeated #:construct rule)
+            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (%role #:name name #:namespace namespace #:rules rule #:labels labels))
+
+(define* (%role-binding #:key name (namespace (current-k8s-namespace)) role
+                        service-account (sa-namespace namespace) (labels '()))
   (resource
     `((apiVersion . "rbac.authorization.k8s.io/v1")
       (kind . "RoleBinding")
@@ -369,19 +403,27 @@ counterpart of `cluster-role-binding'."
       (roleRef (apiGroup . "rbac.authorization.k8s.io") (kind . "Role") (name . ,role))
       (subjects ((kind . "ServiceAccount") (name . ,service-account) (namespace . ,sa-namespace))))))
 
-(define* (cluster-role #:key name (rules '()) (labels '()))
-  "Return a resource op for a cluster-scoped ClusterRole named NAME with the
-given policy RULES (a list of rule alists)."
+(define-construct role-binding
+  #:head name
+  #:fields ((namespace #:default (current-k8s-namespace)) (role #:required)
+            (service-account #:required) (sa-namespace #:default namespace) (labels #:map))
+  #:build (%role-binding #:name name #:namespace namespace #:role role
+                         #:service-account service-account #:sa-namespace sa-namespace #:labels labels))
+
+(define* (%cluster-role #:key name (rules '()) (labels '()))
   (resource
     `((apiVersion . "rbac.authorization.k8s.io/v1")
       (kind . "ClusterRole")
-      (metadata ,@(k8s-metadata name #f labels))      ; cluster-scoped: no namespace
+      (metadata ,@(k8s-metadata name #f labels))
       (rules ,@rules))))
 
-(define* (cluster-role-binding #:key name role service-account
-                               (sa-namespace (current-k8s-namespace)) (labels '()))
-  "Return a resource op for a ClusterRoleBinding named NAME binding ROLE (a
-ClusterRole) to SERVICE-ACCOUNT in SA-NAMESPACE."
+(define-construct cluster-role
+  #:head name
+  #:fields ((rule #:repeated #:construct rule) (labels #:map))
+  #:build (%cluster-role #:name name #:rules rule #:labels labels))
+
+(define* (%cluster-role-binding #:key name role service-account
+                                (sa-namespace (current-k8s-namespace)) (labels '()))
   (resource
     `((apiVersion . "rbac.authorization.k8s.io/v1")
       (kind . "ClusterRoleBinding")
@@ -389,47 +431,39 @@ ClusterRole) to SERVICE-ACCOUNT in SA-NAMESPACE."
       (roleRef (apiGroup . "rbac.authorization.k8s.io") (kind . "ClusterRole") (name . ,role))
       (subjects ((kind . "ServiceAccount") (name . ,service-account) (namespace . ,sa-namespace))))))
 
-;; Convenience: a ServiceAccount + ClusterRole + ClusterRoleBinding sharing
-;; `name`, bundled into one op (so it slots into a `(when ...)` body).
-(define* (cluster-rbac #:key name (rules '()) (namespace (current-k8s-namespace)) (labels '()))
-  "Return one op bundling a ServiceAccount, ClusterRole (with RULES), and
-ClusterRoleBinding all sharing NAME — slots into a (when …) body."
+(define-construct cluster-role-binding
+  #:head name
+  #:fields ((role #:required) (service-account #:required)
+            (sa-namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (%cluster-role-binding #:name name #:role role #:service-account service-account
+                                 #:sa-namespace sa-namespace #:labels labels))
+
+(define* (%cluster-rbac #:key name (rules '()) (namespace (current-k8s-namespace)) (labels '()))
   (compose-ops 'cluster-rbac (list 'cluster-rbac name)
-    (list (service-account #:name name #:namespace namespace #:labels labels)
-          (cluster-role #:name name #:rules rules #:labels labels)
-          (cluster-role-binding #:name name #:role name #:service-account name
-                                #:sa-namespace namespace #:labels labels))))
+    (list (%service-account #:name name #:namespace namespace #:labels labels)
+          (%cluster-role #:name name #:rules rules #:labels labels)
+          (%cluster-role-binding #:name name #:role name #:service-account name
+                                 #:sa-namespace namespace #:labels labels))))
+
+(define-construct cluster-rbac
+  #:head name
+  #:fields ((rule #:repeated #:construct rule)
+            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (%cluster-rbac #:name name #:rules rule #:namespace namespace #:labels labels))
 
 ;; ---------------------------------------------------------------------------
 ;; external manifests — splice resources produced at render time
 ;; ---------------------------------------------------------------------------
-;;
-;; These read an external input *while folding* (a real `resolve`, never
-;; `tree`/`ops`) and append every Kubernetes manifest it yields to
-;; (kubernetes_resources). `which-cmd` + `json-manifests` are the shared
-;; plumbing; `remote-manifest` is the ready-made op for raw upstream YAML.
-;; A consumer builds the others (a `helm template …` op, a `sops -d …` op) on
-;; the same two helpers. `which-cmd` is the shared PATH resolver from
-;; (hexol sh), re-exported above.
 
-;; guile-json renders JSON objects as string-keyed alists, arrays as vectors,
-;; and JSON null as the symbol `null`; resource alists use symbol keys and
-;; lists — convert recursively. Tools emit `null` for empty maps / lists (e.g.
-;; an unset `annotations:`), which would otherwise serialize back out as the
-;; literal string "null"; drop those keys so the field is simply absent.
 (define (json->resource x)
   (cond ((vector? x) (map json->resource (vector->list x)))
-        ((and (pair? x) (pair? (car x)))                 ; object -> alist
+        ((and (pair? x) (pair? (car x)))
          (filter-map (lambda (kv)
                        (and (not (eq? (cdr kv) 'null))
                             (cons (string->symbol (car kv)) (json->resource (cdr kv)))))
                      x))
-        (else x)))                                        ; scalar / empty
+        (else x)))
 
-;; Run CMD (which must print a JSON array of resource docs — typically
-;; `… | yq ea -o=json '[.]'`) and return the manifests as a list of resource
-;; alists (dropping the empty/comment docs yq emits as null). LABEL names it in
-;; errors.
 (define (json-manifests cmd label)
   "Run CMD (printing a JSON array of manifests) and return them as resource
 alists.  Errors if CMD exits non-zero, blaming LABEL."
@@ -443,10 +477,6 @@ alists.  Errors if CMD exits non-zero, blaming LABEL."
       (filter (lambda (r) (and (pair? r) (assq 'kind r)))
               (map json->resource docs)))))
 
-;; Fetch a remote YAML manifest at URL and splice its documents into
-;; (kubernetes_resources) — a fold-time op for raw upstream YAML (CRD bundles,
-;; install manifests). LABEL names it in `tree` / errors. Skipped with a
-;; warning if curl/yq aren't on PATH, so an inventory still renders without them.
 (define (remote-manifest label url)
   "Return a fold-time op that fetches the YAML at URL with curl, converts it to
 JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
@@ -467,67 +497,73 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
 ;; ---------------------------------------------------------------------------
 ;; composites
 ;; ---------------------------------------------------------------------------
-;;
-;; `compose-ops` (re-exported from the kernel) bundles several resource ops
-;; into one op whose effect folds them; child ops are exposed via op-children
-;; so introspection descends through it.
 
-(define* (app #:key name image (port 8080) (replicas 2) (namespace (current-k8s-namespace))
-              (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-              (service-account #f))
-  "Return a bundle op for a typical internal app: a Deployment plus a
-matching Service derived from it with `expose', both named NAME running IMAGE
-on PORT.  The Service's selector and ports track the workload's actual labels
-and container ports, so they can never drift from the Deployment."
+(define* (%app #:key name image (port 8080) (replicas 2) (namespace (current-k8s-namespace))
+               (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
+               (service-account #f))
   (compose-ops 'app `(app ,name)
     (list (expose
-            (deployment #:name name #:image image #:port port #:replicas replicas
-                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
-                        #:resources resources #:privileged privileged
-                        #:service-account service-account)))))
+            (%deployment #:name name #:image image #:port port #:replicas replicas
+                         #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                         #:resources resources #:privileged privileged
+                         #:service-account service-account)))))
 
-(define* (public-app #:key name image (port 8080) (replicas 2) (namespace (current-k8s-namespace))
-                     (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                     (service-account #f) (host #f))
-  "Return a bundle op for an internet-facing app: a Deployment, a matching
-Service derived from it with `expose', and an Ingress, all named NAME running
-IMAGE on PORT.  The Service's selector and ports track the workload's actual
-labels and container ports, so they can never drift from the Deployment.  The
-Ingress routes #:HOST (defaulting to \"NAME.example.com\") — pass #:host to use
-a subdomain that differs from the app name."
+(define-construct app
+  #:head name
+  #:fields ((image #:required) (port #:default 8080) (replicas #:default 2)
+            (namespace #:default (current-k8s-namespace))
+            (env #:list) (env-from #:list) (volumes #:list)
+            (resources #:default '()) (privileged #:flag) (service-account #:default #f))
+  #:build (%app #:name name #:image image #:port port #:replicas replicas #:namespace namespace
+                #:env env #:env-from env-from #:volumes volumes #:resources resources
+                #:privileged privileged #:service-account service-account))
+
+(define* (%public-app #:key name image (port 8080) (replicas 2) (namespace (current-k8s-namespace))
+                      (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
+                      (service-account #f) (host #f))
   (compose-ops 'public-app `(public-app ,name)
     (list (expose
-            (deployment #:name name #:image image #:port port #:replicas replicas
-                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
-                        #:resources resources #:privileged privileged
-                        #:service-account service-account))
-          (ingress #:name name #:port port #:namespace namespace #:host host))))
+            (%deployment #:name name #:image image #:port port #:replicas replicas
+                         #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                         #:resources resources #:privileged privileged
+                         #:service-account service-account))
+          (%ingress #:name name #:port port #:namespace namespace #:host host))))
 
-(define* (worker #:key name image (replicas 1) (namespace (current-k8s-namespace))
-                 (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                 (service-account #f))
-  "Return a bundle op for a background worker: a Deployment named NAME
-running IMAGE with no exposed port and no Service."
+(define-construct public-app
+  #:head name
+  #:fields ((image #:required) (port #:default 8080) (replicas #:default 2)
+            (namespace #:default (current-k8s-namespace))
+            (env #:list) (env-from #:list) (volumes #:list)
+            (resources #:default '()) (privileged #:flag) (service-account #:default #f)
+            (host #:default #f))
+  #:build (%public-app #:name name #:image image #:port port #:replicas replicas
+                       #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                       #:resources resources #:privileged privileged
+                       #:service-account service-account #:host host))
+
+(define* (%worker #:key name image (replicas 1) (namespace (current-k8s-namespace))
+                  (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
+                  (service-account #f))
   (compose-ops 'worker `(worker ,name)
-    (list (deployment #:name name #:image image #:port 0 #:replicas replicas
-                      #:namespace namespace #:env env #:env-from env-from #:volumes volumes
-                      #:resources resources #:privileged privileged
-                      #:service-account service-account))))
+    (list (%deployment #:name name #:image image #:port 0 #:replicas replicas
+                       #:namespace namespace #:env env #:env-from env-from #:volumes volumes
+                       #:resources resources #:privileged privileged
+                       #:service-account service-account))))
+
+(define-construct worker
+  #:head name
+  #:fields ((image #:required) (replicas #:default 1)
+            (namespace #:default (current-k8s-namespace))
+            (env #:list) (env-from #:list) (volumes #:list)
+            (resources #:default '()) (privileged #:flag) (service-account #:default #f))
+  #:build (%worker #:name name #:image image #:replicas replicas #:namespace namespace
+                   #:env env #:env-from env-from #:volumes volumes #:resources resources
+                   #:privileged privileged #:service-account service-account))
 
 ;; ---------------------------------------------------------------------------
 ;; expose — derive a Service from a workload.
 ;; ---------------------------------------------------------------------------
-;;
-;; `(expose (deployment ...))` folds the workload op, then reads the
-;; resource it produced and appends a matching Service: same name +
-;; namespace, a selector copied verbatim from the workload's own
-;; spec.selector.matchLabels (so it selects exactly the pods that workload
-;; owns), and one Service port per distinct container port found across all
-;; containers. A single port is named "http"; with several it's "port-<n>".
-;; No ports found -> no Service.
 
-;; `append` is shadowed by the surface op-macro in this module; gather with
-;; concatenate.
 (define (collect-container-ports tree)
   (cond
     ((and (pair? tree) (eq? (car tree) 'containerPort) (not (pair? (cdr tree))))
@@ -538,12 +574,7 @@ running IMAGE with no exposed port and no Service."
     (else '())))
 
 (define (service-from-workload wl)
-  "Build a Service resource alist from the workload alist WL: same name and
-namespace, one Service port per distinct container port (named \"http\" if one,
-\"port-<n>\" if several), and a selector copied verbatim from the workload's
-own spec.selector.matchLabels — so the Service selects exactly the pods the
-workload owns (falling back to (app . <name>) if the workload declares no
-matchLabels)."
+  "Build a Service resource alist from the workload alist WL."
   (let* ((meta  (or (assq-ref wl 'metadata) '()))
          (name  (assq-ref meta 'name))
          (ns    (assq-ref meta 'namespace))
@@ -567,8 +598,7 @@ matchLabels)."
 
 (define (expose workload-op)
   "Return an op that folds WORKLOAD-OP, then appends a Service derived from
-the workload it produced (via `service-from-workload').  No container ports
-found means no Service is added."
+the workload it produced (via `service-from-workload')."
   (make-op 'expose '(expose)
     (lambda (state)
       (let* ((before (length (or (state-get state '(kubernetes_resources)) '())))
@@ -585,8 +615,7 @@ found means no Service is added."
 ;; tls-all — add a TLS block to every Ingress.
 ;; ---------------------------------------------------------------------------
 (define (tls-all)
-  "Return an op that adds a TLS block to every Ingress, with a per-Ingress
-secret named \"<name>-tls\" covering that Ingress's hosts."
+  "Return an op that adds a TLS block to every Ingress."
   (transform-resources
     (lambda (r)
       (if (equal? (assq-ref r 'kind) "Ingress")
@@ -598,8 +627,7 @@ secret named \"<name>-tls\" covering that Ingress's hosts."
           r))))
 
 ;; ---------------------------------------------------------------------------
-;; checksum-config — annotate each Deployment with a hash of the
-;; ConfigMaps/Secrets it references (envFrom + volumes).
+;; checksum-config
 ;; ---------------------------------------------------------------------------
 
 (define (envfrom-refs container)
@@ -651,16 +679,9 @@ secret named \"<name>-tls\" covering that Ingress's hosts."
 (define (hash-hex s)
   (number->string (string-hash s) 16))
 
-;; checksum-config is self-contained: as it resolves each Deployment's
-;; ConfigMap/Secret references to hash their data, any reference that
-;; doesn't resolve to a defined resource is recorded as a compliance
-;; finding (check "checksum-config") — instead of being silently hashed
-;; as empty data. It both annotates the pod template and reports.
 (define (checksum-config)
   "Return an op that annotates each Deployment's pod template with a hash of
-the ConfigMaps/Secrets it references (envFrom + volumes), so pods restart
-when that data changes.  References to undefined resources are recorded as
-\"checksum-config\" compliance findings rather than silently hashed empty."
+the ConfigMaps/Secrets it references (envFrom + volumes)."
   (make-op 'checksum-config '(checksum-config)
     (lambda (state)
       (let* ((rs    (or (state-get state '(kubernetes_resources)) '()))
@@ -706,7 +727,7 @@ when that data changes.  References to undefined resources are recorded as
                  rs)))))))
 
 ;; ---------------------------------------------------------------------------
-;; compliance checks — walk the resource list, append findings.
+;; compliance checks
 ;; ---------------------------------------------------------------------------
 
 (define workload-kinds '("Deployment" "StatefulSet" "DaemonSet"))
@@ -754,10 +775,8 @@ when that data changes.  References to undefined resources are recorded as
                                     new)))))
 
 (define (compliance-check name predicate)
-  "Return an op that runs PREDICATE over every resource and appends a
-finding (tagged with check NAME and the resource id) for each message
-PREDICATE returns.  PREDICATE takes a resource alist and returns a list of
-message strings."
+  "Return an op that runs PREDICATE over every resource and appends a finding
+for each message PREDICATE returns."
   (make-op 'compliance-check `(compliance-check ,name)
     (lambda (state)
       (let ((rs (or (state-get state '(kubernetes_resources)) '())))
@@ -879,8 +898,7 @@ container-level securityContext sets privileged to true."
                        (workload-containers r))))))))))
 
 (define (compliance-all registry)
-  "Return one op bundling every compliance check (resource requests, cpu and
-memory limits, image registry REGISTRY, and no-privileged)."
+  "Return one op bundling every compliance check."
   (compose-ops 'compliance-all '(compliance-all)
     (list (check-resources-set)
           (check-cpu-limit-ge-request)
