@@ -80,9 +80,29 @@
 ;; human-facing views (tree / ops / explain / show) and diagnostics paint.
 
 (define no-color? (and (getenv "NO_COLOR") #t))
-(define (port-color? port) (and (not no-color?) (isatty? port)))
+
+;; Color mode, set by the global `--color[=WHEN]` flag (parsed in `dispatch`):
+;;   auto    (default) paint only on a TTY, honoring NO_COLOR — the original
+;;           behavior, so a pipe/file stays clean;
+;;   always  force color on regardless of TTY/NO_COLOR — for `… | less -R` or a
+;;           captured log you'll view colored;
+;;   never   force it off.
+;; `--color` with no value means `always` (the GNU optional-arg convention).
+(define color-mode 'auto)
+(define (port-color? port)
+  (case color-mode
+    ((always) #t)
+    ((never)  #f)
+    (else     (and (not no-color?) (isatty? port)))))
+;; Recomputed from `port-color?`, so they reflect `color-mode`. `set-color-mode!`
+;; re-derives them once the flag is parsed (they're read by the painters at call
+;; time, so updating them before any output repaints everything downstream).
 (define stdout-color? (port-color? (current-output-port)))
 (define stderr-color? (port-color? (current-error-port)))
+(define (set-color-mode! mode)
+  (set! color-mode mode)
+  (set! stdout-color? (port-color? (current-output-port)))
+  (set! stderr-color? (port-color? (current-error-port))))
 
 ;; Build the ESC byte explicitly: Guile's string \x escape is version-
 ;; dependent (2.2+ wants a `\xHH;` terminator and consumes it; 3.0 in some
@@ -1036,7 +1056,12 @@ children, and the state delta it introduced during the resolve.
 The inventory is never a positional: pass it with -i/--inventory FILE, or set
 $HEXOL_INVENTORY once for the session. So a verb's positional is purely its
 domain token, and an exploration loop is just `show HASH` / `explain PATH` —
-the iterated token is the only positional (up-arrow, edit it, re-run).")
+the iterated token is the only positional (up-arrow, edit it, re-run).
+
+--color[=always|never|auto] (any position) forces the human views' coloring:
+auto (default) paints only on a TTY and honors NO_COLOR; always forces it on
+(for `… | less -R` or a colored log); never forces it off. Bare --color =
+always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
 
 ;; Best-effort list of the custom verbs an inventory registers, as
 ;; (name synopsis proc) triples — for `--help` and the no-match fallback.
@@ -1090,20 +1115,46 @@ the iterated token is the only positional (up-arrow, edit it, re-run).")
   (display usage-footer)
   (newline))
 
+;; The WHEN of `--color=WHEN`, validated. A bare `--color` (no value) is
+;; handled by the caller as `always`.
+(define (parse-color-when s)
+  (cond
+    ((string=? s "always") 'always)
+    ((string=? s "never")  'never)
+    ((string=? s "auto")   'auto)
+    (else (usage-error "bad --color value ~s (want always|never|auto)" s))))
+
+;; Pull the global `--color`/`--color=WHEN` flag out of ARGS wherever it appears
+;; and return (values MODE REST): MODE is the color mode (or #f when absent, so
+;; the default `auto' stands), REST is ARGS with the flag removed. Global, not
+;; per-verb — it governs every view's painting — so it is stripped before
+;; dispatch picks the verb, the way nothing else slices a flag out up front.
+(define (extract-color args)
+  (let loop ((args args) (mode #f) (acc '()))
+    (match args
+      (() (values mode (reverse acc)))
+      (("--color" . rest) (loop rest 'always acc))   ; bare → always
+      ((arg . rest)
+       (if (string-prefix? "--color=" arg)
+           (loop rest (parse-color-when (substring arg 8)) acc)
+           (loop rest mode (cons arg acc)))))))
+
 (define (dispatch args)
-  (match (cdr args)
-    (() (show-help) (exit 0))
-    (((or "-h" "--help" "help")) (show-help) (exit 0))
-    ((subcmd . _)
-     (let* ((rest (cdr args))
-            (act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
+  (call-with-values (lambda () (extract-color (cdr args)))
+   (lambda (mode rest)
+    (when mode (set-color-mode! mode))
+    (match rest
+      (() (show-help) (exit 0))
+      (((or "-h" "--help" "help")) (show-help) (exit 0))
+      ((subcmd . _)
+       (let* ((act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
        (if act
            ((action-runner act) rest)
            ;; No built-in verb matched — fall through to a custom verb the
            ;; inventory may register (so an inventory can ADD verbs but never
            ;; shadow a built-in). With no resolvable inventory this re-raises
            ;; the unknown-subcommand usage error.
-           (run-inventory-action subcmd rest))))))
+           (run-inventory-action subcmd rest))))))))
 
 ;; Turn a raised error into one clean stderr line instead of a Guile
 ;; backtrace — the common case being a typo or a mistake inside the
