@@ -16,6 +16,7 @@ help:
 
 test:
 	$(GUILE) -L . test.scm
+	$(GUILE) -L . test/construct.scm
 	$(GUILE) -L . test/k8s-res.scm
 	$(GUILE) -L . test/cmdb-store.scm
 	$(GUILE) -L . test/cmdb-server.scm
