@@ -96,6 +96,15 @@ yields the symbol `at-rest`. The `$` marker is required only when a
 value's syntactic shape could be mistaken for a nested map (e.g. an
 arithmetic expression like `(* 1024 ...)`).
 
+> **Two surfaces, one rule each.** The auto-quoting above is the
+> *config-tree* layer (`hx-merge`/`hx-append`/`hx-when`/`hx-case`), where
+> symbol values pair naturally with the symbol-valued query attributes.
+> **Typed library constructors** (`(hexol k8s)`, the SQL column sugar, …)
+> use the opposite, evaluate-by-default rule: a record body of `(key value)`
+> entries where values are ordinary Scheme — `(deployment "api" (image "x")
+> (replicas (if prod? 3 1)))`. Which rule applies is always decided by the
+> form you're in. See [`extending.md`](extending.md) for `define-construct`.
+
 ## Helpers inside `$` and inside predicates
 
 - `(attr key)`  — read `(attributes key)` from the current fold state.
@@ -258,6 +267,8 @@ hexol.scm           # umbrella: (use-modules (hexol)) -> kernel + surface
 hexol/
   kernel.scm        # (hexol kernel)  — op record, apply-op, resolve, op:* constructors
   surface.scm       # (hexol surface) — hx-ops/hx-merge/hx-when/hx-case/hx-append/attrs/$ macros
+  construct.scm     # (hexol construct)— define-construct: schema-driven record-body
+                    #                   constructor engine every typed target library uses
   k8s.scm           # (hexol k8s)     — deployment/service/ingress/configmap/secret/
                     #                   daemonset/custom-resource/service-monitor sugar,
                     #                   service-account + cluster-rbac, expose (derive a

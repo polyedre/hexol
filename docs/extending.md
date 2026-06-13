@@ -58,6 +58,67 @@ service, with its specific attributes — is content, so it stays in
 library kinds, while a region table, a journal, or a firewall role are
 example content.
 
+## The two author surfaces
+
+hexol has **two** value rules, chosen by the enclosing form — never ambiguous,
+because the form head tells you which you're in:
+
+- **The merge / config-tree layer** — `hx-merge`, `hx-append`, and
+  `hx-when`/`hx-case` predicates. Bare symbols **auto-quote** (`(cni cilium)`
+  → the symbol `cilium`), nesting is bare (`(network (mtu 9000))`), and a
+  computed value uses the `($ …)` marker (deferred to fold time, where
+  `attr`/`get` read accumulated state). This layer is enum- and
+  attribute-heavy, and symbol values are routinely compared against the
+  symbol-valued query attributes — so auto-quoting is the right default.
+
+- **Typed library constructors** — everything built with `define-construct`
+  (all of `(hexol k8s)`, the SQL column sugar, …). Values are **evaluated
+  Scheme** (`(image "x")`, `(replicas (if prod? 3 1))`, `(uuid (ref …))`);
+  strings are quoted, references and arithmetic are natural. No `$`.
+
+The schema-less escapes (`terraform-resource`, the ansible `task`,
+`custom-resource`'s `spec`) are also evaluate-by-default, but keep an explicit
+`(block …)` nesting marker: with evaluated values and no per-field schema,
+nothing else can tell a nested block from an attribute whose value is a call.
+
+## Building a typed constructor: `define-construct`
+
+`(hexol construct)` provides `define-construct`, the one mechanism every typed
+library constructor is built on. It turns a positional `#:head` + a `#:fields`
+schema + a `#:build` expression into a record-body constructor: defaults,
+required fields, coercions, boolean flags, and unknown-key errors (with a
+nearest-key suggestion) — everything the old `#:`-keyword `define*` surface
+gave, minus the hand-quoted alists its argument values used to collapse into.
+
+```scheme
+(define-construct deployment
+  #:head name                                   ; positional; (a b) for several
+  #:fields ((image     #:required)              ; missing → compile error
+            (port      #:default 8080)          ; default value (library scope)
+            (replicas  #:default 1)
+            (env       #:map)                   ; free-form nested alist
+            (env-from  #:list)                  ; (k a b …) → (list a b …)
+            (resources #:coerce normalize-resources)  ; wrap the value in (P …)
+            (privileged #:flag))                ; (privileged) → #t, absent → #f
+  #:build (%deployment #:name name #:image image #:port port …))   ; any value/op
+```
+
+Field kinds: plain scalar, `#:flag` (valueless `(x)` ≡ `#t`), `#:list`,
+`#:map` (free-form, string keys allowed for file-shaped data), and
+`#:construct C` (each entry expands to `(C . args)`; with `#:repeated`, the
+occurrences collect into a list — this is how RBAC `(rule …)` works). `#:build`
+sees the head params and every field bound as locals and may return a plain
+value (a column, a task) or an op (a resource) — the engine is agnostic.
+
+`#:open? #t` lets unknown `(key value)` entries through into an `extra` local
+(an alist) instead of erroring — for generic forms whose key set isn't fixed.
+
+Because the schema names each field's kind, a typed constructor needs **no**
+nesting marker: `(deployment "api" (env (LOG_LEVEL "info")))` is unambiguous.
+Composites and the alist-producing layer stay plain Scheme — a `define-construct`
+`#:build` just calls them — so adding the record-body surface is additive and
+leaves rendered output unchanged.
+
 ## What we built on top, without touching the kernel
 
 The Kubernetes layer is **entirely user-space** — no kernel changes were
