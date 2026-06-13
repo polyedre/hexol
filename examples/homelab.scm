@@ -448,9 +448,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 
 ;; A Flux HelmRepository: where a chart comes from. Lives in flux-system.
 (define* (helm-repository #:key name url (namespace "flux-system") (interval "1h"))
-  (custom-resource #:api "source.toolkit.fluxcd.io/v1" #:kind "HelmRepository"
-    #:name name #:namespace namespace
-    #:spec `((interval . ,interval) (url . ,url))))
+  (custom-resource name
+    (api "source.toolkit.fluxcd.io/v1") (kind "HelmRepository")
+    (namespace namespace)
+    (spec `((interval . ,interval) (url . ,url)))))
 
 ;; A Flux HelmRelease: CHART from the REPO HelmRepository at VERSION, deployed
 ;; into TARGET-NAMESPACE with VALUES. The CR itself lives in flux-system (where
@@ -458,9 +459,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 (define* (helm-release #:key name chart repo version target-namespace
                        (release-name name) (timeout #f)
                        (namespace "flux-system") (values '()) (interval "1h"))
-  (custom-resource #:api "helm.toolkit.fluxcd.io/v2" #:kind "HelmRelease"
-    #:name name #:namespace namespace
-    #:spec `((interval . ,interval)
+  (custom-resource name
+    (api "helm.toolkit.fluxcd.io/v2") (kind "HelmRelease")
+    (namespace namespace)
+    (spec `((interval . ,interval)
              ;; Pin the Helm release name. Flux otherwise defaults it to
              ;; `<targetNamespace>-<name>`, which doubles every chart resource
              ;; name (e.g. `monitoring-kube-prometheus-stack-grafana`) and
@@ -476,7 +478,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
              ,@(if timeout `((timeout . ,timeout)) '())
              (install (createNamespace . #t) (crds . "Create"))
              (upgrade (crds . "CreateReplace") (remediation (retries . 3)))
-             (values ,@values))))
+             (values ,@values)))))
 
 ;; Rancher local-path-provisioner as a self-contained bundle: namespace (PSS
 ;; `privileged` — its helper pods mount hostPath), RBAC, the config (data path
@@ -487,34 +489,35 @@ template` and appends every manifest it emits to (kubernetes_resources)."
         (sa "local-path-provisioner-service-account"))
     (compose-ops 'local-path-provisioner '(local-path-provisioner)
       (list
-        (namespace ns #:labels '((pod-security.kubernetes.io/enforce . "privileged")))
-        (service-account #:name sa #:namespace ns)
+        (namespace ns (labels (pod-security.kubernetes.io/enforce "privileged")))
+        (service-account sa (namespace ns))
         ;; namespaced Role + RoleBinding: manage the helper pods in its own
         ;; namespace (library `role`/`role-binding` — the namespaced counterparts
         ;; of `cluster-role`/`cluster-role-binding`).
-        (role #:name "local-path-provisioner-role" #:namespace ns
-          #:rules '(((apiGroups "") (resources "pods")
-                     (verbs "get" "list" "watch" "create" "patch" "update" "delete"))))
-        (role-binding #:name "local-path-provisioner-bind" #:namespace ns
-          #:role "local-path-provisioner-role" #:service-account sa #:sa-namespace ns)
+        (role "local-path-provisioner-role" (namespace ns)
+          (rule (api-groups "") (resources "pods")
+                (verbs "get" "list" "watch" "create" "patch" "update" "delete")))
+        (role-binding "local-path-provisioner-bind" (namespace ns)
+          (role "local-path-provisioner-role") (service-account sa) (sa-namespace ns))
         ;; cluster-scoped perms: PVs, nodes, storageclasses, events
-        (cluster-role #:name "local-path-provisioner-role"
-          #:rules '(((apiGroups "")
-                     (resources "nodes" "persistentvolumeclaims" "configmaps" "pods" "pods/log")
-                     (verbs "get" "list" "watch"))
-                    ((apiGroups "") (resources "persistentvolumes")
-                     (verbs "get" "list" "watch" "create" "patch" "update" "delete"))
-                    ((apiGroups "") (resources "events") (verbs "create" "patch"))
-                    ((apiGroups "storage.k8s.io") (resources "storageclasses")
-                     (verbs "get" "list" "watch"))))
-        (cluster-role-binding #:name "local-path-provisioner-bind"
-          #:role "local-path-provisioner-role" #:service-account sa #:sa-namespace ns)
+        (cluster-role "local-path-provisioner-role"
+          (rule (api-groups "")
+                (resources "nodes" "persistentvolumeclaims" "configmaps" "pods" "pods/log")
+                (verbs "get" "list" "watch"))
+          (rule (api-groups "") (resources "persistentvolumes")
+                (verbs "get" "list" "watch" "create" "patch" "update" "delete"))
+          (rule (api-groups "") (resources "events") (verbs "create" "patch"))
+          (rule (api-groups "storage.k8s.io") (resources "storageclasses")
+                (verbs "get" "list" "watch")))
+        (cluster-role-binding "local-path-provisioner-bind"
+          (role "local-path-provisioner-role") (service-account sa) (sa-namespace ns))
         ;; config: data path under /var (Talos-writable), helper pod + scripts
-        (configmap #:name "local-path-config" #:namespace ns
-          #:data `((config.json . "{\n  \"nodePathMap\":[\n    { \"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\", \"paths\":[\"/var/mnt/local-path-provisioner\"] }\n  ]\n}")
-                   (setup . "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"")
-                   (teardown . "#!/bin/sh\nset -eu\nrm -rf \"$VOL_DIR\"")
-                   (helperPod.yaml . "apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: busybox\n    imagePullPolicy: IfNotPresent")))
+        (configmap "local-path-config" (namespace ns)
+          (data
+            (config.json "{\n  \"nodePathMap\":[\n    { \"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\", \"paths\":[\"/var/mnt/local-path-provisioner\"] }\n  ]\n}")
+            (setup "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"")
+            (teardown "#!/bin/sh\nset -eu\nrm -rf \"$VOL_DIR\"")
+            (helperPod.yaml "apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: busybox\n    imagePullPolicy: IfNotPresent")))
         ;; the provisioner itself (raw: needs a fieldRef env the generic
         ;; `deployment` constructor doesn't model)
         (resource
@@ -554,9 +557,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; 80→http-port and 443→https-port.
 (define* (gateway #:key name (class "cilium") (namespace (current-k8s-namespace))
                   (http-port 80) (https-port 443))
-  (custom-resource #:api "gateway.networking.k8s.io/v1" #:kind "Gateway"
-    #:name name #:namespace namespace
-    #:spec `((gatewayClassName . ,class)
+  (custom-resource name
+    (api "gateway.networking.k8s.io/v1") (kind "Gateway")
+    (namespace namespace)
+    (spec `((gatewayClassName . ,class)
              (listeners
                ((name . "http") (protocol . "HTTP") (port . ,http-port)
                 (allowedRoutes (namespaces (from . "All"))))
@@ -564,16 +568,17 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                 (hostname . ,(str "*." (cfg 'domain)))
                 (allowedRoutes (namespaces (from . "All")))
                 (tls (mode . "Terminate")
-                     (certificateRefs ((kind . "Secret") (name . "wildcard-tls")))))))))
+                     (certificateRefs ((kind . "Secret") (name . "wildcard-tls"))))))))))
 
 ;; An HTTPRoute attaching one Service to that Gateway under host.<domain>.
 (define* (httproute #:key name (namespace (current-k8s-namespace)) host service port
                     (gateway-name "homelab") (gateway-namespace "gateway"))
-  (custom-resource #:api "gateway.networking.k8s.io/v1" #:kind "HTTPRoute"
-    #:name name #:namespace namespace
-    #:spec `((parentRefs ((name . ,gateway-name) (namespace . ,gateway-namespace)))
+  (custom-resource name
+    (api "gateway.networking.k8s.io/v1") (kind "HTTPRoute")
+    (namespace namespace)
+    (spec `((parentRefs ((name . ,gateway-name) (namespace . ,gateway-namespace)))
              (hostnames ,(str host "." (cfg 'domain)))
-             (rules ((backendRefs ((name . ,service) (port . ,port))))))))
+             (rules ((backendRefs ((name . ,service) (port . ,port)))))))))
 
 (define* (pvc #:key name size (namespace (current-k8s-namespace)) (mode "ReadWriteOnce"))
   (resource `((apiVersion . "v1") (kind . "PersistentVolumeClaim")
@@ -582,9 +587,12 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                     (resources (requests (storage . ,size)))))))
 
 ;; A stateful self-hosted app: a PVC, a single-replica Deployment that mounts
-;; it, and a Service. The library `deployment` now models raw `#:env` vars and
-;; a `(pvc CLAIM PATH)` volume, so the workload is one library call — the PVC
-;; (a separate object) and the matching Service round out the bundle.
+;; it, and a Service. The Deployment is built as a raw `resource` (like the
+;; local-path-provisioner / wireguard workloads above) rather than via the
+;; library `deployment`: its `env` is a runtime list, and the record-body
+;; `(env …)` field expects literal entries, not a spliced variable — the
+;; alist below mirrors exactly what `(deployment …)` would emit. The PVC and
+;; the matching Service round out the bundle.
 ;;
 ;; `#:expose`, when non-empty, is a list of `httproute` keyword arguments
 ;; (e.g. `'(#:host "vault" #:gateway-name "homelab-private")`) — the route is
@@ -593,19 +601,32 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 (define* (stateful-app #:key name image port (namespace (current-k8s-namespace))
                        (storage "5Gi") (mount "/data") (env '()) (resources "100m-*/256Mi")
                        (expose '()))
-  (compose-ops 'stateful-app `(stateful-app ,name)
-    (append
-      (list
-        (pvc #:name name #:size storage #:namespace namespace)
-        (deployment #:name name #:image image #:port port #:replicas 1
-                    #:namespace namespace #:env env
-                    #:volumes `((pvc ,name ,mount))
-                    #:resources resources)
-        (service #:name name #:port port #:namespace namespace))
-      (if (null? expose)
-          '()
-          (list (apply httproute #:name name #:service name #:port port
-                       #:namespace namespace expose))))))
+  (let ((vol (string-append "pvc-" name)))
+    (compose-ops 'stateful-app `(stateful-app ,name)
+      (append
+        (list
+          (pvc #:name name #:size storage #:namespace namespace)
+          (resource
+            `((apiVersion . "apps/v1") (kind . "Deployment")
+              (metadata (namespace . ,namespace) (name . ,name) (labels (app . ,name)))
+              (spec (replicas . 1)
+                    (selector (matchLabels (app . ,name)))
+                    (template
+                      (metadata (labels (app . ,name)))
+                      (spec
+                        (containers
+                          ((name . ,name) (image . ,image)
+                           (ports ((containerPort . ,port)))
+                           ,@(if (null? env) '() `((env ,@env)))
+                           (volumeMounts ((name . ,vol) (mountPath . ,mount)))
+                           (resources ,@(res resources))))
+                        (volumes ((name . ,vol)
+                                  (persistentVolumeClaim (claimName . ,name)))))))))
+          (service name (port port) (namespace namespace)))
+        (if (null? expose)
+            '()
+            (list (apply httproute #:name name #:service name #:port port
+                         #:namespace namespace expose)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; secrets store (content) — one inline, sops-encrypted document
@@ -943,7 +964,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; cluster subnets (pushed via the client's AllowedIPs) and reach the PRIVATE
   ;; Gateway on the node IPs. Runs privileged in its own PSS-privileged namespace
   ;; (it manages the kernel WireGuard interface).
-  (namespace "vpn" #:labels '((pod-security.kubernetes.io/enforce . "privileged")))
+  (namespace "vpn" (labels (pod-security.kubernetes.io/enforce "privileged")))
   ;; wg0.conf (server key + peers) comes from the inline secrets-store,
   ;; resolved into this Secret's stringData at render time.
   ;; TODO: This should use the standard library of k8s.scm. Patch it if needed
@@ -1024,13 +1045,14 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     ;; The webhook reads the OVH creds Secret, but the chart only wires that RBAC
     ;; for issuers IT creates from values — our ClusterIssuer + Secret are managed
     ;; here, so grant the webhook's ServiceAccount read access to the one Secret.
-    (role #:name "ovh-credentials-reader"
-      #:rules '(((apiGroups "") (resources "secrets") (verbs "get" "watch")
-                 (resourceNames "ovh-credentials"))))
-    (role-binding #:name "ovh-credentials-reader" #:role "ovh-credentials-reader"
-                  #:service-account "cert-manager-webhook-ovh")
-    (custom-resource #:api "cert-manager.io/v1" #:kind "ClusterIssuer" #:name "letsencrypt"
-      #:spec `((acme (server . "https://acme-v02.api.letsencrypt.org/directory")
+    (role "ovh-credentials-reader"
+      (rule (api-groups "") (resources "secrets") (verbs "get" "watch")
+            (resource-names "ovh-credentials")))
+    (role-binding "ovh-credentials-reader" (role "ovh-credentials-reader")
+                  (service-account "cert-manager-webhook-ovh"))
+    (custom-resource "letsencrypt"
+      (api "cert-manager.io/v1") (kind "ClusterIssuer")
+      (spec `((acme (server . "https://acme-v02.api.letsencrypt.org/directory")
                      (email . ,(str "admin@" (cfg 'domain)))
                      (privateKeySecretRef (name . "letsencrypt-account"))
                      ;; solve ACME dns-01 via the OVH webhook (wildcard-capable)
@@ -1042,12 +1064,13 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                                           (ovhEndpointName . ,(cfg 'ovh-endpoint))
                                           (applicationKeyRef         (name . "ovh-credentials") (key . "applicationKey"))
                                           (applicationSecretRef      (name . "ovh-credentials") (key . "applicationSecret"))
-                                          (applicationConsumerKeyRef (name . "ovh-credentials") (key . "applicationConsumerKey")))))))))))
+                                          (applicationConsumerKeyRef (name . "ovh-credentials") (key . "applicationConsumerKey"))))))))))))
   (with-namespace "gateway"
-    (custom-resource #:api "cert-manager.io/v1" #:kind "Certificate" #:name "wildcard"
-      #:spec `((secretName . "wildcard-tls")
+    (custom-resource "wildcard"
+      (api "cert-manager.io/v1") (kind "Certificate")
+      (spec `((secretName . "wildcard-tls")
                (issuerRef (name . "letsencrypt") (kind . "ClusterIssuer"))
-               (dnsNames ,(str "*." (cfg 'domain)) ,(cfg 'domain))))
+               (dnsNames ,(str "*." (cfg 'domain)) ,(cfg 'domain)))))
     ;; Two edge Gateways sharing the wildcard cert. The PUBLIC one binds the
     ;; host ports the Octavia LB forwards 80/443 to (internet-reachable); the
     ;; PRIVATE one binds ports the LB does not expose and the secgroup leaves
