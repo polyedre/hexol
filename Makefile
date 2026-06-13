@@ -9,10 +9,10 @@ help:
 	@echo "  make clean   remove this project's Guile compile cache"
 	@echo
 	@echo "everything else is the CLI — ./bin/hexol --help:"
-	@echo "  ./bin/hexol render [-o sexp|json|yaml|terraform|ansible] [--query K=V,…] [--path P] INVENTORY"
-	@echo "  ./bin/hexol tree|ops INVENTORY"
-	@echo "  ./bin/hexol explain [--query K=V,…] PATH INVENTORY"
-	@echo "  ./bin/hexol show HASH INVENTORY"
+	@echo "  ./bin/hexol render [-o sexp|json|yaml|terraform|ansible] [--query K=V,…] [--path P] [-i INVENTORY]"
+	@echo "  ./bin/hexol tree [-i INVENTORY]"
+	@echo "  ./bin/hexol explain [--query K=V,…] PATH|HASH [-i INVENTORY]"
+	@echo "  ./bin/hexol show HASH [-i INVENTORY]"
 
 test:
 	$(GUILE) -L . test.scm

@@ -14,7 +14,6 @@
 ;;;
 ;;;   hexol render [-o FMT] [-q Q] [--path P] [-i INV]  resolve + emit (default)
 ;;;   hexol tree                          [-i INV]   the op tree, indented
-;;;   hexol ops                           [-i INV]   top-level ops + source
 ;;;   hexol explain [-q Q] PATH|HASH      [-i INV]   ops that touched PATH
 ;;;                                                  (or every path an op changed)
 ;;;
@@ -475,24 +474,6 @@
         (walk-list ops '() walk-op)))))
 
 ;; ---------------------------------------------------------------------------
-;; ops — top-level ops with their captured source form
-;; ---------------------------------------------------------------------------
-
-(define (cmd-ops args)
-  (let ((inv (inventory-only "ops" args)))
-    (let ((ops (load-ops inv)))
-      (note ";; inventory: ~a~%" inv)
-      (note ";; ~a top-level ops~%" (length ops))
-      (note ";; ----~%")
-      (let loop ((ops ops) (i 1))
-        (unless (null? ops)
-          (let ((op (car ops)))
-            (format #t "~3d. ~a~30t~a~%     " i (op-kind op)
-                    (o-dim (loc->string (op-loc op))))
-            (pretty-print (op-source op))
-            (loop (cdr ops) (+ i 1))))))))
-
-;; ---------------------------------------------------------------------------
 ;; explain — every op that changed a path during the fold
 ;; ---------------------------------------------------------------------------
 
@@ -935,9 +916,6 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 (register-action!
  (make-action "tree" (cmd-is "tree") (delegating-runner cmd-tree)
    "tree    [-i INVENTORY]"))
-(register-action!
- (make-action "ops" (cmd-is "ops") (delegating-runner cmd-ops)
-   "ops     [-i INVENTORY]"))
 (register-action!
  (make-action "explain" (cmd-is "explain") (delegating-runner cmd-explain)
    "explain [-q K=V,…] PATH|HASH [-i INVENTORY]"))
