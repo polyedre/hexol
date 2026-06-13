@@ -32,8 +32,8 @@
 ;; in (SQL has no equivalent — you copy/paste the columns).
 
 (define (audit-columns)
-  (list (timestamp 'created_at #:not-null #t #:default (raw "now()"))
-        (timestamp 'updated_at #:not-null #t #:default (raw "now()"))))
+  (list (timestamp 'created_at (not-null) (default (raw "now()")))
+        (timestamp 'updated_at (not-null) (default (raw "now()")))))
 
 (hx-ops
 
@@ -41,31 +41,31 @@
 
     (table 'users
       (id)
-      (text 'email     #:not-null #t #:unique #t)
-      (text 'name      #:not-null #t)
-      (boolean 'active #:not-null #t #:default #t)
-      (numeric 'balance 12 2 #:not-null #t #:default 0)   ; precision 12, scale 2
+      (text 'email     (not-null) (unique))
+      (text 'name      (not-null))
+      (boolean 'active (not-null) (default #t))
+      (numeric 'balance 12 2 (not-null) (default 0))   ; precision 12, scale 2
       (audit-columns))
 
     ;; A per-user account row, with audit columns spliced in via the helper.
     (table 'accounts
       (id)
       (references 'user_id 'users)
-      (varchar 'kind 32 #:not-null #t #:check "kind IN ('free', 'pro', 'team')")
+      (varchar 'kind 32 (not-null) (check "kind IN ('free', 'pro', 'team')"))
       (audit-columns))
 
     (table 'posts
       (id)
       (references 'author_id 'users)
-      (text 'title     #:not-null #t)
+      (text 'title     (not-null))
       (text 'body)
-      (boolean 'published   #:not-null #t #:default #f)
+      (boolean 'published   (not-null) (default #f))
       (timestamp 'published_at)
       (audit-columns))
 
     (table 'tags
       (id)
-      (text 'label #:not-null #t #:unique #t))
+      (text 'label (not-null) (unique)))
 
     ;; Join table: composite primary key, two foreign keys, no surrogate id.
     (table 'post_tags
@@ -77,7 +77,7 @@
       (id)
       (references 'post_id   'posts)
       (references 'author_id 'users)
-      (text 'body #:not-null #t)
+      (text 'body (not-null))
       (audit-columns))
 
     ;; ---- indexes ----

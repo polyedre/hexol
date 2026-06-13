@@ -157,12 +157,16 @@
            (if (eq? (syntax->datum #'a) k) #'b (loop #'rest))))))
     (syntax-case stx ()
       ((_ name kw ...)
-       (let* ((kwd      (syntax->datum #'(kw ...)))
-              (head     (let ((h (kw-get kwd #:head '())))
-                          (if (list? h) h (list h))))
-              (open?    (kw-get kwd #:open? #f))
+       (let* ((open?    (kw-get (syntax->datum #'(kw ...)) #:open? #f))
               (build    (kw-syntax #'(kw ...) #:build #'(error "construct: no #:build")))
               (fields-stx (stx->list (kw-syntax #'(kw ...) #:fields #'())))
+              ;; head identifiers, kept as their original syntax (with marks) so
+              ;; they are the *same* bindings #:build references.
+              (head-stx (kw-syntax #'(kw ...) #:head #'()))
+              (head-ids (syntax-case head-stx ()
+                          ((a ...) (stx->list head-stx))
+                          (single  (list head-stx))))
+              (head     (map syntax->datum head-ids))
               (name-sym (syntax->datum #'name))
               (impl     (datum->syntax #'name (symbol-append '% name-sym '-impl))))
          ;; Per field: derive name, kind, repeated?, required?, the construct
@@ -188,12 +192,15 @@
                                ((construct) (if rep? #''() #'#f))
                                (else #'#f))))
                   (coerce (opt-syntax-after opts #:coerce)))
-             (list fname (datum->syntax #'name fname) kind cname rep? req? deflt coerce)))
+             ;; The field-id is the ORIGINAL name identifier (car parts), kept
+             ;; with its marks intact, so it is the very binding #:build
+             ;; references — correct even when define-construct is itself
+             ;; produced by another macro (e.g. SQL's type sugar).
+             (list fname (car parts) kind cname rep? req? deflt coerce)))
          (let* ((infos    (map field-info fields-stx))
                 (fnames   (map car infos))
                 (field-ids (map cadr infos))
-                (head-ids (map (lambda (p) (datum->syntax #'name p)) head))
-                (extra-id (datum->syntax #'name 'extra))
+                (extra-id (datum->syntax build 'extra))
                 ;; descriptors handed to the runtime expander: (name kind rep? req? cname)
                 (descs    (map (lambda (i) (list (list-ref i 0) (list-ref i 2)
                                                  (list-ref i 4) (list-ref i 5) (list-ref i 3)))

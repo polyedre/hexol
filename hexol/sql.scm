@@ -39,6 +39,7 @@
 
 (define-module (hexol sql)
   #:use-module (hexol kernel)
+  #:use-module (hexol construct)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
   #:export (;; scope
@@ -100,16 +101,21 @@
           (references  . ,references)
           (check       . ,check))))
 
-;; Each sugar names a SQL type and otherwise forwards the shared flags.
+;; Each sugar is a value-returning `define-construct`: a positional column
+;; name, then boolean flags written valuelessly — `(text 'email (not-null)
+;; (unique))` — plus `(default …)` / `(check …)` value entries. The schema
+;; recovers what the `#:`-keyword surface gave (defaults, unknown-key errors)
+;; while reading like the rest of the libraries.
 (define-syntax-rule (define-type-sugar (name type) ...)
   (begin
-    (define* (name col-name #:key (primary-key #f) (not-null #f)
-                              (unique #f) (default 'none)
-                              (references #f) (check #f))
-      (column col-name type
-              #:primary-key primary-key #:not-null not-null
-              #:unique unique #:default default
-              #:references references #:check check))
+    (define-construct name
+      #:head (col-name)
+      #:fields ((primary-key #:flag) (not-null #:flag) (unique #:flag)
+                (default #:default 'none) (check #:default #f) (references #:default #f))
+      #:build (column col-name type
+                      #:primary-key primary-key #:not-null not-null
+                      #:unique unique #:default default
+                      #:references references #:check check))
     ...))
 
 (define-type-sugar
@@ -120,30 +126,36 @@
   (timestamp "TIMESTAMP")
   (date      "DATE"))
 
-;; `id` is the near-universal surrogate key: `SERIAL PRIMARY KEY`.
+;; `id` is the near-universal surrogate key: `SERIAL PRIMARY KEY`. It stays a
+;; plain (optional-positional) procedure — `(id)` / `(id 'pk)` — since it
+;; carries no flags and the optional name reads best positionally.
 (define* (id #:optional (name 'id))
   (column name "SERIAL" #:primary-key #t))
 
-;; Parametric types take their argument(s) before the keywords.
-(define* (varchar name n #:key (not-null #f) (unique #f)
-                            (default 'none) (check #f))
-  (column name (format #f "VARCHAR(~a)" n)
-          #:not-null not-null #:unique unique
-          #:default default #:check check))
+;; Parametric types take their argument(s) as extra positional head params.
+(define-construct varchar
+  #:head (name n)
+  #:fields ((not-null #:flag) (unique #:flag) (default #:default 'none) (check #:default #f))
+  #:build (column name (format #f "VARCHAR(~a)" n)
+                  #:not-null not-null #:unique unique
+                  #:default default #:check check))
 
-(define* (numeric name precision scale #:key (not-null #f)
-                                        (default 'none) (check #f))
-  (column name (format #f "NUMERIC(~a, ~a)" precision scale)
-          #:not-null not-null #:default default #:check check))
+(define-construct numeric
+  #:head (name precision scale)
+  #:fields ((not-null #:flag) (default #:default 'none) (check #:default #f))
+  #:build (column name (format #f "NUMERIC(~a, ~a)" precision scale)
+                  #:not-null not-null #:default default #:check check))
 
 ;; A foreign-key column. `(references 'author_id 'users)` makes an INTEGER
-;; column referencing users(id); #:on overrides the target column.
-;; Not-null by default — a dangling FK is usually a bug.
-(define* (references name target #:key (on 'id) (not-null #t)
-                                  (unique #f) (default 'none))
-  (column name "INTEGER"
-          #:not-null not-null #:unique unique #:default default
-          #:references (cons target on)))
+;; column referencing users(id); `(on …)` overrides the target column.
+;; Not-null by default — a dangling FK is usually a bug — so opt out with the
+;; `(nullable)` flag rather than a not-null default.
+(define-construct references
+  #:head (name target)
+  #:fields ((on #:default 'id) (unique #:flag) (default #:default 'none) (nullable #:flag))
+  #:build (column name "INTEGER"
+                  #:not-null (not nullable) #:unique unique #:default default
+                  #:references (cons target on)))
 
 ;; ---------------------------------------------------------------------------
 ;; table-level constraints (values, not ops)
