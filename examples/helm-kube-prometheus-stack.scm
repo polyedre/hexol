@@ -100,127 +100,127 @@
 
   ;; prometheus-operator: RBAC + Deployment (Service derived) + self-ServiceMonitor.
   (hx-when (on? '(prometheusOperator enabled))
-    (cluster-rbac #:name (fullname "operator")
-      #:rules '(((apiGroups "monitoring.coreos.com")
-                 (resources "prometheuses" "alertmanagers" "servicemonitors"
-                            "podmonitors" "prometheusrules" "probes")
-                 (verbs "*"))
-                ((apiGroups "apps") (resources "statefulsets") (verbs "*"))
-                ((apiGroups "") (resources "configmaps" "secrets" "services" "endpoints" "pods")
-                 (verbs "*"))))
+    (cluster-rbac (fullname "operator")
+      (rule (api-groups "monitoring.coreos.com")
+            (resources "prometheuses" "alertmanagers" "servicemonitors"
+                       "podmonitors" "prometheusrules" "probes")
+            (verbs "*"))
+      (rule (api-groups "apps") (resources "statefulsets") (verbs "*"))
+      (rule (api-groups "") (resources "configmaps" "secrets" "services" "endpoints" "pods")
+            (verbs "*")))
     (expose
-      (deployment #:name (fullname "operator") #:image (vget '(prometheusOperator image))
-                  #:replicas (vget '(prometheusOperator replicas))
-                  #:port 8080 #:service-account (fullname "operator")
-                  #:args '("--kubelet-service=kube-system/kubelet")
-                  #:resources "100m-*/128Mi-256Mi"))
-    (service-monitor #:name (fullname "operator")))
+      (deployment (fullname "operator")
+                  (image (vget '(prometheusOperator image)))
+                  (replicas (vget '(prometheusOperator replicas)))
+                  (port 8080) (service-account (fullname "operator"))
+                  (args "--kubelet-service=kube-system/kubelet")
+                  (resources "100m-*/128Mi-256Mi")))
+    (service-monitor (fullname "operator")))
 
   ;; Prometheus CR (reconciled by the operator) + RBAC + Service + self-ServiceMonitor.
   (hx-when (on? '(prometheus enabled))
-    (cluster-rbac #:name (fullname "prometheus")
-      #:rules '(((apiGroups "") (resources "nodes" "nodes/metrics" "services" "endpoints" "pods")
-                 (verbs "get" "list" "watch"))
-                ((apiGroups "") (resources "configmaps") (verbs "get"))
-                ((nonResourceURLs "/metrics") (verbs "get"))))
-    (custom-resource
-      #:api "monitoring.coreos.com/v1" #:kind "Prometheus"
-      #:name (fullname "prometheus")
-      #:spec `((replicas . ,(vget '(prometheus replicas)))
-               (image . ,(vget '(prometheus image)))
-               (retention . ,(vget '(prometheus retention)))
-               (scrapeInterval . ,(vget '(prometheus scrapeInterval)))
-               (serviceAccountName . ,(fullname "prometheus"))
-               ;; empty selectors == "discover every ServiceMonitor / Rule"
-               (serviceMonitorSelector)
-               (ruleSelector)
-               (resources ,@(res "500m-*/2Gi"))
-               (storage
-                 (volumeClaimTemplate
-                   (spec (storageClassName . ,(vget '(prometheus storage class)))
-                         (accessModes "ReadWriteOnce")
-                         (resources (requests (storage . ,(vget '(prometheus storage size))))))))
-               (alerting
-                 (alertmanagers ((namespace . ,ns)
-                                 (name . ,(fullname "alertmanager"))
-                                 (port . "http"))))))
-    (service #:name (fullname "prometheus") #:port 9090 #:target-port 9090)
-    (service-monitor #:name (fullname "prometheus")))
+    (cluster-rbac (fullname "prometheus")
+      (rule (api-groups "") (resources "nodes" "nodes/metrics" "services" "endpoints" "pods")
+            (verbs "get" "list" "watch"))
+      (rule (api-groups "") (resources "configmaps") (verbs "get"))
+      (rule (non-resource-urls "/metrics") (verbs "get")))
+    (custom-resource (fullname "prometheus")
+      (api "monitoring.coreos.com/v1") (kind "Prometheus")
+      (spec `((replicas . ,(vget '(prometheus replicas)))
+              (image . ,(vget '(prometheus image)))
+              (retention . ,(vget '(prometheus retention)))
+              (scrapeInterval . ,(vget '(prometheus scrapeInterval)))
+              (serviceAccountName . ,(fullname "prometheus"))
+              ;; empty selectors == "discover every ServiceMonitor / Rule"
+              (serviceMonitorSelector)
+              (ruleSelector)
+              (resources ,@(res "500m-*/2Gi"))
+              (storage
+                (volumeClaimTemplate
+                  (spec (storageClassName . ,(vget '(prometheus storage class)))
+                        (accessModes "ReadWriteOnce")
+                        (resources (requests (storage . ,(vget '(prometheus storage size))))))))
+              (alerting
+                (alertmanagers ((namespace . ,ns)
+                                (name . ,(fullname "alertmanager"))
+                                (port . "http")))))))
+    (service (fullname "prometheus") (port 9090) (target-port 9090))
+    (service-monitor (fullname "prometheus")))
 
   ;; Alertmanager CR + ServiceAccount (no cluster RBAC needed) + Service.
   (hx-when (on? '(alertmanager enabled))
-    (service-account #:name (fullname "alertmanager"))
-    (custom-resource
-      #:api "monitoring.coreos.com/v1" #:kind "Alertmanager"
-      #:name (fullname "alertmanager")
-      #:spec `((replicas . ,(vget '(alertmanager replicas)))
-               (image . ,(vget '(alertmanager image)))
-               (serviceAccountName . ,(fullname "alertmanager"))
-               (resources ,@(res "100m-*/256Mi"))))
-    (service #:name (fullname "alertmanager") #:port 9093 #:target-port 9093))
+    (service-account (fullname "alertmanager"))
+    (custom-resource (fullname "alertmanager")
+      (api "monitoring.coreos.com/v1") (kind "Alertmanager")
+      (spec `((replicas . ,(vget '(alertmanager replicas)))
+              (image . ,(vget '(alertmanager image)))
+              (serviceAccountName . ,(fullname "alertmanager"))
+              (resources ,@(res "100m-*/256Mi")))))
+    (service (fullname "alertmanager") (port 9093) (target-port 9093)))
 
   ;; Grafana: datasource ConfigMap + Deployment + Service + optional Ingress.
   (hx-when (on? '(grafana enabled))
-    (configmap #:name (fullname "grafana-datasource")
-      #:data `((datasource.yaml . ,(string-append
-                                     "apiVersion: 1\n"
-                                     "datasources:\n"
-                                     "  - name: Prometheus\n"
-                                     "    type: prometheus\n"
-                                     "    access: proxy\n"
-                                     "    isDefault: true\n"
-                                     "    url: http://" (fullname "prometheus") "." ns ".svc:9090\n"))))
-    (deployment #:name (fullname "grafana") #:image (vget '(grafana image)) #:replicas 1
-                #:port 3000
-                #:volumes `((configMap ,(fullname "grafana-datasource")
-                                       "/etc/grafana/provisioning/datasources"))
-                #:resources "100m-*/128Mi-256Mi")
-    (service #:name (fullname "grafana") #:port 80 #:target-port 3000)
+    (configmap (fullname "grafana-datasource")
+      (data (datasource.yaml (string-append
+                               "apiVersion: 1\n"
+                               "datasources:\n"
+                               "  - name: Prometheus\n"
+                               "    type: prometheus\n"
+                               "    access: proxy\n"
+                               "    isDefault: true\n"
+                               "    url: http://" (fullname "prometheus") "." ns ".svc:9090\n"))))
+    (deployment (fullname "grafana")
+                (image (vget '(grafana image))) (replicas 1) (port 3000)
+                (volumes (mount (cm (fullname "grafana-datasource"))
+                                "/etc/grafana/provisioning/datasources"))
+                (resources "100m-*/128Mi-256Mi"))
+    (service (fullname "grafana") (port 80) (target-port 3000))
     (hx-when (on? '(grafana ingress enabled))
-      (ingress #:name (fullname "grafana") #:port 80
-               #:host (vget '(grafana ingress host)))))
+      (ingress (fullname "grafana") (port 80)
+               (host (vget '(grafana ingress host))))))
 
   ;; kube-state-metrics: RBAC + Deployment (Service derived) + ServiceMonitor.
   (hx-when (on? '(kubeStateMetrics enabled))
-    (cluster-rbac #:name (fullname "kube-state-metrics")
-      #:rules '(((apiGroups "")
-                 (resources "configmaps" "secrets" "nodes" "pods" "services" "serviceaccounts"
-                            "resourcequotas" "replicationcontrollers" "limitranges"
-                            "persistentvolumeclaims" "persistentvolumes" "namespaces" "endpoints")
-                 (verbs "list" "watch"))
-                ((apiGroups "apps")
-                 (resources "statefulsets" "daemonsets" "deployments" "replicasets")
-                 (verbs "list" "watch"))
-                ((apiGroups "batch") (resources "cronjobs" "jobs") (verbs "list" "watch"))))
+    (cluster-rbac (fullname "kube-state-metrics")
+      (rule (api-groups "")
+            (resources "configmaps" "secrets" "nodes" "pods" "services" "serviceaccounts"
+                       "resourcequotas" "replicationcontrollers" "limitranges"
+                       "persistentvolumeclaims" "persistentvolumes" "namespaces" "endpoints")
+            (verbs "list" "watch"))
+      (rule (api-groups "apps")
+            (resources "statefulsets" "daemonsets" "deployments" "replicasets")
+            (verbs "list" "watch"))
+      (rule (api-groups "batch") (resources "cronjobs" "jobs") (verbs "list" "watch")))
     (expose
-      (deployment #:name (fullname "kube-state-metrics") #:image (vget '(kubeStateMetrics image))
-                  #:replicas 1 #:port 8080
-                  #:service-account (fullname "kube-state-metrics")
-                  #:resources "50m-*/64Mi-128Mi"))
-    (service-monitor #:name (fullname "kube-state-metrics")))
+      (deployment (fullname "kube-state-metrics")
+                  (image (vget '(kubeStateMetrics image)))
+                  (replicas 1) (port 8080)
+                  (service-account (fullname "kube-state-metrics"))
+                  (resources "50m-*/64Mi-128Mi")))
+    (service-monitor (fullname "kube-state-metrics")))
 
   ;; node-exporter: DaemonSet (host network/pid) + Service + ServiceMonitor.
   (hx-when (on? '(nodeExporter enabled))
-    (daemonset #:name (fullname "node-exporter") #:image (vget '(nodeExporter image))
-               #:port (vget '(nodeExporter port)) #:host-network #t #:host-pid #t
-               #:args (list (string-append "--web.listen-address=:"
-                                           (number->string (vget '(nodeExporter port)))))
-               #:resources "50m-*/32Mi-64Mi")
-    (service #:name (fullname "node-exporter") #:port (vget '(nodeExporter port))
-             #:port-name "metrics")
-    (service-monitor #:name (fullname "node-exporter") #:port "metrics"))
+    (daemonset (fullname "node-exporter")
+               (image (vget '(nodeExporter image)))
+               (port (vget '(nodeExporter port))) (host-network) (host-pid)
+               (args (string-append "--web.listen-address=:"
+                                    (number->string (vget '(nodeExporter port)))))
+               (resources "50m-*/32Mi-64Mi"))
+    (service (fullname "node-exporter") (port (vget '(nodeExporter port)))
+             (port-name "metrics"))
+    (service-monitor (fullname "node-exporter") (port "metrics")))
 
   ;; A default PrometheusRule (the chart ships hundreds; one representative).
   (hx-when (on? '(defaultRules enabled))
-    (custom-resource
-      #:api "monitoring.coreos.com/v1" #:kind "PrometheusRule"
-      #:name (fullname "default-rules")
-      #:spec `((groups ((name . "node.rules")
-                        (rules ((alert . "TargetDown")
-                                (expr  . "100 * (count by(job) (up == 0) / count by(job) (up)) > 10")
-                                (for   . "10m")
-                                (labels (severity . "warning"))
-                                (annotations (summary . "Targets are down")))))))))
+    (custom-resource (fullname "default-rules")
+      (api "monitoring.coreos.com/v1") (kind "PrometheusRule")
+      (spec `((groups ((name . "node.rules")
+                       (rules ((alert . "TargetDown")
+                               (expr  . "100 * (count by(job) (up == 0) / count by(job) (up)) > 10")
+                               (for   . "10m")
+                               (labels (severity . "warning"))
+                               (annotations (summary . "Targets are down"))))))))))
 
   ;; _helpers.tpl common labels, applied to every resource at once.
   (label-all (common-labels))))

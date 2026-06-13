@@ -338,7 +338,8 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 (define-construct custom-resource
   #:head name
   #:fields ((api #:required) (kind #:required)
-            (namespace #:default (current-k8s-namespace)) (spec #:map) (labels #:map))
+            (namespace #:default (current-k8s-namespace))
+            (spec #:default '()) (labels #:map))   ; spec: a raw alist (escape hatch)
   #:build (%custom-resource #:api api #:kind kind #:name name
                             #:namespace namespace #:spec spec #:labels labels))
 
@@ -367,8 +368,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct rule
   #:head ()
-  #:fields ((api-groups #:list) (resources #:list) (verbs #:list))
-  #:build `((apiGroups ,@api-groups) (resources ,@resources) (verbs ,@verbs)))
+  #:fields ((api-groups #:list) (resources #:list) (non-resource-urls #:list)
+            (resource-names #:list) (verbs #:list))
+  #:build (filter pair?
+            (list (and (pair? api-groups)        (cons 'apiGroups api-groups))
+                  (and (pair? resources)         (cons 'resources resources))
+                  (and (pair? non-resource-urls) (cons 'nonResourceURLs non-resource-urls))
+                  (and (pair? resource-names)    (cons 'resourceNames resource-names))
+                  (and (pair? verbs)             (cons 'verbs verbs)))))
 
 (define* (%service-account #:key name (namespace (current-k8s-namespace)) (labels '()))
   (resource
