@@ -97,11 +97,20 @@
 ;; The kube-API endpoint: a DNS A record pointing at the API load balancer.
 (define (api-endpoint) (fmt "https://api.~a:6443" (cfg 'domain)))
 
-;; The control-plane nodes, as (index . private-ip) pairs: homelab-cp-1 …
-;; on 10.0.10.11…  (these double as control plane + workers — a homelab runs
-;; its apps on the same three machines).
+;; A node's private IP, as a Terraform interpolation into its Neutron port's
+;; allocated address. The IP is NOT pinned (see `talos-node`): each node gets a
+;; dynamic IP from the subnet, so nothing competes with auto-allocated ports
+;; (the LB VIP, its amphora) for a fixed address — the original cp-3 failure.
+;; Everything that needs the IP — certSANs, LB members, the `*.<domain>` DNS —
+;; references this, so the value is resolved at apply from the real allocation.
+(define (node-ip i)
+  (tf-ref "openstack_networking_port_v2" (str "cp-" i) "all_fixed_ips[0]"))
+
+;; The control-plane nodes, as (index . private-ip-ref) pairs: homelab-cp-1 …
+;; (these double as control plane + workers — a homelab runs its apps on the
+;; same three machines). The cdr is the `node-ip` interpolation, not a literal.
 (define (nodes)
-  (map (lambda (i) (cons i (str "10.0.10." (+ 10 i)))) (iota (cfg 'node-count) 1)))
+  (map (lambda (i) (cons i (node-ip i))) (iota (cfg 'node-count) 1)))
 
 ;; The OVH DNS zone that owns `domain`. Defaults to `domain` itself; override
 ;; (HOMELAB_DNS_ZONE) when `domain` is a subdomain of a larger zone you hold at
@@ -220,15 +229,32 @@
                   (os-ingress "wireguard" (cfg 'wg-port) (cfg 'wg-port) #:protocol "udp")
                   (os-ingress-self "internal"))))           ; etcd, kubelet, Cilium between nodes
 
-;; One control-plane node: the machine config Terraform renders for it (from
-;; the shared secrets + our patch), the VM that boots that config as
-;; user_data, and a floating IP so `talosctl`/`kubectl` can reach it.
+;; One control-plane node: an explicit Neutron port (with a DYNAMIC IP), the
+;; machine config Terraform renders for it (from the shared secrets + our
+;; patch), the VM that boots that config and attaches to the port, and a
+;; floating IP so `talosctl`/`kubectl` can reach it.
+;;
+;; The port is created explicitly rather than left to Nova so its allocated IP
+;; is a referenceable attribute (`node-ip`) — used in certSANs, the LB members,
+;; and DNS — and so nothing is PINNED: each node draws a free IP from the
+;; subnet, which removes the cp-3 collision (an auto-allocated port — the LB
+;; VIP or its amphora — could grab a node's pinned IP before that node's port
+;; was created, failing the VM). Security groups live on the port (not the
+;; instance) since the VM attaches by `port`, and the FIP binds to it directly
+;; — no Nova-auto-port data-source lookup needed.
 (define (talos-node node)
-  (let* ((i (car node)) (ip (cdr node))
+  (let* ((i (car node))
          (host      (str (cfg 'cluster-name) "-cp-" i))
-         (data-name (str "controlplane-" i)))
+         (data-name (str "controlplane-" i))
+         (port      (str "cp-" i)))
     (compose-ops 'talos-node `(talos-node ,i)
       (list
+        ;; the node's port — dynamic IP from the subnet pool, our secgroup.
+        (terraform-resource "openstack_networking_port_v2" port
+          (name           (str host "-port"))
+          (network_id     (ref openstack_networking_network_v2 talos id))
+          (admin_state_up #t)
+          (security_group_ids (list (ref openstack_networking_secgroup_v2 talos id))))
         ;; data "talos_machine_configuration" "<data-name>" — config = secrets + patch
         (terraform-data "talos_machine_configuration" data-name
           (cluster_name     (cfg 'cluster-name))
@@ -240,32 +266,21 @@
           (talos_version    (cfg 'talos-version))
           (machine_secrets  (ref talos_machine_secrets this machine_secrets))
           (config_patches   (list (yaml-string (talos-patch node)))))
-        ;; the VM, booting that machine config
+        ;; the VM, attached to that port, booting that machine config
         (terraform-resource "openstack_compute_instance_v2" host
           (name        host)
           (image_id    (ref openstack_images_image_v2 talos id))
           (flavor_name (cfg 'node-flavor))
           (key_pair    (ref openstack_compute_keypair_v2 deployer name))
           (user_data   (tf-ref "data.talos_machine_configuration" data-name "machine_configuration"))
-          (security_groups (list (ref openstack_networking_secgroup_v2 talos name)))
           (block network
-            (uuid        (ref openstack_networking_network_v2 talos id))
-            (fixed_ip_v4 ip)))
-        ;; a floating IP, associated to the node's Neutron port. (The compute
-        ;; `*_floatingip_associate_v2` resource was dropped in openstack
-        ;; provider v3; the networking one binds the FIP to a port id. The
-        ;; instance does NOT expose its Nova-auto-created port as
-        ;; `network.0.port` (empty in provider v3), so we look the port up by
-        ;; device + network — otherwise the associate binds nothing and the FIP
-        ;; stays DOWN.)
-        (terraform-resource "openstack_networking_floatingip_v2" (str "cp-" i)
+            (port (tf-ref "openstack_networking_port_v2" port "id"))))
+        ;; a floating IP, associated to the node's port.
+        (terraform-resource "openstack_networking_floatingip_v2" port
           (pool (cfg 'ext-net)))
-        (terraform-data "openstack_networking_port_v2" (str "cp-" i)
-          (device_id  (tf-ref "openstack_compute_instance_v2" host "id"))
-          (network_id (ref openstack_networking_network_v2 talos id)))
-        (terraform-resource "openstack_networking_floatingip_associate_v2" (str "cp-" i)
-          (floating_ip (tf-ref "openstack_networking_floatingip_v2" (str "cp-" i) "address"))
-          (port_id     (tf-ref "data.openstack_networking_port_v2" (str "cp-" i) "id")))))))
+        (terraform-resource "openstack_networking_floatingip_associate_v2" port
+          (floating_ip (tf-ref "openstack_networking_floatingip_v2" port "address"))
+          (port_id     (tf-ref "openstack_networking_port_v2" port "id")))))))
 
 
 ;; --- OpenStack load balancer (a generic Octavia LB builder) ---
