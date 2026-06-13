@@ -1,0 +1,8 @@
+;;; note: auto-compilation is enabled, set GUILE_AUTO_COMPILE=0
+;;;       or pass the --no-auto-compile argument to disable.
+;;; compiling /home/polyedre/code/hexol-surface-redesign/./bin/hexol
+;;; compiling /home/polyedre/code/hexol-surface-redesign/hexol/secret-tool.scm
+;;; compiling /home/polyedre/code/hexol-surface-redesign/hexol/secrets.scm
+;;; compiled /home/polyedre/.cache/guile/ccache/3.0-LE-8-4.7/home/polyedre/code/hexol-surface-redesign/hexol/secrets.scm.go
+;;; compiled /home/polyedre/.cache/guile/ccache/3.0-LE-8-4.7/home/polyedre/code/hexol-surface-redesign/hexol/secret-tool.scm.go
+;;; compiled /home/polyedre/.cache/guile/ccache/3.0-LE-8-4.7/home/polyedre/code/hexol-surface-redesign/bin/hexol.go

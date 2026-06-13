@@ -1,0 +1,109 @@
+~ Monthly from 2024/01/01 to 2024/12/31
+    Expense:Gas                         45 EUR
+    Expense:Electric                    25 EUR
+    Expense:Internet                    30 EUR
+    Expense:Rent                        600 EUR
+    Liability:Loan                      20 EUR
+    Asset:Checking
+
+2024/01/01 Opening Balances
+    Asset:Cash                          200 EUR
+    Asset:Checking                      4200 EUR
+    Asset:Savings                       8500 EUR
+    Asset:Brokerage                     12500 EUR
+    Equity:Opening
+
+2024/01/05 Rent
+    Expense:Rent                        600 EUR
+    Asset:Checking
+
+2024/01/05 Groceries
+    Expense:Groceries                   87.40 EUR
+    Asset:Receivable:Alex               43.70 EUR
+    Expense:Groceries                   -43.70 EUR  ; split 1/2 with alex
+    Asset:Checking
+
+2024/01/15 Salary
+    Asset:Checking                      2800 EUR
+    Income:Salary                       -2800 EUR
+
+2024/01/22 Electric bill
+    Expense:Electric                    42.10 EUR  ; January usage
+    Asset:Receivable:Alex               21.05 EUR
+    Expense:Electric                    -21.05 EUR  ; split 1/2 with alex
+    Asset:Checking
+
+2024/01/22 Internet
+    Expense:Internet                    30 EUR
+    Asset:Receivable:Alex               15 EUR
+    Expense:Internet                    -15 EUR  ; split 1/2 with alex
+    Asset:Checking
+
+2024/01/31 * Balance check — Bank statement 2024-01-31
+    Asset:Checking                      0 EUR = 6357.90 EUR
+
+2024/02/05 Rent
+    Expense:Rent                        600 EUR
+    Asset:Checking
+
+2024/02/05 Groceries
+    Expense:Groceries                   64.20 EUR
+    Asset:Receivable:Alex               32.10 EUR
+    Expense:Groceries                   -32.10 EUR  ; split 1/2 with alex
+    Asset:Checking
+
+2024/02/10 Team lunch
+    Expense:Meals                       38.50 EUR  ; team lunch with onboarding cohort
+    Asset:Receivable:Employer           38.50 EUR
+    Expense:Meals                       -38.50 EUR  ; split 1 with employer
+    Asset:Checking
+
+2024/02/15 Salary
+    Asset:Checking                      2800 EUR
+    Income:Salary                       -2800 EUR
+
+2024/02/28 * Balance check
+    Asset:Checking                      0 EUR = 8423.10 EUR
+
+2024/07/12 Hotel
+    Expense:Travel:Hotel                320 USD  ; 2 nights, group rate
+    Asset:Receivable:Jamie              106.67 USD
+    Expense:Travel:Hotel                -106.67 USD  ; split 1/3 with jamie
+    Asset:Receivable:Morgan             106.67 USD
+    Expense:Travel:Hotel                -106.67 USD  ; split 1/3 with morgan
+    Asset:Checking
+
+2024/07/12 Dinner
+    Expense:Travel:Meals                78.40 USD
+    Asset:Receivable:Jamie              26.13 USD
+    Expense:Travel:Meals                -26.13 USD  ; split 1/3 with jamie
+    Asset:Receivable:Morgan             26.13 USD
+    Expense:Travel:Meals                -26.13 USD  ; split 1/3 with morgan
+    Asset:Checking
+
+2024/07/12 Taxi from airport
+    Expense:Travel:Transport            42 USD
+    Asset:Receivable:Jamie              14 USD
+    Expense:Travel:Transport            -14 USD  ; split 1/3 with jamie
+    Asset:Receivable:Morgan             14 USD
+    Expense:Travel:Transport            -14 USD  ; split 1/3 with morgan
+    Asset:Checking
+
+P 2024/07/20 EUR 1.09 USD
+
+2024/07/25 Reimbursement from Jamie
+    Asset:Checking                      146.80 EUR
+    Asset:Receivable:Jamie
+
+2024/12/24 Holiday gifts
+    Expense:Gifts:Family                220 EUR
+    Asset:Checking
+
+2024/12/31 * Balance check — Bank statement EOY
+    Asset:Checking                      0 EUR = 7240 EUR
+
+2024/12/31 * Balance check — Loan fully repaid 2024
+    Liability:Loan                      0 EUR = 0 EUR
+
+2024/12/31 * Balance check — Brokerage YE statement
+    Asset:Brokerage                     0 EUR = 14200 EUR

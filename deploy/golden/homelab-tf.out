@@ -1,0 +1,494 @@
+{
+  "terraform": {
+    "required_version": ">= 1.5.0",
+    "required_providers": {
+      "openstack": {
+        "source": "terraform-provider-openstack/openstack",
+        "version": "~> 3.0"
+      },
+      "talos": {
+        "source": "siderolabs/talos",
+        "version": "~> 0.6"
+      },
+      "ovh": {
+        "source": "ovh/ovh",
+        "version": "~> 1.0"
+      }
+    }
+  },
+  "provider": {
+    "openstack": {
+      "auth_url": "https://auth.cloud.ovh.net/v3",
+      "domain_name": "Default",
+      "region": "GRA11"
+    },
+    "talos": {},
+    "ovh": {
+      "endpoint": "ovh-eu"
+    }
+  },
+  "resource": {
+    "talos_machine_secrets": {
+      "this": {
+        "talos_version": "v1.7.5"
+      }
+    },
+    "openstack_images_image_v2": {
+      "talos": {
+        "name": "talos-v1.7.5",
+        "image_source_url": "https://github.com/siderolabs/talos/releases/download/v1.7.5/openstack-amd64.raw.xz",
+        "container_format": "bare",
+        "disk_format": "raw",
+        "decompress": true,
+        "visibility": "private"
+      }
+    },
+    "openstack_compute_keypair_v2": {
+      "deployer": {
+        "name": "homelab-deployer",
+        "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFbpd2C2lOnj0hDOaR0/vVEQzEb2CgTSCXi//2g6ilG9 polyedre@heimdall"
+      }
+    },
+    "openstack_networking_network_v2": {
+      "talos": {
+        "name": "homelab-net",
+        "admin_state_up": true
+      }
+    },
+    "openstack_networking_subnet_v2": {
+      "talos": {
+        "name": "homelab-subnet",
+        "network_id": "${openstack_networking_network_v2.talos.id}",
+        "cidr": "10.0.10.0/24",
+        "ip_version": 4,
+        "dns_nameservers": [
+          "1.1.1.1",
+          "9.9.9.9"
+        ]
+      }
+    },
+    "openstack_networking_router_v2": {
+      "talos": {
+        "name": "homelab-router",
+        "external_network_id": "${data.openstack_networking_network_v2.ext.id}"
+      }
+    },
+    "openstack_networking_router_interface_v2": {
+      "talos": {
+        "router_id": "${openstack_networking_router_v2.talos.id}",
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      }
+    },
+    "openstack_networking_secgroup_v2": {
+      "talos": {
+        "name": "homelab-talos",
+        "description": "Talos + Kubernetes control plane"
+      }
+    },
+    "openstack_networking_secgroup_rule_v2": {
+      "talos-kube-api": {
+        "direction": "ingress",
+        "ethertype": "IPv4",
+        "protocol": "tcp",
+        "port_range_min": 6443,
+        "port_range_max": 6443,
+        "remote_ip_prefix": "0.0.0.0/0",
+        "security_group_id": "${openstack_networking_secgroup_v2.talos.id}"
+      },
+      "talos-talos": {
+        "direction": "ingress",
+        "ethertype": "IPv4",
+        "protocol": "tcp",
+        "port_range_min": 50000,
+        "port_range_max": 50001,
+        "remote_ip_prefix": "0.0.0.0/0",
+        "security_group_id": "${openstack_networking_secgroup_v2.talos.id}"
+      },
+      "talos-ingress-http": {
+        "direction": "ingress",
+        "ethertype": "IPv4",
+        "protocol": "tcp",
+        "port_range_min": 30080,
+        "port_range_max": 30080,
+        "remote_ip_prefix": "0.0.0.0/0",
+        "security_group_id": "${openstack_networking_secgroup_v2.talos.id}"
+      },
+      "talos-ingress-https": {
+        "direction": "ingress",
+        "ethertype": "IPv4",
+        "protocol": "tcp",
+        "port_range_min": 30443,
+        "port_range_max": 30443,
+        "remote_ip_prefix": "0.0.0.0/0",
+        "security_group_id": "${openstack_networking_secgroup_v2.talos.id}"
+      },
+      "talos-wireguard": {
+        "direction": "ingress",
+        "ethertype": "IPv4",
+        "protocol": "udp",
+        "port_range_min": 51820,
+        "port_range_max": 51820,
+        "remote_ip_prefix": "0.0.0.0/0",
+        "security_group_id": "${openstack_networking_secgroup_v2.talos.id}"
+      },
+      "talos-internal": {
+        "direction": "ingress",
+        "ethertype": "IPv4",
+        "remote_group_id": "${openstack_networking_secgroup_v2.talos.id}",
+        "security_group_id": "${openstack_networking_secgroup_v2.talos.id}"
+      }
+    },
+    "openstack_compute_instance_v2": {
+      "homelab-cp-1": {
+        "name": "homelab-cp-1",
+        "image_id": "${openstack_images_image_v2.talos.id}",
+        "flavor_name": "b2-7",
+        "key_pair": "${openstack_compute_keypair_v2.deployer.name}",
+        "user_data": "${data.talos_machine_configuration.controlplane-1.machine_configuration}",
+        "security_groups": [
+          "${openstack_networking_secgroup_v2.talos.name}"
+        ],
+        "network": {
+          "uuid": "${openstack_networking_network_v2.talos.id}",
+          "fixed_ip_v4": "10.0.10.11"
+        }
+      },
+      "homelab-cp-2": {
+        "name": "homelab-cp-2",
+        "image_id": "${openstack_images_image_v2.talos.id}",
+        "flavor_name": "b2-7",
+        "key_pair": "${openstack_compute_keypair_v2.deployer.name}",
+        "user_data": "${data.talos_machine_configuration.controlplane-2.machine_configuration}",
+        "security_groups": [
+          "${openstack_networking_secgroup_v2.talos.name}"
+        ],
+        "network": {
+          "uuid": "${openstack_networking_network_v2.talos.id}",
+          "fixed_ip_v4": "10.0.10.12"
+        }
+      },
+      "homelab-cp-3": {
+        "name": "homelab-cp-3",
+        "image_id": "${openstack_images_image_v2.talos.id}",
+        "flavor_name": "b2-7",
+        "key_pair": "${openstack_compute_keypair_v2.deployer.name}",
+        "user_data": "${data.talos_machine_configuration.controlplane-3.machine_configuration}",
+        "security_groups": [
+          "${openstack_networking_secgroup_v2.talos.name}"
+        ],
+        "network": {
+          "uuid": "${openstack_networking_network_v2.talos.id}",
+          "fixed_ip_v4": "10.0.10.13"
+        }
+      }
+    },
+    "openstack_networking_floatingip_v2": {
+      "cp-1": {
+        "pool": "Ext-Net"
+      },
+      "cp-2": {
+        "pool": "Ext-Net"
+      },
+      "cp-3": {
+        "pool": "Ext-Net"
+      },
+      "api": {
+        "pool": "Ext-Net",
+        "port_id": "${openstack_lb_loadbalancer_v2.api.vip_port_id}"
+      }
+    },
+    "openstack_networking_floatingip_associate_v2": {
+      "cp-1": {
+        "floating_ip": "${openstack_networking_floatingip_v2.cp-1.address}",
+        "port_id": "${data.openstack_networking_port_v2.cp-1.id}"
+      },
+      "cp-2": {
+        "floating_ip": "${openstack_networking_floatingip_v2.cp-2.address}",
+        "port_id": "${data.openstack_networking_port_v2.cp-2.id}"
+      },
+      "cp-3": {
+        "floating_ip": "${openstack_networking_floatingip_v2.cp-3.address}",
+        "port_id": "${data.openstack_networking_port_v2.cp-3.id}"
+      }
+    },
+    "openstack_lb_loadbalancer_v2": {
+      "api": {
+        "name": "homelab-api",
+        "vip_subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      }
+    },
+    "openstack_lb_listener_v2": {
+      "kube-api": {
+        "name": "kube-api",
+        "protocol": "TCP",
+        "protocol_port": 6443,
+        "loadbalancer_id": "${openstack_lb_loadbalancer_v2.api.id}"
+      },
+      "ingress-http": {
+        "name": "ingress-http",
+        "protocol": "TCP",
+        "protocol_port": 80,
+        "loadbalancer_id": "${openstack_lb_loadbalancer_v2.api.id}"
+      },
+      "ingress-https": {
+        "name": "ingress-https",
+        "protocol": "TCP",
+        "protocol_port": 443,
+        "loadbalancer_id": "${openstack_lb_loadbalancer_v2.api.id}"
+      },
+      "wireguard": {
+        "name": "wireguard",
+        "protocol": "UDP",
+        "protocol_port": 51820,
+        "loadbalancer_id": "${openstack_lb_loadbalancer_v2.api.id}"
+      }
+    },
+    "openstack_lb_pool_v2": {
+      "kube-api": {
+        "name": "kube-api",
+        "protocol": "TCP",
+        "lb_method": "ROUND_ROBIN",
+        "listener_id": "${openstack_lb_listener_v2.kube-api.id}"
+      },
+      "ingress-http": {
+        "name": "ingress-http",
+        "protocol": "TCP",
+        "lb_method": "ROUND_ROBIN",
+        "listener_id": "${openstack_lb_listener_v2.ingress-http.id}"
+      },
+      "ingress-https": {
+        "name": "ingress-https",
+        "protocol": "TCP",
+        "lb_method": "ROUND_ROBIN",
+        "listener_id": "${openstack_lb_listener_v2.ingress-https.id}"
+      },
+      "wireguard": {
+        "name": "wireguard",
+        "protocol": "UDP",
+        "lb_method": "ROUND_ROBIN",
+        "listener_id": "${openstack_lb_listener_v2.wireguard.id}"
+      }
+    },
+    "openstack_lb_monitor_v2": {
+      "kube-api": {
+        "pool_id": "${openstack_lb_pool_v2.kube-api.id}",
+        "type": "TCP",
+        "delay": 10,
+        "timeout": 5,
+        "max_retries": 3
+      }
+    },
+    "openstack_lb_member_v2": {
+      "kube-api-cp-1": {
+        "pool_id": "${openstack_lb_pool_v2.kube-api.id}",
+        "address": "10.0.10.11",
+        "protocol_port": 6443,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "kube-api-cp-2": {
+        "pool_id": "${openstack_lb_pool_v2.kube-api.id}",
+        "address": "10.0.10.12",
+        "protocol_port": 6443,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "kube-api-cp-3": {
+        "pool_id": "${openstack_lb_pool_v2.kube-api.id}",
+        "address": "10.0.10.13",
+        "protocol_port": 6443,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "ingress-http-cp-1": {
+        "pool_id": "${openstack_lb_pool_v2.ingress-http.id}",
+        "address": "10.0.10.11",
+        "protocol_port": 30080,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "ingress-http-cp-2": {
+        "pool_id": "${openstack_lb_pool_v2.ingress-http.id}",
+        "address": "10.0.10.12",
+        "protocol_port": 30080,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "ingress-http-cp-3": {
+        "pool_id": "${openstack_lb_pool_v2.ingress-http.id}",
+        "address": "10.0.10.13",
+        "protocol_port": 30080,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "ingress-https-cp-1": {
+        "pool_id": "${openstack_lb_pool_v2.ingress-https.id}",
+        "address": "10.0.10.11",
+        "protocol_port": 30443,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "ingress-https-cp-2": {
+        "pool_id": "${openstack_lb_pool_v2.ingress-https.id}",
+        "address": "10.0.10.12",
+        "protocol_port": 30443,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "ingress-https-cp-3": {
+        "pool_id": "${openstack_lb_pool_v2.ingress-https.id}",
+        "address": "10.0.10.13",
+        "protocol_port": 30443,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "wireguard-cp-1": {
+        "pool_id": "${openstack_lb_pool_v2.wireguard.id}",
+        "address": "10.0.10.11",
+        "protocol_port": 51820,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "wireguard-cp-2": {
+        "pool_id": "${openstack_lb_pool_v2.wireguard.id}",
+        "address": "10.0.10.12",
+        "protocol_port": 51820,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      },
+      "wireguard-cp-3": {
+        "pool_id": "${openstack_lb_pool_v2.wireguard.id}",
+        "address": "10.0.10.13",
+        "protocol_port": 51820,
+        "subnet_id": "${openstack_networking_subnet_v2.talos.id}"
+      }
+    },
+    "ovh_domain_zone_record": {
+      "api": {
+        "zone": "homelab.example",
+        "subdomain": "api",
+        "fieldtype": "A",
+        "ttl": 60,
+        "target": "${openstack_networking_floatingip_v2.api.address}"
+      },
+      "vpn": {
+        "zone": "homelab.example",
+        "subdomain": "vpn",
+        "fieldtype": "A",
+        "ttl": 60,
+        "target": "${openstack_networking_floatingip_v2.api.address}"
+      },
+      "jellyfin": {
+        "zone": "homelab.example",
+        "subdomain": "jellyfin",
+        "fieldtype": "A",
+        "ttl": 60,
+        "target": "${openstack_networking_floatingip_v2.api.address}"
+      },
+      "wildcard-cp-1": {
+        "zone": "homelab.example",
+        "subdomain": "*",
+        "fieldtype": "A",
+        "ttl": 60,
+        "target": "10.0.10.11"
+      },
+      "wildcard-cp-2": {
+        "zone": "homelab.example",
+        "subdomain": "*",
+        "fieldtype": "A",
+        "ttl": 60,
+        "target": "10.0.10.12"
+      },
+      "wildcard-cp-3": {
+        "zone": "homelab.example",
+        "subdomain": "*",
+        "fieldtype": "A",
+        "ttl": 60,
+        "target": "10.0.10.13"
+      }
+    },
+    "talos_machine_bootstrap": {
+      "this": {
+        "node": "${openstack_networking_floatingip_v2.cp-1.address}",
+        "endpoint": "${openstack_networking_floatingip_v2.cp-1.address}",
+        "client_configuration": "${talos_machine_secrets.this.client_configuration}",
+        "depends_on": [
+          "openstack_networking_floatingip_associate_v2.cp-1"
+        ]
+      }
+    },
+    "talos_cluster_kubeconfig": {
+      "this": {
+        "client_configuration": "${talos_machine_secrets.this.client_configuration}",
+        "node": "${openstack_networking_floatingip_v2.cp-1.address}",
+        "depends_on": [
+          "talos_machine_bootstrap.this"
+        ]
+      }
+    }
+  },
+  "data": {
+    "openstack_networking_network_v2": {
+      "ext": {
+        "name": "Ext-Net"
+      }
+    },
+    "talos_machine_configuration": {
+      "controlplane-1": {
+        "cluster_name": "homelab",
+        "cluster_endpoint": "https://api.homelab.example:6443",
+        "machine_type": "controlplane",
+        "talos_version": "v1.7.5",
+        "machine_secrets": "${talos_machine_secrets.this.machine_secrets}",
+        "config_patches": [
+          "---\nmachine:\n  type: controlplane\n  certSANs:\n  - api.homelab.example\n  - 10.0.10.11\n  - \"${openstack_networking_floatingip_v2.cp-1.address}\"\n  - 127.0.0.1\n  - localhost\n  network:\n    hostname: homelab-cp-1\n  install:\n    disk: /dev/vda\n    wipe: false\n  features:\n    kubePrism:\n      enabled: true\n      port: 7445\n  kubelet:\n    extraArgs:\n      rotate-server-certificates: \"true\"\ncluster:\n  allowSchedulingOnControlPlanes: true\n  network:\n    cni:\n      name: none\n  proxy:\n    disabled: true\n"
+        ]
+      },
+      "controlplane-2": {
+        "cluster_name": "homelab",
+        "cluster_endpoint": "https://api.homelab.example:6443",
+        "machine_type": "controlplane",
+        "talos_version": "v1.7.5",
+        "machine_secrets": "${talos_machine_secrets.this.machine_secrets}",
+        "config_patches": [
+          "---\nmachine:\n  type: controlplane\n  certSANs:\n  - api.homelab.example\n  - 10.0.10.12\n  - \"${openstack_networking_floatingip_v2.cp-2.address}\"\n  - 127.0.0.1\n  - localhost\n  network:\n    hostname: homelab-cp-2\n  install:\n    disk: /dev/vda\n    wipe: false\n  features:\n    kubePrism:\n      enabled: true\n      port: 7445\n  kubelet:\n    extraArgs:\n      rotate-server-certificates: \"true\"\ncluster:\n  allowSchedulingOnControlPlanes: true\n  network:\n    cni:\n      name: none\n  proxy:\n    disabled: true\n"
+        ]
+      },
+      "controlplane-3": {
+        "cluster_name": "homelab",
+        "cluster_endpoint": "https://api.homelab.example:6443",
+        "machine_type": "controlplane",
+        "talos_version": "v1.7.5",
+        "machine_secrets": "${talos_machine_secrets.this.machine_secrets}",
+        "config_patches": [
+          "---\nmachine:\n  type: controlplane\n  certSANs:\n  - api.homelab.example\n  - 10.0.10.13\n  - \"${openstack_networking_floatingip_v2.cp-3.address}\"\n  - 127.0.0.1\n  - localhost\n  network:\n    hostname: homelab-cp-3\n  install:\n    disk: /dev/vda\n    wipe: false\n  features:\n    kubePrism:\n      enabled: true\n      port: 7445\n  kubelet:\n    extraArgs:\n      rotate-server-certificates: \"true\"\ncluster:\n  allowSchedulingOnControlPlanes: true\n  network:\n    cni:\n      name: none\n  proxy:\n    disabled: true\n"
+        ]
+      }
+    },
+    "openstack_networking_port_v2": {
+      "cp-1": {
+        "device_id": "${openstack_compute_instance_v2.homelab-cp-1.id}",
+        "network_id": "${openstack_networking_network_v2.talos.id}"
+      },
+      "cp-2": {
+        "device_id": "${openstack_compute_instance_v2.homelab-cp-2.id}",
+        "network_id": "${openstack_networking_network_v2.talos.id}"
+      },
+      "cp-3": {
+        "device_id": "${openstack_compute_instance_v2.homelab-cp-3.id}",
+        "network_id": "${openstack_networking_network_v2.talos.id}"
+      }
+    },
+    "talos_client_configuration": {
+      "this": {
+        "cluster_name": "homelab",
+        "client_configuration": "${talos_machine_secrets.this.client_configuration}",
+        "endpoints": [
+          "${openstack_networking_floatingip_v2.cp-1.address}"
+        ]
+      }
+    }
+  },
+  "output": {
+    "api_endpoint": {
+      "value": "${openstack_networking_floatingip_v2.api.address}"
+    },
+    "kubeconfig": {
+      "value": "${talos_cluster_kubeconfig.this.kubeconfig_raw}",
+      "sensitive": true
+    },
+    "talosconfig": {
+      "value": "${data.talos_client_configuration.this.talos_config}",
+      "sensitive": true
+    }
+  }
+}

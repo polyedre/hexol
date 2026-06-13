@@ -1,0 +1,739 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    kubernetes.io/metadata.name: monitoring
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-operator
+  labels:
+    app: kube-prometheus-stack-operator
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-prometheus-stack-operator
+  labels:
+    app: kube-prometheus-stack-operator
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+rules:
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - prometheuses
+  - alertmanagers
+  - servicemonitors
+  - podmonitors
+  - prometheusrules
+  - probes
+  verbs:
+  - "*"
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - "*"
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  - services
+  - endpoints
+  - pods
+  verbs:
+  - "*"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-prometheus-stack-operator
+  labels:
+    app: kube-prometheus-stack-operator
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-prometheus-stack-operator
+subjects:
+- kind: ServiceAccount
+  name: kube-prometheus-stack-operator
+  namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-operator
+  labels:
+    app: kube-prometheus-stack-operator
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-operator
+  template:
+    metadata:
+      labels:
+        app: kube-prometheus-stack-operator
+    spec:
+      serviceAccountName: kube-prometheus-stack-operator
+      containers:
+      - name: kube-prometheus-stack-operator
+        image: "quay.io/prometheus-operator/prometheus-operator:v0.76.0"
+        args:
+        - "--kubelet-service=kube-system/kubelet"
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-operator
+  labels:
+    app: kube-prometheus-stack-operator
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    app: kube-prometheus-stack-operator
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-operator
+  labels:
+    app: kube-prometheus-stack-operator
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-operator
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-prometheus
+  labels:
+    app: kube-prometheus-stack-prometheus
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-prometheus-stack-prometheus
+  labels:
+    app: kube-prometheus-stack-prometheus
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - nodes/metrics
+  - services
+  - endpoints
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-prometheus-stack-prometheus
+  labels:
+    app: kube-prometheus-stack-prometheus
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-prometheus-stack-prometheus
+subjects:
+- kind: ServiceAccount
+  name: kube-prometheus-stack-prometheus
+  namespace: monitoring
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-prometheus
+  labels:
+    app: kube-prometheus-stack-prometheus
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  replicas: 2
+  image: "quay.io/prometheus/prometheus:v2.54.1"
+  retention: 30d
+  scrapeInterval: 30s
+  serviceAccountName: kube-prometheus-stack-prometheus
+  serviceMonitorSelector: {}
+  ruleSelector: {}
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      memory: 2Gi
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: fast
+        accessModes:
+        - ReadWriteOnce
+        resources:
+          requests:
+            storage: 200Gi
+  alerting:
+    alertmanagers:
+    - namespace: monitoring
+      name: kube-prometheus-stack-alertmanager
+      port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-prometheus
+  labels:
+    app: kube-prometheus-stack-prometheus
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    app: kube-prometheus-stack-prometheus
+  ports:
+  - name: http
+    port: 9090
+    targetPort: 9090
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-prometheus
+  labels:
+    app: kube-prometheus-stack-prometheus
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-prometheus
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-alertmanager
+  labels:
+    app: kube-prometheus-stack-alertmanager
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Alertmanager
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-alertmanager
+  labels:
+    app: kube-prometheus-stack-alertmanager
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  replicas: 3
+  image: "quay.io/prometheus/alertmanager:v0.27.0"
+  serviceAccountName: kube-prometheus-stack-alertmanager
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-alertmanager
+  labels:
+    app: kube-prometheus-stack-alertmanager
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    app: kube-prometheus-stack-alertmanager
+  ports:
+  - name: http
+    port: 9093
+    targetPort: 9093
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-grafana-datasource
+  labels:
+    app: kube-prometheus-stack-grafana-datasource
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        isDefault: true
+        url: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+    
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-grafana
+  labels:
+    app: kube-prometheus-stack-grafana
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-grafana
+  template:
+    metadata:
+      labels:
+        app: kube-prometheus-stack-grafana
+    spec:
+      containers:
+      - name: kube-prometheus-stack-grafana
+        image: "docker.io/grafana/grafana:11.2.0"
+        ports:
+        - containerPort: 3000
+        volumeMounts:
+        - name: configMap-kube-prometheus-stack-grafana-datasource
+          mountPath: /etc/grafana/provisioning/datasources
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+      volumes:
+      - name: configMap-kube-prometheus-stack-grafana-datasource
+        configMap:
+          name: kube-prometheus-stack-grafana-datasource
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-grafana
+  labels:
+    app: kube-prometheus-stack-grafana
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    app: kube-prometheus-stack-grafana
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-grafana
+  labels:
+    app: kube-prometheus-stack-grafana
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  rules:
+  - host: grafana.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kube-prometheus-stack-grafana
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-kube-state-metrics
+  labels:
+    app: kube-prometheus-stack-kube-state-metrics
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-prometheus-stack-kube-state-metrics
+  labels:
+    app: kube-prometheus-stack-kube-state-metrics
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  - nodes
+  - pods
+  - services
+  - serviceaccounts
+  - resourcequotas
+  - replicationcontrollers
+  - limitranges
+  - persistentvolumeclaims
+  - persistentvolumes
+  - namespaces
+  - endpoints
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  - daemonsets
+  - deployments
+  - replicasets
+  verbs:
+  - list
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-prometheus-stack-kube-state-metrics
+  labels:
+    app: kube-prometheus-stack-kube-state-metrics
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-prometheus-stack-kube-state-metrics
+subjects:
+- kind: ServiceAccount
+  name: kube-prometheus-stack-kube-state-metrics
+  namespace: monitoring
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-kube-state-metrics
+  labels:
+    app: kube-prometheus-stack-kube-state-metrics
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-prometheus-stack-kube-state-metrics
+    spec:
+      serviceAccountName: kube-prometheus-stack-kube-state-metrics
+      containers:
+      - name: kube-prometheus-stack-kube-state-metrics
+        image: "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0"
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-kube-state-metrics
+  labels:
+    app: kube-prometheus-stack-kube-state-metrics
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    app: kube-prometheus-stack-kube-state-metrics
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-kube-state-metrics
+  labels:
+    app: kube-prometheus-stack-kube-state-metrics
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-kube-state-metrics
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-node-exporter
+  labels:
+    app: kube-prometheus-stack-node-exporter
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-node-exporter
+  template:
+    metadata:
+      labels:
+        app: kube-prometheus-stack-node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: kube-prometheus-stack-node-exporter
+        image: "quay.io/prometheus/node-exporter:v1.8.2"
+        args:
+        - "--web.listen-address=:9100"
+        ports:
+        - containerPort: 9100
+        resources:
+          requests:
+            cpu: 50m
+            memory: 32Mi
+          limits:
+            memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-node-exporter
+  labels:
+    app: kube-prometheus-stack-node-exporter
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    app: kube-prometheus-stack-node-exporter
+  ports:
+  - name: metrics
+    port: 9100
+    targetPort: 9100
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-node-exporter
+  labels:
+    app: kube-prometheus-stack-node-exporter
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  selector:
+    matchLabels:
+      app: kube-prometheus-stack-node-exporter
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  namespace: monitoring
+  name: kube-prometheus-stack-default-rules
+  labels:
+    app: kube-prometheus-stack-default-rules
+    app.kubernetes.io/part-of: kube-prometheus-stack
+    app.kubernetes.io/managed-by: hexol
+    app.kubernetes.io/instance: kube-prometheus-stack
+    team: platform
+    env: prod
+spec:
+  groups:
+  - name: node.rules
+    rules:
+    - alert: TargetDown
+      expr: "100 * (count by(job) (up == 0) / count by(job) (up)) > 10"
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: Targets are down

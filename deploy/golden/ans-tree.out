@@ -1,0 +1,163 @@
+;; inventory: examples/ansible.scm (1 top-level ops)
+fb11c89a  └─ fleet
+e147b65f     ├─ play web1.acme.example
+04f8a8c1     │  ├─ task apt: vim (present)
+bd973a3a     │  ├─ task apt: curl (present)
+5db1532d     │  ├─ task apt: htop (present)
+d7086dec     │  ├─ task apt: rsync (present)
+d7199dcd     │  ├─ task apt: ca-certificates (present)
+0f1937a5     │  ├─ task apt: ufw (present)
+78e7f59e     │  ├─ task Set hostname web1.acme.example
+63e47cca     │  ├─ task timezone Etc/UTC
+5ec6a4c7     │  ├─ task locale en_US.UTF-8
+458e912f     │  ├─ task Configure /etc/hosts
+7192f2cb     │  ├─ task sysctl net.core.somaxconn=1024
+8afe5a3b     │  ├─ task sysctl net.ipv4.tcp_syncookies=1
+d3fafcec     │  ├─ task sysctl vm.swappiness=10
+f7d8aff8     │  ├─ task sshd: PermitRootLogin no
+d0bf67ad     │  ├─ task sshd: PasswordAuthentication no
+7c8b96cf     │  ├─ task sshd: X11Forwarding no
+ed6774d4     │  ├─ task user deploy -> present
+cd06c93e     │  ├─ task deploy: .ssh dir
+44c45266     │  ├─ task deploy: authorized_key
+d520f0fa     │  ├─ task user alice -> absent
+6c85ae15     │  ├─ task apt: nginx (present)
+b824247d     │  ├─ task /var/www/web1
+fd7531db     │  ├─ task Deploy app (git)
+d64b935d     │  ├─ task nginx vhost
+312c3d12     │  ├─ task service: nginx -> started
+aea59b75     │  ├─ task ufw: default deny incoming
+91b34839     │  ├─ task ufw: allow OpenSSH
+3191ece8     │  ├─ task ufw: allow 80/tcp
+b9420f21     │  ├─ task ufw: allow 443/tcp
+d9f6e67b     │  ├─ task ufw: enable
+35d8f27f     │  ├─ task stat node_exporter
+a673414f     │  ├─ task Download node_exporter
+e5ac86aa     │  ├─ task Unpack node_exporter
+2c970a22     │  ├─ task service: node_exporter -> started
+b4d983ff     │  ├─ task Check deploy user
+446a7161     │  ├─ task Assert deploy user present
+0f3f575b     │  ├─ task Wait for port 80
+c4184cb8     │  ├─ handler Restart sshd
+ef7aeac2     │  ├─ handler Reload nginx
+a0080476     │  ├─ handler Restart postgresql
+5b8277e5     │  └─ handler Restart redis
+43727566     ├─ play web2.acme.example
+04f8a8c1     │  ├─ task apt: vim (present)
+bd973a3a     │  ├─ task apt: curl (present)
+5db1532d     │  ├─ task apt: htop (present)
+d7086dec     │  ├─ task apt: rsync (present)
+d7199dcd     │  ├─ task apt: ca-certificates (present)
+0f1937a5     │  ├─ task apt: ufw (present)
+ca8ea68d     │  ├─ task Set hostname web2.acme.example
+63e47cca     │  ├─ task timezone Etc/UTC
+5ec6a4c7     │  ├─ task locale en_US.UTF-8
+458e912f     │  ├─ task Configure /etc/hosts
+7192f2cb     │  ├─ task sysctl net.core.somaxconn=1024
+8afe5a3b     │  ├─ task sysctl net.ipv4.tcp_syncookies=1
+d3fafcec     │  ├─ task sysctl vm.swappiness=10
+f7d8aff8     │  ├─ task sshd: PermitRootLogin no
+d0bf67ad     │  ├─ task sshd: PasswordAuthentication no
+7c8b96cf     │  ├─ task sshd: X11Forwarding no
+ed6774d4     │  ├─ task user deploy -> present
+cd06c93e     │  ├─ task deploy: .ssh dir
+44c45266     │  ├─ task deploy: authorized_key
+6c85ae15     │  ├─ task apt: nginx (present)
+518cdc83     │  ├─ task /var/www/web2
+fd7531db     │  ├─ task Deploy app (git)
+d64b935d     │  ├─ task nginx vhost
+312c3d12     │  ├─ task service: nginx -> started
+aea59b75     │  ├─ task ufw: default deny incoming
+91b34839     │  ├─ task ufw: allow OpenSSH
+3191ece8     │  ├─ task ufw: allow 80/tcp
+b9420f21     │  ├─ task ufw: allow 443/tcp
+d9f6e67b     │  ├─ task ufw: enable
+35d8f27f     │  ├─ task stat node_exporter
+a673414f     │  ├─ task Download node_exporter
+e5ac86aa     │  ├─ task Unpack node_exporter
+2c970a22     │  ├─ task service: node_exporter -> started
+b4d983ff     │  ├─ task Check deploy user
+446a7161     │  ├─ task Assert deploy user present
+0f3f575b     │  ├─ task Wait for port 80
+c4184cb8     │  ├─ handler Restart sshd
+ef7aeac2     │  ├─ handler Reload nginx
+a0080476     │  ├─ handler Restart postgresql
+5b8277e5     │  └─ handler Restart redis
+c55a575c     ├─ play db1.acme.example
+04f8a8c1     │  ├─ task apt: vim (present)
+bd973a3a     │  ├─ task apt: curl (present)
+5db1532d     │  ├─ task apt: htop (present)
+d7086dec     │  ├─ task apt: rsync (present)
+d7199dcd     │  ├─ task apt: ca-certificates (present)
+0f1937a5     │  ├─ task apt: ufw (present)
+f174f2e5     │  ├─ task Set hostname db1.acme.example
+63e47cca     │  ├─ task timezone Etc/UTC
+5ec6a4c7     │  ├─ task locale en_US.UTF-8
+458e912f     │  ├─ task Configure /etc/hosts
+7192f2cb     │  ├─ task sysctl net.core.somaxconn=1024
+8afe5a3b     │  ├─ task sysctl net.ipv4.tcp_syncookies=1
+d3fafcec     │  ├─ task sysctl vm.swappiness=10
+f7d8aff8     │  ├─ task sshd: PermitRootLogin no
+d0bf67ad     │  ├─ task sshd: PasswordAuthentication no
+7c8b96cf     │  ├─ task sshd: X11Forwarding no
+ed6774d4     │  ├─ task user deploy -> present
+cd06c93e     │  ├─ task deploy: .ssh dir
+44c45266     │  ├─ task deploy: authorized_key
+8e3695a6     │  ├─ task apt: postgresql (present)
+923dd7a0     │  ├─ task pg_hba.conf
+db5ab668     │  ├─ task service: postgresql -> started
+3847194d     │  ├─ task cron: nightly pg_dump
+aea59b75     │  ├─ task ufw: default deny incoming
+91b34839     │  ├─ task ufw: allow OpenSSH
+c82dc0c9     │  ├─ task ufw: allow postgres from 10.0.1.11
+62f4f283     │  ├─ task ufw: allow postgres from 10.0.1.12
+d9f6e67b     │  ├─ task ufw: enable
+35d8f27f     │  ├─ task stat node_exporter
+a673414f     │  ├─ task Download node_exporter
+e5ac86aa     │  ├─ task Unpack node_exporter
+2c970a22     │  ├─ task service: node_exporter -> started
+b4d983ff     │  ├─ task Check deploy user
+446a7161     │  ├─ task Assert deploy user present
+77e4ac8b     │  ├─ task Wait for port 5432
+c4184cb8     │  ├─ handler Restart sshd
+ef7aeac2     │  ├─ handler Reload nginx
+a0080476     │  ├─ handler Restart postgresql
+5b8277e5     │  └─ handler Restart redis
+1ac06170     └─ play cache1.acme.example
+04f8a8c1        ├─ task apt: vim (present)
+bd973a3a        ├─ task apt: curl (present)
+5db1532d        ├─ task apt: htop (present)
+d7086dec        ├─ task apt: rsync (present)
+d7199dcd        ├─ task apt: ca-certificates (present)
+0f1937a5        ├─ task apt: ufw (present)
+1deea6bf        ├─ task Set hostname cache1.acme.example
+63e47cca        ├─ task timezone Etc/UTC
+5ec6a4c7        ├─ task locale en_US.UTF-8
+458e912f        ├─ task Configure /etc/hosts
+7192f2cb        ├─ task sysctl net.core.somaxconn=1024
+8afe5a3b        ├─ task sysctl net.ipv4.tcp_syncookies=1
+d3fafcec        ├─ task sysctl vm.swappiness=10
+f7d8aff8        ├─ task sshd: PermitRootLogin no
+d0bf67ad        ├─ task sshd: PasswordAuthentication no
+7c8b96cf        ├─ task sshd: X11Forwarding no
+ed6774d4        ├─ task user deploy -> present
+cd06c93e        ├─ task deploy: .ssh dir
+44c45266        ├─ task deploy: authorized_key
+ef1d05af        ├─ task apt: redis-server (present)
+318d06ec        ├─ task redis maxmemory
+41a1791d        ├─ task service: redis-server -> started
+aea59b75        ├─ task ufw: default deny incoming
+91b34839        ├─ task ufw: allow OpenSSH
+6b999ac6        ├─ task ufw: allow 6379/tcp
+d9f6e67b        ├─ task ufw: enable
+35d8f27f        ├─ task stat node_exporter
+a673414f        ├─ task Download node_exporter
+e5ac86aa        ├─ task Unpack node_exporter
+2c970a22        ├─ task service: node_exporter -> started
+b4d983ff        ├─ task Check deploy user
+446a7161        ├─ task Assert deploy user present
+914a9b88        ├─ task Wait for port 6379
+c4184cb8        ├─ handler Restart sshd
+ef7aeac2        ├─ handler Reload nginx
+a0080476        ├─ handler Restart postgresql
+5b8277e5        └─ handler Restart redis
