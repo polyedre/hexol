@@ -37,6 +37,7 @@
   #:use-module (hexol surface)
   #:use-module (hexol construct)
   #:use-module (hexol sh)
+  #:use-module (hexol cache)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
   #:use-module (ice-9 format)
@@ -45,7 +46,9 @@
   #:use-module (json)
   #:re-export (resource transform-resources annotate-all label-all
                compose-ops
-               which-cmd)
+               which-cmd
+               ;; render cache (so an inventory's own shell-out ops can use it)
+               current-render-cache)
   #:export (;; namespace scope
             with-namespace current-k8s-namespace namespace
             ;; compact resources spec
@@ -59,7 +62,7 @@
             service-account role role-binding rule
             cluster-role cluster-role-binding cluster-rbac
             ;; external manifests (render-time splice into kubernetes_resources)
-            json-manifests remote-manifest
+            json-manifests cached-json-manifests remote-manifest
             ;; composites
             app public-app worker
             ;; derive a Service from a workload
@@ -471,18 +474,36 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                      x))
         (else x)))
 
-(define (json-manifests cmd label)
-  "Run CMD (printing a JSON array of manifests) and return them as resource
-alists.  Errors if CMD exits non-zero, blaming LABEL."
+(define (run-json-cmd cmd label)
+  "Run CMD (a shell pipe printing a JSON array of manifests) and return its
+stdout as a string.  Errors if CMD exits non-zero, blaming LABEL."
   (let* ((port   (open-input-pipe cmd))
          (output (get-string-all port))
          (status (close-pipe port)))
     (unless (zero? (status:exit-val status))
       (error "k8s: render command failed for" label))
-    (let* ((parsed (json-string->scm output))
-           (docs   (if (vector? parsed) (vector->list parsed) '())))
-      (filter (lambda (r) (and (pair? r) (assq 'kind r)))
-              (map json->resource docs)))))
+    output))
+
+(define (parse-json-manifests output)
+  "Parse OUTPUT (a JSON array of manifests) into resource alists, dropping
+anything without a `kind`."
+  (let* ((parsed (json-string->scm output))
+         (docs   (if (vector? parsed) (vector->list parsed) '())))
+    (filter (lambda (r) (and (pair? r) (assq 'kind r)))
+            (map json->resource docs))))
+
+(define (json-manifests cmd label)
+  "Run CMD (printing a JSON array of manifests) and return them as resource
+alists.  Errors if CMD exits non-zero, blaming LABEL."
+  (parse-json-manifests (run-json-cmd cmd label)))
+
+(define (cached-json-manifests key cmd label)
+  "Like `json-manifests', but cache CMD's JSON output under KEY in the current
+render cache (`current-render-cache').  KEY must capture every input that
+determines the output (chart+version+values, or the URL).  With no cache bound
+this is exactly `json-manifests' — the shell-out always runs."
+  (parse-json-manifests
+   (cached-json key (lambda () (run-json-cmd cmd label)))))
 
 (define (remote-manifest label url)
   "Return a fold-time op that fetches the YAML at URL with curl, converts it to
@@ -497,7 +518,8 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
            state)
           (else
            (let* ((cmd (fmt "~a -sL ~a | ~a ea -o=json '[.]'" curl url yq))
-                  (manifests (json-manifests cmd label)))
+                  (manifests (cached-json-manifests
+                              (string-append "remote\x00;" url) cmd label)))
              (fold (lambda (r s) (apply-op (resource r) s)) state manifests))))))
     (string-append "remote-manifest " label)))
 

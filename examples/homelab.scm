@@ -425,7 +425,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                                              "--namespace ~a~a --values ~a | ~a ea -o=json '[.]'")
                               helm name chart repo version namespace
                               (if include-crds " --include-crds" "") values-file yq))
-                    (manifests (json-manifests cmd name)))
+                    ;; Cache key: every input that changes the rendered output.
+                    (key (format #f "helm\x00;~a\x00;~a\x00;~a\x00;~a\x00;~a\x00;~a\x00;~s"
+                                 name chart repo version namespace include-crds values))
+                    (manifests (cached-json-manifests key cmd name)))
                (fold (lambda (r s) (apply-op (resource (stamp-namespace namespace r)) s))
                      state manifests)))))))
     (string-append "helm-template " name)))

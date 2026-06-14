@@ -57,6 +57,7 @@
 ;; them; it never authors ops. (The author surface is hx-prefixed now, so it
 ;; no longer shadows anything, but there's still no reason to import it here.)
 (use-modules (hexol kernel)
+             (hexol cache)
              (hexol yaml)
              (hexol terraform)
              (hexol secret-tool)
@@ -1192,22 +1193,41 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
            (loop rest (parse-color-when (substring arg 8)) acc)
            (loop rest mode (cons arg acc)))))))
 
+;; Best-effort: the inventory this invocation will resolve (the -i/--inventory
+;; value or $HEXOL_INVENTORY), or #f. A peek, not a consume — the verb still
+;; parses -i itself; this only lets `dispatch` open the render cache once,
+;; around every verb, without threading it through each resolve site.
+(define (peek-inventory args)
+  (let loop ((args args))
+    (match args
+      (() (env-inventory))
+      (((or "-i" "--inventory") f . _) f)
+      ((arg . rest)
+       (if (string-prefix? "--inventory=" arg) (substring arg 12) (loop rest))))))
+
 (define (dispatch args)
   (call-with-values (lambda () (extract-color (cdr args)))
    (lambda (mode rest)
     (when mode (set-color-mode! mode))
-    (match rest
-      (() (show-help) (exit 0))
-      (((or "-h" "--help" "help")) (show-help) (exit 0))
-      ((subcmd . _)
-       (let* ((act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
-       (if act
-           ((action-runner act) rest)
-           ;; No built-in verb matched — fall through to a custom verb the
-           ;; inventory may register (so an inventory can ADD verbs but never
-           ;; shadow a built-in). With no resolvable inventory this re-raises
-           ;; the unknown-subcommand usage error.
-           (run-inventory-action subcmd rest))))))))
+    ;; One render cache per invocation, scoped to this inventory's content, so
+    ;; helm-template / remote-manifest shell-outs are reused across runs. #f
+    ;; (no inventory, or an unusable cache dir) disables it — results are
+    ;; identical either way.
+    (let ((inv (peek-inventory rest)))
+      (parameterize ((current-render-cache
+                      (and inv (file-exists? inv) (open-render-cache inv))))
+        (match rest
+          (() (show-help) (exit 0))
+          (((or "-h" "--help" "help")) (show-help) (exit 0))
+          ((subcmd . _)
+           (let* ((act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
+             (if act
+                 ((action-runner act) rest)
+                 ;; No built-in verb matched — fall through to a custom verb the
+                 ;; inventory may register (so an inventory can ADD verbs but never
+                 ;; shadow a built-in). With no resolvable inventory this re-raises
+                 ;; the unknown-subcommand usage error.
+                 (run-inventory-action subcmd rest))))))))))
 
 ;; Turn a raised error into one clean stderr line instead of a Guile
 ;; backtrace — the common case being a typo or a mistake inside the
