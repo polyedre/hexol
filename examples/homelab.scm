@@ -717,6 +717,32 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 (define (kubectl* . args)
   (apply cmd "kubectl" "--kubeconfig=deploy/kubeconfig" args))
 
+;; The public URLs the cluster serves, read straight from the resolved
+;; (kubernetes_resources) — no cluster round-trip. Every HTTPRoute's hostnames
+;; (this homelab routes via Gateway API, not Ingress objects) plus any Ingress
+;; rule host, as `https://…` (both Gateways terminate TLS). Sorted + de-duped so
+;; the post-apply summary is stable.
+(define (ingress-urls state)
+  (let ((rs (or (state-get state '(kubernetes_resources)) '())))
+    (sort
+      (delete-duplicates
+        (append-map
+          (lambda (r)
+            (let ((kind (assq-ref r 'kind))
+                  (spec (or (assq-ref r 'spec) '())))
+              (cond
+                ;; HTTPRoute: spec.hostnames is a list of bare hosts.
+                ((equal? kind "HTTPRoute")
+                 (map (lambda (h) (str "https://" h)) (or (assq-ref spec 'hostnames) '())))
+                ;; Ingress: spec.rules[].host (none here today, but stay general).
+                ((equal? kind "Ingress")
+                 (filter-map (lambda (rule)
+                               (and=> (assq-ref rule 'host) (lambda (h) (str "https://" h))))
+                             (or (assq-ref spec 'rules) '())))
+                (else '()))))
+          rs))
+      string<?)))
+
 (appliers
   ("terraform"
    (terraform-applier #:workdir "deploy" #:binary "tofu"
@@ -746,7 +772,19 @@ template` and appends every manifest it emits to (kubernetes_resources)."
    (check "all nodes Ready (Cilium up)"
           (kubectl* "wait" "node" "--all"
                     "--for=condition=Ready" "--timeout=10s")
-          #:fatal? #f)))
+          #:fatal? #f))
+
+  ;; What did we just deploy, and where? A `report` (always runs, never fatal)
+  ;; that prints every service URL — derived from the rendered HTTPRoutes, so it
+  ;; needs no cluster query. The URLs go to stdout (pipeable); report's own
+  ;; framing line is on stderr with the rest of the apply log.
+  ("ingress-urls"
+   (report "service URLs"
+           (lambda (state)
+             (let ((urls (ingress-urls state)))
+               (if (null? urls)
+                   (format (current-error-port) ";;   (no HTTPRoutes/Ingresses rendered)~%")
+                   (for-each (lambda (u) (format #t "~a~%" u)) urls)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; actions (custom CLI verbs) — what this inventory adds to `hexol`
@@ -765,7 +803,18 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; tofu's own "Enter a value: yes" prompt still gates the real destruction.
 (actions
   ("destroy" "destroy [--dry-run]   tear the stack down (tofu destroy)"
-   (terraform-destroyer #:workdir "deploy" #:binary "tofu")))
+   (terraform-destroyer #:workdir "deploy" #:binary "tofu"))
+
+  ;; Re-fetch the cluster credentials from existing tofu state, without an
+  ;; apply: writes deploy/kubeconfig + deploy/talosconfig (the same outputs the
+  ;; terraform applier dumps after a real apply). Install them with:
+  ;;   hexol output -i examples/homelab.scm
+  ;;   cp deploy/kubeconfig  ~/.kube/config      # or KUBECONFIG=deploy/kubeconfig
+  ;;   cp deploy/talosconfig ~/.talos/config     # or talosctl --talosconfig …
+  ("output" "output               write kubeconfig + talosconfig from tofu state"
+   (terraform-outputter #:workdir "deploy" #:binary "tofu"
+                        #:outputs '(("kubeconfig"  . "deploy/kubeconfig")
+                                    ("talosconfig" . "deploy/talosconfig")))))
 
 ;; ---------------------------------------------------------------------------
 ;; the homelab

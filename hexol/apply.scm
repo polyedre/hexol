@@ -59,7 +59,12 @@
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 format)
+  ;; `report'/`check' predicates read the resolved state directly; re-export the
+  ;; accessor so an inventory's own report lambdas (e.g. derive URLs from the
+  ;; rendered resources) can reach into it without importing (hexol kernel).
+  #:re-export (state-get)
   #:export (terraform-applier kubectl-applier terraform-destroyer
+            terraform-outputter
             appliers actions wait-for check report cmd sh-ok?))
 
 ;; ---------- shell helpers ----------
@@ -247,6 +252,26 @@ explicit `hexol' verb — never a step in a bare `hexol apply'."
                  (run* tf chdir "plan" "-destroy"))
           (begin (log ";; destroy: ~a ~a destroy~%" binary chdir)
                  (run* tf chdir "destroy"))))))
+
+;; ---------- terraform outputter (a CLI action, not a pipeline step) ----------
+
+(define* (terraform-outputter #:key (workdir "deploy") (binary "tofu") (outputs '()))
+  "Return an *action* (a (state args -> effects) CLI verb, not an applier) that
+fetches terraform outputs out of the state and writes them to files: for each
+(OUTPUT . FILE) pair in OUTPUTS, capture `BINARY -chdir=WORKDIR output -raw
+OUTPUT' and write it to FILE.  Same hand-off `terraform-applier's #:output->file
+does after an apply, but on demand — so a `hexol output' verb can re-fetch the
+kubeconfig / talosconfig from existing state without re-running apply.  Register
+it with `defines-action'/`actions' to make it its own `hexol' verb."
+  (lambda (state args)
+    (let ((tf    (find-binary binary))
+          (chdir (string-append "-chdir=" workdir)))
+      (for-each
+        (lambda (pair)
+          (let ((val (capture tf chdir "output" "-raw" (car pair))))
+            (write-file (cdr pair) val)
+            (log ";; output: ~a -> ~a~%" (car pair) (cdr pair))))
+        outputs))))
 
 ;; ---------- kubectl applier ----------
 
