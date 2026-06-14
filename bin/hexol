@@ -13,7 +13,8 @@
 ;;; and the same `resolve` fold:
 ;;;
 ;;;   hexol render [-o FMT] [-q Q] [--path P] [-i INV]  resolve + emit (default)
-;;;   hexol tree                          [-i INV]   the op tree, indented
+;;;   hexol tree [-v]                     [-i INV]   the op tree, indented
+;;;                                                  (-v: + per-op fold time)
 ;;;   hexol explain [-q Q] PATH|HASH      [-i INV]   ops that touched PATH
 ;;;                                                  (or every path an op changed)
 ;;;
@@ -463,17 +464,46 @@
 ;; left margin, so the emitted lines land at ~line-width columns.
 (define line-width 120)
 
+;; `tree -v` timing column. When bound (verbose mode), holds the hashq table
+;; of op -> internal-real-time units that `resolve-with-timings` populated;
+;; otherwise #f and the column collapses to nothing. The column is 10 chars
+;; (a right-justified "NN.NNms") plus a two-space gap, so op and source lines
+;; stay aligned under the hash gutter.
+(define tree-timings (make-parameter #f))
+(define time-col-width 12)
+
+(define (op-time-ms op)
+  ;; OP's measured fold time in milliseconds, or #f if it wasn't measured
+  ;; (e.g. a `when` whose predicate never fired, so its effect never ran).
+  (let ((table (tree-timings)))
+    (and table
+         (let ((u (hashq-ref table op)))
+           (and u (/ (* 1000.0 u) internal-time-units-per-second))))))
+
+;; The timing cell for an op line (empty unless verbose).
+(define (time-cell op)
+  (if (tree-timings)
+      (let ((ms (op-time-ms op)))
+        (string-append
+          (o-dim (format #f "~10@a" (if ms (format #f "~,2fms" ms) "—"))) "  "))
+      ""))
+
+;; A blank timing cell for source-derived lines (no op record to measure).
+(define (time-blank)
+  (if (tree-timings) (make-string time-col-width #\space) ""))
+
 (define (walk-op op bars last?)
-  (format #t "~a  ~a~%"
+  (format #t "~a  ~a~a~%"
           (paint-hash (op-content-hash op))
+          (time-cell op)
           (line bars last? (label-paint (or (op-label op) (symbol->string (op-kind op))))))
   (walk-op-children op (concatenate (list bars (list (not last?))))))
 
 (define (walk-source form bars last?)
   ;; Source-derived children have no op record (hence no addressable hash);
-  ;; pad the hash gutter so the tree stays aligned.
+  ;; pad the hash and timing gutters so the tree stays aligned.
   (when (printable-source? form)
-    (format #t "~a~a~%" hash-gutter
+    (format #t "~a~a~a~%" hash-gutter (time-blank)
             (line bars last? (label-paint (label-from-source form))))
     (walk-children form (concatenate (list bars (list (not last?)))))))
 
@@ -499,11 +529,22 @@
                 bars walk-source))))
 
 (define (cmd-tree args)
-  (let ((inv (inventory-only "tree" args)))
-    (let ((ops (load-ops inv)))
-      (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
-        (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
-        (walk-list ops '() walk-op)))))
+  (call-with-values (lambda () (extract-verbose args))
+    (lambda (verbose? rest)
+      (let* ((inv (inventory-only "tree" rest))
+             (ops (load-ops inv)))
+        (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
+          (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
+          (if verbose?
+              ;; Run the fold once to measure each op's time, then annotate the
+              ;; tree. Times are inclusive of children (a parent line totals its
+              ;; subtree); the seed query is empty, matching `render` with no -q.
+              (let ((timings (make-hash-table)))
+                (resolve-with-timings ops '() timings)
+                (note ";; -v: fold time per op (inclusive of children)~%")
+                (parameterize ((tree-timings timings))
+                  (walk-list ops '() walk-op)))
+              (walk-list ops '() walk-op)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; explain — every op that changed a path during the fold
@@ -955,7 +996,7 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
    "apply  [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] [-i INVENTORY]"))
 (register-action!
  (make-action "tree" (cmd-is "tree") (delegating-runner cmd-tree)
-   "tree    [-i INVENTORY]"))
+   "tree    [-v] [-i INVENTORY]"))
 (register-action!
  (make-action "explain" (cmd-is "explain") (delegating-runner cmd-explain)
    "explain [-q K=V,…] PATH|HASH [-i INVENTORY]"))
@@ -1005,6 +1046,16 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
            (loop rest (substring arg 12) acc)
            (loop rest inv (cons arg acc)))))))
 
+;; Pull -v/--verbose out of ARGS wherever it appears, returning (values
+;; VERBOSE? REST) so a verb can opt into it without `inventory-only` (which
+;; rejects stray args) tripping over the flag.
+(define (extract-verbose args)
+  (let loop ((args args) (v #f) (acc '()))
+    (match args
+      (() (values v (reverse acc)))
+      (((or "-v" "--verbose") . rest) (loop rest #t acc))
+      ((arg . rest) (loop rest v (cons arg acc))))))
+
 ;; Pull -q/--query Q (and --query=Q) out of ARGS wherever it appears, parse it,
 ;; and return (values QUERY REST) — the parsed query alist (empty when absent)
 ;; and ARGS with the flag and its value removed. The custom-action fallback
@@ -1051,7 +1102,9 @@ own tool; there is no separate hexol confirmation.
 
 tree prints a stable content hash beside each op; `show HASH` resolves any
 unambiguous prefix of one to that op's kind, label, source, location(s),
-children, and the state delta it introduced during the resolve.
+children, and the state delta it introduced during the resolve. tree -v adds a
+per-op fold-time column (the time the resolve spent in each op's effect,
+inclusive of its children), so you can see where folding the inventory is slow.
 
 The inventory is never a positional: pass it with -i/--inventory FILE, or set
 $HEXOL_INVENTORY once for the session. So a verb's positional is purely its

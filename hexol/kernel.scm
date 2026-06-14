@@ -26,6 +26,8 @@
             path->string
             ;; tracing (explain support)
             current-trace resolve-with-trace path-get
+            ;; per-op fold timing (tree -v support)
+            current-timings resolve-with-timings
             ;; loader (exposed so other modules can override path resolution)
             load-inventory-file
             ;; optional per-file render adapters
@@ -175,10 +177,25 @@ from its kind, source form, label, and the content hashes of its children."
 
 (define current-trace (make-parameter #f))
 
+;; `current-timings`, when bound to a hash table, accumulates each apply-op
+;; call's elapsed real-time (internal time units) keyed by op identity (eq?).
+;; Because a compose op's effect folds its children through apply-op, a
+;; parent's recorded time is *inclusive* of its subtree — the same shape a
+;; profiler tree shows. Unbound (the default) means zero timing overhead.
+(define current-timings (make-parameter #f))
+
 (define (apply-op op state)
   "Apply OP's effect to STATE and return the new state.  When
-`current-trace' is bound to a box, records the (op . after-state) pair."
-  (let ((new-state ((op-effect op) state)))
+`current-trace' is bound to a box, records the (op . after-state) pair; when
+`current-timings' is bound to a hash table, accumulates OP's elapsed
+real-time (inclusive of children) keyed by op identity."
+  (let* ((timings   (current-timings))
+         (start     (and timings (get-internal-real-time)))
+         (new-state ((op-effect op) state)))
+    (when timings
+      (hashq-set! timings op
+                  (+ (- (get-internal-real-time) start)
+                     (or (hashq-ref timings op) 0))))
     (let ((box (current-trace)))
       (when box
         (set-car! box (cons (cons op new-state) (car box)))))
@@ -200,6 +217,14 @@ a list of (op . after-state) pairs in fire order."
     (let ((result (parameterize ((current-trace box))
                     (resolve ops attributes))))
       (values result (reverse (car box))))))
+
+(define (resolve-with-timings ops attributes table)
+  "Like `resolve', but record each op's fold time into TABLE (a hash table
+keyed by op identity, via hashq), accumulating across calls.  Times are
+internal real-time units and inclusive of each op's children.  Returns the
+final resolved state."
+  (parameterize ((current-timings table))
+    (resolve ops attributes)))
 
 ;; Walk a nested state by a path of symbols (alist keys) and integers
 ;; (list indices). Returns #f if any step is missing.

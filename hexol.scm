@@ -14,6 +14,7 @@
                op:merge op:set op:append op:when op:case
                state-get state-set state-append deep-merge deep-merge-with
                current-trace resolve-with-trace path-get load-inventory-file
+               current-timings resolve-with-timings
                renders-with
                ;; surface
                hx-ops hx-each hx-merge hx-when hx-case hx-append
