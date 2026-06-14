@@ -72,7 +72,9 @@
    '((cluster-name  . "homelab")
      (domain        . "homelab.example")
      (node-count    . 3)
-     (talos-version . "v1.7.5")          ; docs.siderolabs.com/talos/v1.7
+     (talos-version . "v1.13.4")         ; docs.siderolabs.com/talos/v1.13
+     ;; Image Factory schematic; default is the vanilla (no-extensions) one.
+     (talos-schematic . "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba")
      (os-region     . "GRA11")           ; an OVH public-cloud region
      (node-flavor   . "b2-7")            ; 2 vCPU / 7 GiB
      (ext-net       . "Ext-Net")         ; OVH's external (floating-IP) network
@@ -144,12 +146,16 @@
 
 (define (talos-patch node)
   (let* ((i (car node)) (ip (cdr node))
-         (host (str (cfg 'cluster-name) "-cp-" i))
          (node-fip (tf-ref "openstack_networking_floatingip_v2" (str "cp-" i) "address")))
     `((machine
         (type . "controlplane")
         (certSANs ,(str "api." (cfg 'domain)) ,ip ,node-fip "127.0.0.1" "localhost")
-        (network (hostname . ,host))
+        ;; No machine.network.hostname: as of Talos v1.12+ the provider auto-emits
+        ;; a `HostnameConfig{auto: stable}` document, and a v1alpha1 hostname
+        ;; alongside it fails validation ("static hostname is already set in
+        ;; v1alpha1 config"). `auto` is the lowest-priority hostname source, so
+        ;; the OpenStack platform's metadata hostname (the instance name) wins —
+        ;; nodes still come up as homelab-cp-N.
         (install (disk . "/dev/vda") (wipe . #f))
         (features (kubePrism (enabled . #t) (port . 7445)))
         (kubelet (extraArgs (rotate-server-certificates . "true"))
@@ -270,8 +276,8 @@
           (cluster_endpoint (api-endpoint))
           (machine_type     "controlplane")
           ;; Pin to the booted image's Talos version — otherwise the provider
-          ;; generates config for its own (newer) schema, which adds keys like
-          ;; `install.grubUseUKICmdline` that v1.7.5 rejects on config load.
+          ;; generates config for its own (possibly newer) schema, adding keys
+          ;; the running apid may reject on config load.
           (talos_version    (cfg 'talos-version))
           (machine_secrets  (ref talos_machine_secrets this machine_secrets))
           (config_patches   (list (yaml-string (talos-patch node)))))
@@ -306,17 +312,30 @@
 ;; #:backends (a list of (suffix . ip)) on #:member-port (default PORT), and a
 ;; TCP health monitor when #:monitor. Returns a procedure of (lb-label subnet)
 ;; that `openstack-lb` applies — so the call site states only the service.
+;; #:persistence (e.g. "SOURCE_IP") pins a client to one backend for the life of
+;; its session. Required for WireGuard: a UDP round-robin pool sprays a single
+;; client's packets across all backends, but each node runs an INDEPENDENT
+;; WireGuard instance — only the one that handshook holds the session, so the
+;; rest are dropped and the tunnel's data plane collapses (handshake succeeds,
+;; everything after times out). SOURCE_IP stickiness keeps a client on the node
+;; it handshook with.
 (define* (lb-listener name #:key port (member-port port) (protocol "TCP")
-                      (monitor #f) (backends '()))
+                      (monitor #f) (persistence #f) (backends '()))
   (lambda (lb subnet)
     (append
       (list
         (terraform-resource "openstack_lb_listener_v2" name
           (name name) (protocol protocol) (protocol_port port)
           (loadbalancer_id (tf-ref "openstack_lb_loadbalancer_v2" lb "id")))
-        (terraform-resource "openstack_lb_pool_v2" name
-          (name name) (protocol protocol) (lb_method "ROUND_ROBIN")
-          (listener_id (tf-ref "openstack_lb_listener_v2" name "id"))))
+        ;; pool — with optional SOURCE_IP stickiness (a nested `persistence' block)
+        (if persistence
+            (terraform-resource "openstack_lb_pool_v2" name
+              (name name) (protocol protocol) (lb_method "ROUND_ROBIN")
+              (listener_id (tf-ref "openstack_lb_listener_v2" name "id"))
+              (block persistence (type persistence)))
+            (terraform-resource "openstack_lb_pool_v2" name
+              (name name) (protocol protocol) (lb_method "ROUND_ROBIN")
+              (listener_id (tf-ref "openstack_lb_listener_v2" name "id")))))
       (if monitor
           (list (terraform-resource "openstack_lb_monitor_v2" name
                   (pool_id (tf-ref "openstack_lb_pool_v2" name "id"))
@@ -546,10 +565,15 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                 (verbs "get" "list" "watch")))
         (cluster-role-binding "local-path-provisioner-bind"
           (role "local-path-provisioner-role") (service-account sa) (sa-namespace ns))
-        ;; config: data path under /var (Talos-writable), helper pod + scripts
+        ;; config: data path under /var (Talos-writable), helper pod + scripts.
+        ;; Must be /var/local-path-provisioner, NOT /var/mnt/…: on Talos /var is
+        ;; the writable ephemeral partition, but /var/mnt is the read-only
+        ;; mountpoint reserved for user-attached disks (we attach none), so a
+        ;; helper pod hostPath-mounting under it fails with "mkdir … read-only
+        ;; file system" and every PVC hangs Pending.
         (configmap "local-path-config" (namespace ns)
           (data
-            (config.json "{\n  \"nodePathMap\":[\n    { \"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\", \"paths\":[\"/var/mnt/local-path-provisioner\"] }\n  ]\n}")
+            (config.json "{\n  \"nodePathMap\":[\n    { \"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\", \"paths\":[\"/var/local-path-provisioner\"] }\n  ]\n}")
             (setup "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"")
             (teardown "#!/bin/sh\nset -eu\nrm -rf \"$VOL_DIR\"")
             (helperPod.yaml "apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: busybox\n    imagePullPolicy: IfNotPresent")))
@@ -575,11 +599,14 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                                   ((name . "CONFIG_MOUNT_PATH") (value . "/etc/config/")))))
                           (volumes ((name . "config-volume")
                                     (configMap (name . "local-path-config")))))))))
-        ;; the default StorageClass (annotated so unclassed PVCs use it)
+        ;; A non-default StorageClass for node-local scratch (cinder-csi below
+        ;; is now the default). Explicitly is-default-class "false" so there is
+        ;; exactly one default in the cluster — two defaults is an error k8s
+        ;; resolves arbitrarily. Opt in per-PVC with storageClassName "local-path".
         (resource
           `((apiVersion . "storage.k8s.io/v1") (kind . "StorageClass")
             (metadata (name . "local-path")
-                      (annotations (storageclass.kubernetes.io/is-default-class . "true")))
+                      (annotations (storageclass.kubernetes.io/is-default-class . "false")))
             (provisioner . "rancher.io/local-path")
             (volumeBindingMode . "WaitForFirstConsumer")
             (reclaimPolicy . "Delete")))))))
@@ -700,6 +727,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
               "DUMMY-PLACEHOLDER-NOT-A-REAL-KEY"
               "-----END PGP MESSAGE-----")))
         (data
+          (openstack/cloud.conf       . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
           (ovh/applicationConsumerKey . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
           (ovh/applicationKey         . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
           (ovh/applicationSecret      . "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
@@ -885,13 +913,14 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (terraform-resource "talos_machine_secrets" "this"
     (talos_version (cfg 'talos-version)))
 
-  ;; The Talos image, uploaded to Glance from the upstream OpenStack release
-  ;; asset (a compressed raw disk the provider decompresses on upload).
+  ;; The Talos image, uploaded to Glance from Image Factory (newer releases no
+  ;; longer ship an openstack asset on GitHub). A compressed raw disk the
+  ;; provider decompresses on upload.
   (terraform-resource "openstack_images_image_v2" "talos"
     (name (str "talos-" (cfg 'talos-version)))
     (image_source_url
-      (fmt "https://github.com/siderolabs/talos/releases/download/~a/openstack-amd64.raw.xz"
-           (cfg 'talos-version)))
+      (fmt "https://factory.talos.dev/image/~a/~a/openstack-amd64.raw.xz"
+           (cfg 'talos-schematic) (cfg 'talos-version)))
     (container_format "bare")
     (disk_format      "raw")
     (decompress       #t)
@@ -939,7 +968,11 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     (list (lb-listener "kube-api" #:port 6443 #:monitor #t #:backends (node-backends))
           (lb-listener "ingress-http"  #:port 80 #:member-port (cfg 'ingress-http-hostport)  #:backends (node-backends))
           (lb-listener "ingress-https" #:port 443 #:member-port (cfg 'ingress-https-hostport) #:backends (node-backends))
-          (lb-listener "wireguard" #:port (cfg 'wg-port) #:protocol "UDP" #:backends (node-backends))))
+          ;; SOURCE_IP stickiness: WireGuard sessions are per-node, so a client
+          ;; must keep hitting the one node it handshook with — round-robin
+          ;; across the 3 independent wg instances breaks the tunnel data plane.
+          (lb-listener "wireguard" #:port (cfg 'wg-port) #:protocol "UDP"
+                       #:persistence "SOURCE_IP" #:backends (node-backends))))
 
   ;; DNS. PUBLIC names resolve to the LB's floating IP: `api.<domain>` (kube-API
   ;; 6443), `vpn.<domain>` (the WireGuard UDP endpoint), and `jellyfin.<domain>`
@@ -1074,18 +1107,47 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (helm-template #:name "kubelet-csr-approver" #:namespace "kube-system"
     #:chart "kubelet-csr-approver"
     #:repo "https://postfinance.github.io/kubelet-csr-approver" #:version "1.2.14"
-    #:values `((providerRegex . ,(str "^" (cfg 'cluster-name) "-cp-[0-9]+$"))
+    ;; Tolerate an optional domain suffix in case the platform-provided
+    ;; hostname is FQDN-style (e.g. homelab-cp-1.novalocal).
+    #:values `((providerRegex . ,(str "^" (cfg 'cluster-name) "-cp-[0-9]+(\\..+)?$"))
                (bypassDnsResolution . #t)
                (providerIpPrefixes ,(cfg 'net-cidr))))
 
-  ;; --- local-path-provisioner: the cluster's default StorageClass ---
-  ;; Talos ships no CSI / StorageClass, so the apps' PVCs would hang Pending.
-  ;; Rancher's local-path-provisioner hands out node-local hostPath volumes —
-  ;; right for a homelab. Talos specifics: the data path must live under the
-  ;; writable /var (not the default /opt, which is read-only on Talos), and the
-  ;; namespace is labelled `privileged` because the helper pods mount hostPath
-  ;; (which Talos's default `baseline` PodSecurity forbids).
+  ;; --- local-path-provisioner: node-local scratch StorageClass (non-default) ---
+  ;; Rancher's local-path-provisioner hands out node-local hostPath volumes. It
+  ;; is no longer the default (cinder-csi below is) — its volumes pin to a node
+  ;; for life, which strands a pod when that node is full or down; keep it for
+  ;; throwaway scratch (opt in with storageClassName "local-path"). Talos
+  ;; specifics: the data path must be /var/local-path-provisioner — directly
+  ;; under the writable ephemeral /var (the default /opt is read-only on Talos,
+  ;; and so is /var/mnt, which is reserved for attached disks; see the configmap
+  ;; for why /var/mnt fails) — and the namespace is labelled `privileged`
+  ;; because the helper pods mount hostPath (Talos's default `baseline` forbids).
   (local-path-provisioner)
+
+  ;; --- cinder-csi: OVH Block Storage as the DEFAULT StorageClass ---
+  ;; Network-attached volumes that follow a pod to whatever node the scheduler
+  ;; picks (and reattach on reschedule) — unlike local-path's node-pinned PVs.
+  ;; The driver authenticates to OpenStack with a `cloud.conf' (the whole INI is
+  ;; one sealed secret — it carries the password — referenced whole, the same
+  ;; way wireguard/wg0.conf is). The driver itself is a Flux HelmRelease below;
+  ;; here we lay down the credential Secret and the default StorageClass it backs
+  ;; (cluster-scoped, so it needs no namespace). Volume type is left unset → the
+  ;; project's default OVH type (set parameters.type to "classic"/"high-speed"
+  ;; to pin one).
+  (resource
+    `((apiVersion . "v1") (kind . "Secret")
+      (metadata (namespace . "kube-system") (name . "cloud-config"))
+      (type . "Opaque")
+      (stringData (cloud.conf . ,(secret-ref 'openstack/cloud.conf)))))
+  (resource
+    `((apiVersion . "storage.k8s.io/v1") (kind . "StorageClass")
+      (metadata (name . "cinder")
+                (annotations (storageclass.kubernetes.io/is-default-class . "true")))
+      (provisioner . "cinder.csi.openstack.org")
+      (volumeBindingMode . "WaitForFirstConsumer")
+      (allowVolumeExpansion . #t)
+      (reclaimPolicy . "Delete")))
 
   ;; --- WireGuard: the VPN that gates the private services ---
   ;; A host-networked WireGuard server (UDP 51820, exposed only via the LB's UDP
@@ -1117,7 +1179,13 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                 (hostNetwork . #t)
                 (containers
                   ((name . "wireguard")
-                   (image . "lscr.io/linuxserver/wireguard:1.0.20210914-r4-ls75")
+                   ;; Talos has an nftables-only kernel (no legacy ip_tables
+                   ;; module), so wg-quick's PostUp must use `nft' — see the
+                   ;; nft-based PostUp/PostDown in the sealed wg0.conf. This image
+                   ;; must therefore ship `nft'; the old 2021 tag (…-ls75) had
+                   ;; only legacy iptables, so wg-quick aborted and the tunnel
+                   ;; never came up (every client handshake timed out).
+                   (image . "lscr.io/linuxserver/wireguard:1.0.20250521-r1-ls114")
                    (securityContext (privileged . #t)
                                     (capabilities (add "NET_ADMIN" "SYS_MODULE")))
                    (ports ((containerPort . ,(cfg 'wg-port)) (hostPort . ,(cfg 'wg-port))
@@ -1143,6 +1211,31 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (helm-repository #:name "jetstack" #:url "https://charts.jetstack.io")
   (helm-repository #:name "prometheus-community" #:url "https://prometheus-community.github.io/helm-charts")
   (helm-repository #:name "cert-manager-webhook-ovh" #:url "https://aureq.github.io/cert-manager-webhook-ovh/")
+  (helm-repository #:name "cloud-provider-openstack" #:url "https://kubernetes.github.io/cloud-provider-openstack")
+
+  ;; --- cinder-csi driver (Flux): controller + per-node DaemonSet ---
+  ;; Installed by Flux (not inline) so a render never has to fetch this chart.
+  ;; Uses the pre-created `cloud-config' Secret (secret.create #f) and skips the
+  ;; chart's own StorageClass — we declared `cinder' (default) above so we own
+  ;; the volume type / reclaim policy. Talos: the node plugin bind-mounts under
+  ;; /var/lib/kubelet, which needs the rshared kubelet mount in the talos-patch
+  ;; (rolled out by `hexol config-apply`). NOTE: pin the chart version to one
+  ;; that matches the cluster's Kubernetes minor (this cluster is v1.36) — bump
+  ;; if Flux reports the version is unavailable.
+  (helm-release #:name "openstack-cinder-csi" #:repo "cloud-provider-openstack"
+    #:chart "openstack-cinder-csi" #:version "2.31.2" #:target-namespace "kube-system"
+    #:values '((secret (enabled . #t) (create . #f) (name . "cloud-config"))
+               (storageClass (enabled . #f))
+               ;; Drop the chart's default `cacert' hostPath (/etc/cacert): its
+               ;; create-if-missing mount fails on Talos's read-only /etc
+               ;; ("mkdir /etc/cacert: read-only file system" → CreateContainerError).
+               ;; We set no `ca-file' in cloud.conf (OVH keystone uses a public
+               ;; cert), so it's unused — keep only the cloud-config mount.
+               (csi (plugin
+                      (volumes)            ; render {}: drop the default cacert volume
+                      (volumeMounts ((name . "cloud-config")
+                                     (mountPath . "/etc/kubernetes")
+                                     (readOnly . #t)))))))
 
   ;; --- cert-manager (Flux): ACME wildcard cert for *.<domain> ---
   ;; The cert is a *wildcard* (`*.<domain>`), which Let's Encrypt only issues
