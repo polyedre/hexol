@@ -152,7 +152,16 @@
         (network (hostname . ,host))
         (install (disk . "/dev/vda") (wipe . #f))
         (features (kubePrism (enabled . #t) (port . 7445)))
-        (kubelet (extraArgs (rotate-server-certificates . "true"))))
+        (kubelet (extraArgs (rotate-server-certificates . "true"))
+                 ;; A CSI driver (cinder-csi) stages a volume under
+                 ;; /var/lib/kubelet then bind-mounts it into the pod; that
+                 ;; bidirectional propagation needs the kubelet's own mount to
+                 ;; be rshared, which on Talos means declaring it explicitly.
+                 ;; (Harmless without a CSI driver; required once cinder-csi is
+                 ;; in. Rolled to live nodes by `hexol config-apply`.)
+                 (extraMounts ((destination . "/var/lib/kubelet")
+                               (type . "bind") (source . "/var/lib/kubelet")
+                               (options "bind" "rshared" "rw")))))
       (cluster
         (allowSchedulingOnControlPlanes . #t)
         (network (cni (name . "none")))      ; Cilium is the CNI
@@ -274,7 +283,15 @@
           (key_pair    (ref openstack_compute_keypair_v2 deployer name))
           (user_data   (tf-ref "data.talos_machine_configuration" data-name "machine_configuration"))
           (block network
-            (port (tf-ref "openstack_networking_port_v2" port "id"))))
+            (port (tf-ref "openstack_networking_port_v2" port "id")))
+          ;; `user_data' SEEDS first boot only. A later patch edit changes it,
+          ;; which OpenStack treats as ForceNew (it would replace the VM) — so
+          ;; ignore it here and let `hexol config-apply' roll config to the
+          ;; running node via the talos API instead. Day 1 = terraform; day 2 =
+          ;; the rolling, health-gated action. (Removing this pin and editing a
+          ;; patch would rebuild the node, the heavy-handed alternative.)
+          (block lifecycle
+            (ignore_changes (list "user_data"))))
         ;; a floating IP, associated to the node's port.
         (terraform-resource "openstack_networking_floatingip_v2" port
           (pool (cfg 'ext-net)))
@@ -814,7 +831,22 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ("output" "output               write kubeconfig + talosconfig from tofu state"
    (terraform-outputter #:workdir "deploy" #:binary "tofu"
                         #:outputs '(("kubeconfig"  . "deploy/kubeconfig")
-                                    ("talosconfig" . "deploy/talosconfig")))))
+                                    ("talosconfig" . "deploy/talosconfig"))))
+
+  ;; Day-2 config rollout: push the inventory's current machine config to the
+  ;; running nodes, ONE at a time, waiting for cluster health between each (so a
+  ;; reboot never breaks etcd quorum). Edit the talos-patch, `hexol apply --only
+  ;; terraform` to refresh state, then:
+  ;;   hexol config-apply --dry-run -i examples/homelab.scm   # show the diff
+  ;;   hexol config-apply           -i examples/homelab.scm   # roll it live
+  ("config-apply" "config-apply [--dry-run]   roll machine config to nodes (talosctl, health-gated)"
+   (talos-config-applier
+     #:workdir "deploy" #:binary "talosctl" #:tofu "tofu"
+     #:talosconfig "deploy/talosconfig"
+     #:nodes (map (lambda (n)
+                    (let ((i (car n)))
+                      (list (str "cp-" i) (str "cp_" i "_address") (str "cp_" i "_config"))))
+                  (nodes)))))
 
 ;; ---------------------------------------------------------------------------
 ;; the homelab
@@ -955,6 +987,21 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (terraform-output "talosconfig"
     (value (tf-ref "data.talos_client_configuration" "this" "talos_config"))
     (sensitive #t))
+
+  ;; Per-node endpoint + rendered machine config, so the `config-apply' action
+  ;; can pull each node's exact config out of state and roll it (the config is
+  ;; the provider's to render — secrets + PKI + our patch — not hexol's). One
+  ;; (address, config) pair per node: cp_<i>_address / cp_<i>_config.
+  (append-map
+    (lambda (n)
+      (let ((i (car n)))
+        (list
+          (terraform-output (str "cp_" i "_address")
+            (value (tf-ref "openstack_networking_floatingip_v2" (str "cp-" i) "address")))
+          (terraform-output (str "cp_" i "_config")
+            (value (tf-ref "data.talos_machine_configuration" (str "controlplane-" i) "machine_configuration"))
+            (sensitive #t)))))
+    (nodes))
 
   ;; ====================================================================
   ;; CLUSTER  — render with `-o yaml`

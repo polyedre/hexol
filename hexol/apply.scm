@@ -59,12 +59,13 @@
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 format)
+  #:use-module (srfi srfi-1)
   ;; `report'/`check' predicates read the resolved state directly; re-export the
   ;; accessor so an inventory's own report lambdas (e.g. derive URLs from the
   ;; rendered resources) can reach into it without importing (hexol kernel).
   #:re-export (state-get)
   #:export (terraform-applier kubectl-applier terraform-destroyer
-            terraform-outputter
+            terraform-outputter talos-config-applier
             appliers actions wait-for check report cmd sh-ok?))
 
 ;; ---------- shell helpers ----------
@@ -272,6 +273,79 @@ it with `defines-action'/`actions' to make it its own `hexol' verb."
             (write-file (cdr pair) val)
             (log ";; output: ~a -> ~a~%" (car pair) (cdr pair))))
         outputs))))
+
+;; ---------- talos day-2 lifecycle (CLI actions, not pipeline steps) ----------
+;;
+;; Provisioning is terraform's job (day 1).  Changing a *running* cluster is
+;; not something terraform expresses safely: a control-plane machine-config
+;; edit that reboots a node must roll ONE node at a time, waiting for the
+;; cluster to come back healthy before touching the next, or etcd loses quorum
+;; — a gate that is awkward in HCL but natural here.  So day-2 lifecycle lives
+;; as hexol *actions* (talosctl-backed verbs), parallel to `terraform-destroyer'.
+;;
+;; The config is NOT re-derived here — hexol only holds the patch, while the
+;; full machine config (secrets, PKI) is rendered by the talos provider.  So
+;; the rolling action reads each node's config straight out of terraform state
+;; via `tofu output' (expose it as a per-node `terraform-output'); the inventory
+;; stays the one source of truth, and `apply-config' pushes exactly what a fresh
+;; boot would.  (Pin `user_data' with a lifecycle ignore so a config edit does
+;; not force-replace the instance — first boot seeds it, this rolls it after.)
+
+;; Capture `BINARY -chdir=WORKDIR output -raw NAME' (a single terraform output).
+(define (tf-output-raw binary workdir name)
+  (capture binary (string-append "-chdir=" workdir) "output" "-raw" name))
+
+(define* (talos-config-applier #:key (workdir "deploy") (binary "talosctl")
+                               (tofu "tofu") (talosconfig "deploy/talosconfig")
+                               (mode "auto") (health-timeout "10m") (nodes '()))
+  "Return an *action* (a (state args -> effects) CLI verb) that rolls the
+rendered machine config onto each node in NODES one at a time, health-gating
+between them.  NODES is a list of (LABEL ADDRESS-OUTPUT CONFIG-OUTPUT): LABEL
+names the node; ADDRESS-OUTPUT and CONFIG-OUTPUT are the terraform output names
+holding its endpoint (floating IP) and its `data.talos_machine_configuration'
+machine_configuration.  Per node the config is fetched from terraform state,
+written to a temp file, and applied with `talosctl apply-config --mode MODE';
+then `talosctl health' must pass — queried from a DIFFERENT node, so the probe
+is not aimed at a rebooting apid — before the next.  TALOSCONFIG (client certs)
+is refreshed from state first.  With `--dry-run' in ARGS each node gets
+`apply-config --dry-run' (prints the diff, changes nothing, no reboot, no gate).
+Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
+  (lambda (state args)
+    (let* ((tc-bin (find-binary binary))
+           (tf-bin (find-binary tofu))
+           (dry?   (and (member "--dry-run" args) #t))
+           ;; one tofu round-trip per value; addresses up front (for the
+           ;; "observe from another node" health gate), configs lazily per node.
+           (addrs  (map (lambda (n) (tf-output-raw tf-bin workdir (cadr n))) nodes)))
+      ;; refresh the client config so apply/health use current certs
+      (write-file talosconfig (tf-output-raw tf-bin workdir "talosconfig"))
+      (log ";; talos: wrote ~a~%" talosconfig)
+      (let loop ((ns nodes) (i 0))
+        (unless (null? ns)
+          (let* ((n     (car ns))
+                 (label (car n))
+                 (ep    (list-ref addrs i))
+                 ;; a stable observer: the first node that isn't this one (so a
+                 ;; reboot of EP does not blind the health probe). Falls back to
+                 ;; EP itself for a single-node cluster.
+                 (obs   (or (find (lambda (a) (not (equal? a ep))) addrs) ep))
+                 (cfg   (tf-output-raw tf-bin workdir (caddr n)))
+                 (file  (string-append "/tmp/hexol-talos-" label ".yaml")))
+            (write-file file cfg)
+            (cond
+              (dry?
+               (log ";; talos[dry]: ~a — apply-config --dry-run via ~a~%" label ep)
+               (run* tc-bin "--talosconfig" talosconfig "-n" ep "-e" ep
+                     "apply-config" "--dry-run" "--file" file))
+              (else
+               (log ";; talos: applying config to ~a (~a), mode ~a~%" label ep mode)
+               (run* tc-bin "--talosconfig" talosconfig "-n" ep "-e" ep
+                     "apply-config" "--mode" mode "--file" file)
+               (log ";; talos: waiting for cluster health via ~a (timeout ~a)…~%" obs health-timeout)
+               (run* tc-bin "--talosconfig" talosconfig "-e" obs "-n" obs
+                     "health" "--wait-timeout" health-timeout)
+               (log ";; talos: ~a healthy~%" label)))
+            (loop (cdr ns) (+ i 1))))))))
 
 ;; ---------- kubectl applier ----------
 
