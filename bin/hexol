@@ -1153,15 +1153,15 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
                   (let ((state (resolve ops query)))
                     ((caddr a) state arest)))))))))))
 
-(define (show-help)
+(define (show-help inv)
   (display "hexol — resolve a hexol inventory and view it.\n\nusage:\n")
   (for-each (lambda (a) (format #t "  hexol ~a~%" (action-synopsis a))) *actions*)
-  ;; Inventory-contributed verbs, when an inventory is resolvable (via
-  ;; $HEXOL_INVENTORY here, since --help carries no -i). Listed under their own
+  ;; Inventory-contributed verbs, when an inventory is resolvable (from this
+  ;; invocation's -i/--inventory, else $HEXOL_INVENTORY). Listed under their own
   ;; heading so they read as belonging to this inventory, not to hexol itself.
-  (let ((custom (inventory-actions (env-inventory))))
+  (let ((custom (inventory-actions inv)))
     (unless (null? custom)
-      (format #t "~%inventory actions (~a):~%" (env-inventory))
+      (format #t "~%inventory actions (~a):~%" inv)
       (for-each (lambda (a)
                   (format #t "  hexol ~a~%" (or (cadr a) (car a))))
                 custom)))
@@ -1205,6 +1205,15 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
       ((arg . rest)
        (if (string-prefix? "--inventory=" arg) (substring arg 12) (loop rest))))))
 
+;; Is this invocation a help request? `-h`/`--help` anywhere (it commonly
+;; trails an `-i FILE`, e.g. `hexol --help -i homelab.scm`), or a leading
+;; `help` verb. Kept loose on purpose: help should win over dispatch so a
+;; user can always see an inventory's actions, even alongside other flags.
+(define (wants-help? args)
+  (match args
+    (("help" . _) #t)
+    (_ (or (member "-h" args) (member "--help" args) #f))))
+
 (define (dispatch args)
   (call-with-values (lambda () (extract-color (cdr args)))
    (lambda (mode rest)
@@ -1217,8 +1226,12 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
       (parameterize ((current-render-cache
                       (and inv (file-exists? inv) (open-render-cache inv))))
         (match rest
-          (() (show-help) (exit 0))
-          (((or "-h" "--help" "help")) (show-help) (exit 0))
+          (() (show-help inv) (exit 0))
+          ;; A help request — `-h`/`--help` anywhere in the args, or a leading
+          ;; `help` — shows help for INV (so `hexol --help -i FILE` and
+          ;; `hexol -i FILE help` both list that inventory's actions, not just
+          ;; the $HEXOL_INVENTORY one).
+          ((? wants-help?) (show-help inv) (exit 0))
           ((subcmd . _)
            (let* ((act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
              (if act
