@@ -1100,41 +1100,42 @@ auto (default) paints only on a TTY and honors NO_COLOR; always forces it on
 (for `… | less -R` or a colored log); never forces it off. Bare --color =
 always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
 
-;; Best-effort list of the custom verbs an inventory registers, as kernel
-;; <action> records — for `--help` and the no-match fallback. Returns '() when
-;; no inventory is resolvable; any error loading it (a broken inventory
-;; shouldn't break `--help`) is swallowed to '() too.
-(define (inventory-actions inv)
-  (if (and inv (file-exists? inv))
-      (catch #t
-        (lambda () (call-with-values (lambda () (load-ops+collected current-actions inv))
-                     (lambda (ops actions) actions)))
-        (lambda _ '()))
-      '()))
+;; Adapt a kernel <action> — an inventory-contributed (state args -> effects)
+;; verb — into a dispatch <verb>, so built-ins and inventory verbs are the one
+;; type and run through the one `(verb-runner v) args` path. The predicate
+;; fires on the action's own name; the runner strips -i (already known) and -q
+;; (seeds the resolve) off the post-verb args, resolves OPS once, and calls the
+;; action proc with the remainder. OPS is the inventory's loaded ops, shared
+;; from `inventory-verbs` so the runner needn't reload.
+(define (action->verb ops a)
+  (make-verb
+    (action-name a)
+    (cmd-is (action-name a))
+    (lambda (args)
+      ;; ARGS leads with the verb itself; drop it so the action sees only its
+      ;; own flags/positionals, the way the cmd-* handlers receive `(cdr args)`.
+      (call-with-values (lambda () (extract-inventory (action-name a) (cdr args)))
+        (lambda (_inv rest)
+          (call-with-values (lambda () (extract-query rest))
+            (lambda (query arest)
+              (let ((state (resolve ops query)))
+                ((action-proc a) state arest)))))))
+    (or (action-synopsis a) (action-name a))))
 
-;; The no-built-in-match fallback: a custom verb the inventory contributes via
-;; `defines-action`. Resolve the inventory (from -i/$HEXOL_INVENTORY; without one
-;; there's nothing to dispatch to, so the original unknown-subcommand error
-;; stands), find the action named SUBCMD, strip -q to seed the resolve, and run
-;; it once against the resolved state with the remaining args. Built-ins always
-;; win — this only runs when none matched — so an inventory can never shadow a
-;; core verb.
-(define (run-inventory-action subcmd args)
-  ;; ARGS leads with the verb itself (as the dispatcher hands it on); drop it so
-  ;; the action sees only its own flags/positionals, the way the cmd-* handlers
-  ;; receive `(cdr args)`.
-  (call-with-values (lambda () (extract-inventory subcmd (cdr args)))
-    (lambda (inv rest)
-      (let ((inv (or inv (env-inventory))))
-        (unless inv (usage-error "unknown subcommand: ~a" subcmd))
-        (call-with-values (lambda () (load-ops+collected current-actions inv))
-          (lambda (ops actions)
-            (let ((a (find (lambda (a) (string=? (action-name a) subcmd)) actions)))
-              (unless a (usage-error "unknown subcommand: ~a" subcmd))
-              (call-with-values (lambda () (extract-query rest))
-                (lambda (query arest)
-                  (let ((state (resolve ops query)))
-                    ((action-proc a) state arest)))))))))))
+;; The verbs INV contributes via `defines-action`, each adapted into a dispatch
+;; <verb> (see action->verb) over the ops loaded here once. Errors propagate —
+;; a broken inventory on a real verb should fail loudly; the help path catches.
+(define (inventory-verbs inv)
+  (call-with-values (lambda () (load-ops+collected current-actions inv))
+    (lambda (ops actions)
+      (map (lambda (a) (action->verb ops a)) actions))))
+
+;; Like `inventory-verbs', but best-effort: '() when INV is unresolvable or
+;; fails to load, so a broken inventory never breaks `--help'.
+(define (inventory-verbs-safe inv)
+  (if (and inv (file-exists? inv))
+      (catch #t (lambda () (inventory-verbs inv)) (lambda _ '()))
+      '()))
 
 (define (show-help inv)
   (display "hexol — resolve a hexol inventory and view it.\n\nusage:\n")
@@ -1142,12 +1143,10 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
   ;; Inventory-contributed verbs, when an inventory is resolvable (from this
   ;; invocation's -i/--inventory, else $HEXOL_INVENTORY). Listed under their own
   ;; heading so they read as belonging to this inventory, not to hexol itself.
-  (let ((custom (inventory-actions inv)))
+  (let ((custom (inventory-verbs-safe inv)))
     (unless (null? custom)
       (format #t "~%inventory actions (~a):~%" inv)
-      (for-each (lambda (a)
-                  (format #t "  hexol ~a~%" (or (action-synopsis a) (action-name a))))
-                custom)))
+      (for-each (lambda (v) (format #t "  hexol ~a~%" (verb-synopsis v))) custom)))
   (newline)
   (display usage-footer)
   (newline))
@@ -1216,14 +1215,18 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
           ;; the $HEXOL_INVENTORY one).
           ((? wants-help?) (show-help inv) (exit 0))
           ((subcmd . _)
-           (let* ((act  (find (lambda (v) ((verb-predicate v) subcmd rest)) *verbs*)))
-             (if act
-                 ((verb-runner act) rest)
-                 ;; No built-in verb matched — fall through to a custom verb the
-                 ;; inventory may register (so an inventory can ADD verbs but never
-                 ;; shadow a built-in). With no resolvable inventory this re-raises
-                 ;; the unknown-subcommand usage error.
-                 (run-inventory-action subcmd rest))))))))))
+           ;; Built-ins first, then the verbs INV contributes — both are <verb>
+           ;; records run through the same `(verb-runner v) rest` path, so an
+           ;; inventory can ADD verbs but never shadow a built-in. With no
+           ;; resolvable inventory there is nothing to fall through to, so the
+           ;; unknown-subcommand usage error stands.
+           (let ((v (or (find (lambda (v) ((verb-predicate v) subcmd rest)) *verbs*)
+                        (and inv
+                             (find (lambda (v) ((verb-predicate v) subcmd rest))
+                                   (inventory-verbs inv))))))
+             (if v
+                 ((verb-runner v) rest)
+                 (usage-error "unknown subcommand: ~a" subcmd))))))))))
 
 ;; Turn a raised error into one clean stderr line instead of a Guile
 ;; backtrace — the common case being a typo or a mistake inside the
