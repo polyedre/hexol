@@ -30,6 +30,8 @@
             current-timings resolve-with-timings
             ;; loader (exposed so other modules can override path resolution)
             load-inventory-file
+            ;; registration collectors (the shape renderers/appliers/actions share)
+            make-collector collect! collect-from
             ;; optional per-file render adapters
             current-renderers renders-with
             ;; optional per-file apply adapters (effects)
@@ -524,6 +526,40 @@ children for introspection."
                    (length table))
            body))
 
+;; ---------- registration collectors ----------
+;;
+;; The three optional per-file registries below — renderers, appliers, and
+;; actions — share ONE shape, named here once so each is an instance rather
+;; than a reimplementation. A *collector* is a parameter that is either #f
+;; (inert — the default, so registration forms vanish wherever nothing is
+;; collecting) or bound to a one-element box (a mutable list) into which
+;; registrations accumulate in reverse. `collect!' pushes an entry onto the
+;; bound box (a harmless no-op when the parameter is #f); `collect-from' binds
+;; a fresh box around a thunk and returns two values — the thunk's result and
+;; the entries in registration order. `renders-with' / `applies-with' /
+;; `defines-action' are each just a `collect!' onto their own collector, and
+;; the CLI reads each back with one `collect-from'.
+
+(define (make-collector)
+  "Return a fresh collector: a parameter holding #f (inert) until bound to a
+box by `collect-from'.  Each per-file registry is one instance."
+  (make-parameter #f))
+
+(define (collect! collector entry)
+  "Push ENTRY onto COLLECTOR's bound box, or do nothing when COLLECTOR is #f
+(unbound).  Returns unspecified, so a registration form has no value."
+  (let ((box (collector)))
+    (when box (set-car! box (cons entry (car box)))))
+  *unspecified*)
+
+(define (collect-from collector thunk)
+  "Call THUNK with a fresh box bound to COLLECTOR, returning two values:
+THUNK's result and the list of entries `collect!'d during it, in registration
+order."
+  (let ((box (list '())))
+    (let ((result (parameterize ((collector box)) (thunk))))
+      (values result (reverse (car box))))))
+
 ;; ---------- optional per-file render adapters ----------
 ;;
 ;; The resolved state IS the output; the builtin formats (sexp / json /
@@ -536,15 +572,13 @@ children for introspection."
 ;; #f and `renders-with` is a harmless no-op — so the ops contract is
 ;; unchanged and `op:load` / introspection keep seeing a plain list of ops.
 
-(define current-renderers (make-parameter #f))
+(define current-renderers (make-collector))
 
 (define (renders-with name proc)
   "Register PROC, a (state -> writes text) renderer, under string NAME for
 the inventory file currently being loaded.  The CLI exposes it as `hexol
 render -o NAME`.  A no-op when no collector is bound."
-  (let ((box (current-renderers)))
-    (when box (set-car! box (cons (cons name proc) (car box)))))
-  *unspecified*)
+  (collect! current-renderers (cons name proc)))
 
 ;; ---------- optional per-file apply adapters (effects) ----------
 ;;
@@ -562,16 +596,14 @@ render -o NAME`.  A no-op when no collector is bound."
 ;; `apply`, so `applies-with` is a harmless no-op for render/tree/ops and the
 ;; ops contract is unchanged.
 
-(define current-appliers (make-parameter #f))
+(define current-appliers (make-collector))
 
 (define* (applies-with name proc #:optional (order #f))
   "Register PROC, a (state dry? -> performs effects) applier, under string
 NAME.  Appliers run in registration order under `hexol apply'; pass an
 explicit ORDER (a number) only to override that placement.  A no-op when no
 collector is bound."
-  (let ((box (current-appliers)))
-    (when box (set-car! box (cons (list name order proc) (car box)))))
-  *unspecified*)
+  (collect! current-appliers (list name order proc)))
 
 ;; ---------- optional per-file CLI verbs (actions) ----------
 ;;
@@ -591,15 +623,13 @@ collector is bound."
 ;; the parameter is #f outside the CLI's action-discovery load, so
 ;; `defines-action' is a harmless no-op for render/apply/tree/ops.
 
-(define current-actions (make-parameter #f))
+(define current-actions (make-collector))
 
 (define* (defines-action name proc #:optional (synopsis #f))
   "Register PROC, a (state args -> performs effects) action, as the CLI verb
 NAME, with optional one-line SYNOPSIS for `hexol --help'.  Built-in verbs take
 precedence over inventory actions.  A no-op when no collector is bound."
-  (let ((box (current-actions)))
-    (when box (set-car! box (cons (list name synopsis proc) (car box)))))
-  *unspecified*)
+  (collect! current-actions (list name synopsis proc)))
 
 ;; ---------- loader ----------
 

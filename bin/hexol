@@ -206,40 +206,15 @@
   (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
   (load-inventory-file inv))
 
-;; Like `load-ops`, but also collect any (name . renderer) the file
-;; registered via `renders-with` — the optional domain-text adapters
-;; (SQL DDL, ledger-cli text) that `render -o NAME` invokes. tree / ops /
-;; explain don't need these and use plain `load-ops`.
-(define (load-ops+renderers inv)
+;; Like `load-ops`, but also collect whatever the file registered onto
+;; COLLECTOR — one of the kernel's registration collectors (current-renderers
+;; / current-appliers / current-actions). Returns (values ops entries) with
+;; entries in registration order. The three registries share this one loader;
+;; tree / explain / show don't collect and use plain `load-ops`.
+(define (load-ops+collected collector inv)
   (unless inv (usage-error "missing INVENTORY file"))
   (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
-  (let ((box (list '())))
-    (let ((ops (parameterize ((current-renderers box))
-                 (load-inventory-file inv))))
-      (values ops (reverse (car box))))))
-
-;; Like `load-ops`, but also collect any (name order proc) the file
-;; registered via `applies-with` — the effect adapters `apply` runs. Mirrors
-;; `load-ops+renderers`; only `apply` needs these.
-(define (load-ops+appliers inv)
-  (unless inv (usage-error "missing INVENTORY file"))
-  (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
-  (let ((box (list '())))
-    (let ((ops (parameterize ((current-appliers box))
-                 (load-inventory-file inv))))
-      (values ops (reverse (car box))))))
-
-;; Like `load-ops`, but also collect any (name synopsis proc) the file
-;; registered via `defines-action` — the custom CLI verbs an inventory
-;; contributes. Mirrors `load-ops+appliers`; only the action fallback in
-;; `dispatch` (and `--help`'s listing) needs these.
-(define (load-ops+actions inv)
-  (unless inv (usage-error "missing INVENTORY file"))
-  (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
-  (let ((box (list '())))
-    (let ((ops (parameterize ((current-actions box))
-                 (load-inventory-file inv))))
-      (values ops (reverse (car box))))))
+  (collect-from collector (lambda () (load-inventory-file inv))))
 
 (define (usage-error fmt . args)
   (format (current-error-port) "~a~%" (e-red (apply format #f fmt args)))
@@ -322,7 +297,7 @@
   (string-join (append builtin-formats (map car renderers)) " | "))
 
 (define (do-render inv fmt path query)
-  (call-with-values (lambda () (load-ops+renderers inv))
+  (call-with-values (lambda () (load-ops+collected current-renderers inv))
     (lambda (ops renderers)
       (let ((state (resolve ops query))
             (custom (and (not path) (assoc fmt renderers))))
@@ -380,7 +355,7 @@
              (else (usage-error "apply: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
 (define (do-apply inv only dry? query)
-  (call-with-values (lambda () (load-ops+appliers inv))
+  (call-with-values (lambda () (load-ops+collected current-appliers inv))
     (lambda (ops appliers)
       (when (null? appliers)
         (die "apply: ~a registers no appliers (use applies-with in the inventory)" inv))
@@ -1124,7 +1099,7 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
 (define (inventory-actions inv)
   (if (and inv (file-exists? inv))
       (catch #t
-        (lambda () (call-with-values (lambda () (load-ops+actions inv))
+        (lambda () (call-with-values (lambda () (load-ops+collected current-actions inv))
                      (lambda (ops actions) actions)))
         (lambda _ '()))
       '()))
@@ -1144,7 +1119,7 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
     (lambda (inv rest)
       (let ((inv (or inv (env-inventory))))
         (unless inv (usage-error "unknown subcommand: ~a" subcmd))
-        (call-with-values (lambda () (load-ops+actions inv))
+        (call-with-values (lambda () (load-ops+collected current-actions inv))
           (lambda (ops actions)
             (let ((a (assoc subcmd actions)))
               (unless a (usage-error "unknown subcommand: ~a" subcmd))
