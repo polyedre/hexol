@@ -367,25 +367,19 @@
                       (die "apply: no applier named ~s (have: ~a)"
                            name (string-join (map applier-name appliers) ", "))))
                   only))
-      ;; Default order is registration order: pair each applier with its
-      ;; position, and let an explicit `applies-with` order (when given)
-      ;; override that key. A stable sort then preserves registration order
-      ;; among appliers that share (or omit) an order.
-      (let* ((indexed (map (lambda (a i) (cons (or (applier-order a) i) a))
-                           appliers (iota (length appliers))))
-             (chosen  (if only
-                          (filter (lambda (p) (member (applier-name (cdr p)) only)) indexed)
-                          indexed))
-             (sorted  (stable-sort chosen (lambda (x y) (< (car x) (car y)))))
-             (state   (resolve ops query)))   ; resolve ONCE; all appliers share it
+      ;; Registration order IS the run order; --only keeps just the named ones,
+      ;; preserving that order.
+      (let ((chosen (if only
+                        (filter (lambda (a) (member (applier-name a) only)) appliers)
+                        appliers))
+            (state  (resolve ops query)))   ; resolve ONCE; all appliers share it
         (for-each
-          (lambda (p)
-            (let ((a (cdr p)))
-              (format (current-error-port) ";; apply: ~a~a~%"
-                      (applier-name a) (if dry? " (dry-run)" ""))
-              (force-output (current-error-port))
-              ((applier-proc a) state dry?)))
-          sorted)))))
+          (lambda (a)
+            (format (current-error-port) ";; apply: ~a~a~%"
+                    (applier-name a) (if dry? " (dry-run)" ""))
+            (force-output (current-error-port))
+            ((applier-proc a) state dry?))
+          chosen)))))
 
 ;; ---------------------------------------------------------------------------
 ;; tree — concise op-tree view (walks captured source recursively)

@@ -37,7 +37,7 @@
             make-renderer renderer? renderer-name renderer-proc
             ;; optional per-file apply adapters (effects)
             current-appliers applies-with
-            make-applier applier? applier-name applier-order applier-proc
+            make-applier applier? applier-name applier-proc
             ;; optional per-file CLI verbs (actions)
             current-actions defines-action
             make-action action? action-name action-synopsis action-proc))
@@ -567,8 +567,8 @@ order."
 ;; for the same reason an op is a record and not a bare closure — the shape
 ;; stops being load-bearing-by-position and the consumer reads named fields.
 ;; A renderer carries a (state -> text) proc; an applier a (state dry? ->
-;; effects) proc plus an optional explicit ORDER (#f = registration order); an
-;; action a (state args -> effects) proc plus a one-line SYNOPSIS for --help.
+;; effects) proc (run in registration order); an action a (state args ->
+;; effects) proc plus a one-line SYNOPSIS for --help.
 (define-record-type <renderer>
   (make-renderer name proc)
   renderer?
@@ -576,11 +576,10 @@ order."
   (proc renderer-proc))
 
 (define-record-type <applier>
-  (make-applier name order proc)
+  (make-applier name proc)
   applier?
-  (name  applier-name)
-  (order applier-order)
-  (proc  applier-proc))
+  (name applier-name)
+  (proc applier-proc))
 
 (define-record-type <action>
   (make-action name synopsis proc)
@@ -627,12 +626,11 @@ render -o NAME`.  A no-op when no collector is bound."
 
 (define current-appliers (make-collector))
 
-(define* (applies-with name proc #:optional (order #f))
+(define (applies-with name proc)
   "Register PROC, a (state dry? -> performs effects) applier, under string
-NAME.  Appliers run in registration order under `hexol apply'; pass an
-explicit ORDER (a number) only to override that placement.  A no-op when no
-collector is bound."
-  (collect! current-appliers (make-applier name order proc)))
+NAME.  Appliers run under `hexol apply' in the order registered.  A no-op when
+no collector is bound."
+  (collect! current-appliers (make-applier name proc)))
 
 ;; ---------- optional per-file CLI verbs (actions) ----------
 ;;
