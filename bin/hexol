@@ -294,18 +294,19 @@
 (define builtin-formats '("sexp" "json" "yaml" "terraform" "ansible"))
 
 (define (format-list renderers)
-  (string-join (append builtin-formats (map car renderers)) " | "))
+  (string-join (append builtin-formats (map renderer-name renderers)) " | "))
 
 (define (do-render inv fmt path query)
   (call-with-values (lambda () (load-ops+collected current-renderers inv))
     (lambda (ops renderers)
       (let ((state (resolve ops query))
-            (custom (and (not path) (assoc fmt renderers))))
+            (custom (and (not path)
+                         (find (lambda (r) (string=? (renderer-name r) fmt)) renderers))))
         (cond
           ;; A file-registered renderer wins for its own name. `--path` is a
           ;; state-subtree selector that only makes sense for the generic
           ;; formats, so it suppresses the custom renderer.
-          (custom ((cdr custom) state))
+          (custom ((renderer-proc custom) state))
           (else
            (let ((target (render-target fmt state path)))
              (when (and path (not target))
@@ -362,27 +363,28 @@
       ;; Validate every requested name before doing anything irreversible.
       (when only
         (for-each (lambda (name)
-                    (unless (assoc name appliers)
+                    (unless (find (lambda (a) (string=? (applier-name a) name)) appliers)
                       (die "apply: no applier named ~s (have: ~a)"
-                           name (string-join (map car appliers) ", "))))
+                           name (string-join (map applier-name appliers) ", "))))
                   only))
-      ;; Default order is registration order: stamp each applier with its
+      ;; Default order is registration order: pair each applier with its
       ;; position, and let an explicit `applies-with` order (when given)
       ;; override that key. A stable sort then preserves registration order
       ;; among appliers that share (or omit) an order.
-      (let* ((ordered (map (lambda (a i) (list (car a) (or (cadr a) i) (caddr a)))
+      (let* ((indexed (map (lambda (a i) (cons (or (applier-order a) i) a))
                            appliers (iota (length appliers))))
              (chosen  (if only
-                          (filter (lambda (a) (member (car a) only)) ordered)
-                          ordered))
-             (sorted  (stable-sort chosen (lambda (a b) (< (cadr a) (cadr b)))))
+                          (filter (lambda (p) (member (applier-name (cdr p)) only)) indexed)
+                          indexed))
+             (sorted  (stable-sort chosen (lambda (x y) (< (car x) (car y)))))
              (state   (resolve ops query)))   ; resolve ONCE; all appliers share it
         (for-each
-          (lambda (a)
-            (format (current-error-port) ";; apply: ~a~a~%"
-                    (car a) (if dry? " (dry-run)" ""))
-            (force-output (current-error-port))
-            ((caddr a) state dry?))
+          (lambda (p)
+            (let ((a (cdr p)))
+              (format (current-error-port) ";; apply: ~a~a~%"
+                      (applier-name a) (if dry? " (dry-run)" ""))
+              (force-output (current-error-port))
+              ((applier-proc a) state dry?)))
           sorted)))))
 
 ;; ---------------------------------------------------------------------------
@@ -917,44 +919,50 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
                   (secret-error "secret: unknown verb ~a" v))))))))))
 
 ;; ---------------------------------------------------------------------------
-;; actions — the verb registry
+;; verbs — the dispatch registry
 ;; ---------------------------------------------------------------------------
 ;;
-;; A subcommand is no longer a hardcoded arm of `dispatch`. It is an <action>:
+;; A subcommand is no longer a hardcoded arm of `dispatch`. It is a <verb>:
 ;; a NAME, a PREDICATE over the invocation — (subcommand full-args) -> bool —
 ;; and a RUNNER that receives the full post-program args (the verb included)
-;; and does the work. `dispatch` walks *actions* and runs the first whose
-;; predicate fires, so a new verb is one `register-action!` away with nothing
+;; and does the work. `dispatch` walks *verbs* and runs the first whose
+;; predicate fires, so a new verb is one `register-verb!` away with nothing
 ;; in the dispatcher to touch.
 ;;
-;; The predicate sees the full args, not just the verb, so a future action can
+;; The predicate sees the full args, not just the verb, so a future verb can
 ;; fire on a flag or an inventory shape rather than an exact name; the runner
 ;; likewise gets every argument and slices off what it needs. The built-in
 ;; verbs all just match their own name (`cmd-is`) and delegate to the existing
 ;; cmd-* handler. `help` deliberately stays OUT of this set — it lists the
-;; verbs by reading them back off *actions* and must work before any inventory
+;; verbs by reading them back off *verbs* and must work before any inventory
 ;; loads, so it lives in the dispatch frame instead.
 ;;
-;; *actions* holds the BUILT-IN verbs (fixed at load). An inventory can ALSO
+;; *verbs* holds the BUILT-IN verbs (fixed at load). An inventory can ALSO
 ;; contribute verbs: `defines-action NAME PROC` (sugar: `actions`) registers a
-;; (state args -> effects) procedure, and when `dispatch` finds no built-in
-;; match it loads the inventory collecting these and runs the one named SUBCMD
-;; (see `run-inventory-action`). Built-ins are tried first, so an inventory can
-;; only ADD verbs, never shadow a core one. This is how an inventory ships its
-;; own teardown/diff/bootstrap verb — e.g. examples/homelab.scm's `destroy`.
+;; (state args -> effects) procedure as a kernel <action>, and when `dispatch`
+;; finds no built-in match it loads the inventory collecting these and runs the
+;; one named SUBCMD (see `run-inventory-action`). Built-ins are tried first, so
+;; an inventory can only ADD verbs, never shadow a core one. This is how an
+;; inventory ships its own teardown/diff/bootstrap verb — e.g.
+;; examples/homelab.scm's `destroy`.
 
-(define-record-type <action>
-  (make-action name predicate runner synopsis)
-  action?
-  (name      action-name)
-  (predicate action-predicate)   ; (subcommand full-args) -> bool
-  (runner    action-runner)      ; (full-args) -> effects  (full-args includes the verb)
-  (synopsis  action-synopsis))   ; one-line usage shown in `hexol --help`
+;; A dispatchable CLI verb: a NAME, a PREDICATE over the invocation, a RUNNER
+;; that does the work, and a one-line SYNOPSIS for `--help'. The built-ins are
+;; <verb> records directly; an inventory-contributed action (a kernel <action>)
+;; is adapted into one of these (see `inventory-verbs'), so dispatch and help
+;; iterate a single record type rather than forking over two shapes.
+(define-record-type <verb>
+  (make-verb name predicate runner synopsis)
+  verb?
+  (name      verb-name)
+  (predicate verb-predicate)   ; (subcommand full-args) -> bool
+  (runner    verb-runner)      ; (full-args) -> effects  (full-args includes the verb)
+  (synopsis  verb-synopsis))   ; one-line usage shown in `hexol --help`
 
-(define *actions* '())
+(define *verbs* '())
 
-(define (register-action! a)
-  (set! *actions* (append *actions* (list a))))
+(define (register-verb! v)
+  (set! *verbs* (append *verbs* (list v))))
 
 ;; The common predicate: fire when the leading subcommand is exactly NAME.
 (define (cmd-is name)
@@ -964,27 +972,27 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 ;; full list, so drop the head.
 (define (delegating-runner cmd) (lambda (args) (cmd (cdr args))))
 
-(register-action!
- (make-action "render" (cmd-is "render") (delegating-runner cmd-render)
+(register-verb!
+ (make-verb "render" (cmd-is "render") (delegating-runner cmd-render)
    "render [-o sexp|json|yaml|terraform|ansible] [-q K=V,…] [--path a.b.c] [-i INVENTORY]"))
-(register-action!
- (make-action "apply" (cmd-is "apply") (delegating-runner cmd-apply)
+(register-verb!
+ (make-verb "apply" (cmd-is "apply") (delegating-runner cmd-apply)
    "apply  [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] [-i INVENTORY]"))
-(register-action!
- (make-action "tree" (cmd-is "tree") (delegating-runner cmd-tree)
+(register-verb!
+ (make-verb "tree" (cmd-is "tree") (delegating-runner cmd-tree)
    "tree    [-v] [-i INVENTORY]"))
-(register-action!
- (make-action "explain" (cmd-is "explain") (delegating-runner cmd-explain)
+(register-verb!
+ (make-verb "explain" (cmd-is "explain") (delegating-runner cmd-explain)
    "explain [-q K=V,…] PATH|HASH [-i INVENTORY]"))
-(register-action!
- (make-action "show" (cmd-is "show") (delegating-runner cmd-show)
+(register-verb!
+ (make-verb "show" (cmd-is "show") (delegating-runner cmd-show)
    "show    HASH [-i INVENTORY]"))
-(register-action!
- (make-action "secret" (cmd-is "secret") (delegating-runner cmd-secret)
+(register-verb!
+ (make-verb "secret" (cmd-is "secret") (delegating-runner cmd-secret)
    "secret  <ls|get|set|edit|rm|rekey|init> … [-i INVENTORY]"))
 
 ;; A "|"-joined verb list for terse usage lines.
-(define (verb-list) (string-join (map action-name *actions*) "|"))
+(define (verb-list) (string-join (map verb-name *verbs*) "|"))
 
 ;; ---------------------------------------------------------------------------
 ;; dispatch — the frame: help, then run the first matching action
@@ -1092,10 +1100,10 @@ auto (default) paints only on a TTY and honors NO_COLOR; always forces it on
 (for `… | less -R` or a colored log); never forces it off. Bare --color =
 always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
 
-;; Best-effort list of the custom verbs an inventory registers, as
-;; (name synopsis proc) triples — for `--help` and the no-match fallback.
-;; Returns '() when no inventory is resolvable; any error loading it (a broken
-;; inventory shouldn't break `--help`) is swallowed to '() too.
+;; Best-effort list of the custom verbs an inventory registers, as kernel
+;; <action> records — for `--help` and the no-match fallback. Returns '() when
+;; no inventory is resolvable; any error loading it (a broken inventory
+;; shouldn't break `--help`) is swallowed to '() too.
 (define (inventory-actions inv)
   (if (and inv (file-exists? inv))
       (catch #t
@@ -1121,16 +1129,16 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
         (unless inv (usage-error "unknown subcommand: ~a" subcmd))
         (call-with-values (lambda () (load-ops+collected current-actions inv))
           (lambda (ops actions)
-            (let ((a (assoc subcmd actions)))
+            (let ((a (find (lambda (a) (string=? (action-name a) subcmd)) actions)))
               (unless a (usage-error "unknown subcommand: ~a" subcmd))
               (call-with-values (lambda () (extract-query rest))
                 (lambda (query arest)
                   (let ((state (resolve ops query)))
-                    ((caddr a) state arest)))))))))))
+                    ((action-proc a) state arest)))))))))))
 
 (define (show-help inv)
   (display "hexol — resolve a hexol inventory and view it.\n\nusage:\n")
-  (for-each (lambda (a) (format #t "  hexol ~a~%" (action-synopsis a))) *actions*)
+  (for-each (lambda (v) (format #t "  hexol ~a~%" (verb-synopsis v))) *verbs*)
   ;; Inventory-contributed verbs, when an inventory is resolvable (from this
   ;; invocation's -i/--inventory, else $HEXOL_INVENTORY). Listed under their own
   ;; heading so they read as belonging to this inventory, not to hexol itself.
@@ -1138,7 +1146,7 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
     (unless (null? custom)
       (format #t "~%inventory actions (~a):~%" inv)
       (for-each (lambda (a)
-                  (format #t "  hexol ~a~%" (or (cadr a) (car a))))
+                  (format #t "  hexol ~a~%" (or (action-synopsis a) (action-name a))))
                 custom)))
   (newline)
   (display usage-footer)
@@ -1208,9 +1216,9 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
           ;; the $HEXOL_INVENTORY one).
           ((? wants-help?) (show-help inv) (exit 0))
           ((subcmd . _)
-           (let* ((act  (find (lambda (a) ((action-predicate a) subcmd rest)) *actions*)))
+           (let* ((act  (find (lambda (v) ((verb-predicate v) subcmd rest)) *verbs*)))
              (if act
-                 ((action-runner act) rest)
+                 ((verb-runner act) rest)
                  ;; No built-in verb matched — fall through to a custom verb the
                  ;; inventory may register (so an inventory can ADD verbs but never
                  ;; shadow a built-in). With no resolvable inventory this re-raises

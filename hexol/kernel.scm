@@ -34,10 +34,13 @@
             make-collector collect! collect-from
             ;; optional per-file render adapters
             current-renderers renders-with
+            make-renderer renderer? renderer-name renderer-proc
             ;; optional per-file apply adapters (effects)
             current-appliers applies-with
+            make-applier applier? applier-name applier-order applier-proc
             ;; optional per-file CLI verbs (actions)
-            current-actions defines-action))
+            current-actions defines-action
+            make-action action? action-name action-synopsis action-proc))
 
 ;; ---------- op record ----------
 
@@ -560,6 +563,32 @@ order."
     (let ((result (parameterize ((collector box)) (thunk))))
       (values result (reverse (car box))))))
 
+;; What each `collect!' stores: a named record rather than a positional tuple,
+;; for the same reason an op is a record and not a bare closure — the shape
+;; stops being load-bearing-by-position and the consumer reads named fields.
+;; A renderer carries a (state -> text) proc; an applier a (state dry? ->
+;; effects) proc plus an optional explicit ORDER (#f = registration order); an
+;; action a (state args -> effects) proc plus a one-line SYNOPSIS for --help.
+(define-record-type <renderer>
+  (make-renderer name proc)
+  renderer?
+  (name renderer-name)
+  (proc renderer-proc))
+
+(define-record-type <applier>
+  (make-applier name order proc)
+  applier?
+  (name  applier-name)
+  (order applier-order)
+  (proc  applier-proc))
+
+(define-record-type <action>
+  (make-action name synopsis proc)
+  action?
+  (name     action-name)
+  (synopsis action-synopsis)
+  (proc     action-proc))
+
 ;; ---------- optional per-file render adapters ----------
 ;;
 ;; The resolved state IS the output; the builtin formats (sexp / json /
@@ -578,7 +607,7 @@ order."
   "Register PROC, a (state -> writes text) renderer, under string NAME for
 the inventory file currently being loaded.  The CLI exposes it as `hexol
 render -o NAME`.  A no-op when no collector is bound."
-  (collect! current-renderers (cons name proc)))
+  (collect! current-renderers (make-renderer name proc)))
 
 ;; ---------- optional per-file apply adapters (effects) ----------
 ;;
@@ -603,7 +632,7 @@ render -o NAME`.  A no-op when no collector is bound."
 NAME.  Appliers run in registration order under `hexol apply'; pass an
 explicit ORDER (a number) only to override that placement.  A no-op when no
 collector is bound."
-  (collect! current-appliers (list name order proc)))
+  (collect! current-appliers (make-applier name order proc)))
 
 ;; ---------- optional per-file CLI verbs (actions) ----------
 ;;
@@ -629,7 +658,7 @@ collector is bound."
   "Register PROC, a (state args -> performs effects) action, as the CLI verb
 NAME, with optional one-line SYNOPSIS for `hexol --help'.  Built-in verbs take
 precedence over inventory actions.  A no-op when no collector is bound."
-  (collect! current-actions (list name synopsis proc)))
+  (collect! current-actions (make-action name synopsis proc)))
 
 ;; ---------- loader ----------
 
