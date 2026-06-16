@@ -1,13 +1,11 @@
 ;;; cmdb/libraries/v2.scm — version 2.
 ;;;
-;;; Same shape as v1, but the `region` op patches EU regions' NTP pool
-;;; from the legacy "europe.pool.ntp.org" (which v1 writes via the
-;;; shared region-body) to "paris.pool.ntp.org".
+;;; Like v1, but `region` patches EU NTP pool from "europe.pool.ntp.org"
+;;; (v1's shared region-body value) to "paris.pool.ntp.org".
 ;;;
-;;; This demonstrates a library bump as an in-log event: facts written
-;;; before `(bump-lib "v2")` keep their v1-rendered NTP pool; facts
-;;; written after get the v2 one. Replay is contemporaneous — each fact
-;;; applies through whichever library was current when it landed.
+;;; Demonstrates a library bump as an in-log event: facts before
+;;; `(bump-lib "v2")` keep the v1 pool, facts after get v2. Replay is
+;;; contemporaneous — each fact applies through the then-current library.
 
 (define-module (cmdb libraries v2)
   #:use-module (hexol kernel)

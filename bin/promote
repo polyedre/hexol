@@ -6,15 +6,13 @@
 ;;;   ./bin/promote app=<name> tag=<tag> waves=<wave1:wave2:...> \
 ;;;                 [url=http://127.0.0.1:8080] [gate=<shell-cmd>]
 ;;;
-;;; A wave is a comma-separated list of region symbols, e.g.
+;;; A wave is comma-separated region symbols, e.g.
 ;;;   waves=alpha5:golf1,bravo1:charlie6,hotel3
 ;;;
-;;; For each wave the script:
-;;;   1. POSTs (promote-image <app> "<tag>" <region>) for each region.
-;;;   2. Reads back /state/regions.<region>.apps.<app>.image.tag to verify.
-;;;   3. Runs <gate> as a shell command if provided. Non-zero exit aborts.
+;;; Per wave: POST a promote fact per region, read back to verify, then
+;;; run <gate> (if given) — non-zero exit aborts.
 ;;;
-;;; Exit code: 0 on success, 1 if a gate fails, 2 on transport/HTTP errors.
+;;; Exit: 0 ok, 1 gate failed, 2 transport/HTTP error.
 
 (add-to-load-path (dirname (dirname (current-filename))))
 
@@ -91,8 +89,8 @@
         (exit 1)))
     (format #t "  gate: ok~%")))
 
-;; A promotion is a `(promote <region> <path> <value>)` fact. <path> is
-;; rooted under the region (e.g. (apps ingress-nginx chart version)).
+;; A promotion is a `(promote <region> <path> <value>)` fact; <path> is
+;; region-rooted (e.g. (apps ingress-nginx chart version)).
 (define (kind->path-tail kind)
   (cond ((string=? kind "image") '(image tag))
         ((string=? kind "chart") '(chart version))

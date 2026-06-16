@@ -1,22 +1,20 @@
 ;;; hexol/ansible.scm — the ansible target library.
 ;;;
-;;; An in-memory inventory + role-rendering vocabulary, the same way
-;;; (hexol k8s) is a vocabulary for Kubernetes resources. Opt in with
-;;; `(use-modules (hexol ansible))` and consume it from a role example
+;;; In-memory inventory + role-rendering vocabulary (cf. (hexol k8s) for K8s).
+;;; Opt in with `(use-modules (hexol ansible))`, consume from a role example
 ;;; (examples/ansible.scm).
 ;;;
-;;; This library is vocabulary only. It loads inventory.yml into a state
-;;; alist, gives role authors helpers to read it (host-attr, group-hosts,
-;;; …) and sugar to build tasks (task, handler, as), and one sink op —
-;;; `play` — that appends an assembled play into the `(ansible_plays)`
-;;; accumulator, the Ansible-side analogue of `(kubernetes_resources)`.
+;;; Vocabulary only: loads inventory.yml into a state alist, gives role
+;;; authors read helpers (host-attr, group-hosts, …), task sugar (task,
+;;; handler, as), and one sink op — `play` — appending an assembled play into
+;;; the `(ansible_plays)` accumulator (Ansible analogue of
+;;; `(kubernetes_resources)`).
 ;;;
-;;; What is deliberately NOT here: fanning a role over a group (one play
-;;; per host) is an *example's* organizing structure, built from the
-;;; kernel's ordinary compose-ops/map — see examples/ansible.scm.
-;;; And *rendering* is the CLI's job: `hexol render -o ansible` JSON-encodes
-;;; `(ansible_plays)` (an Ansible playbook is valid as JSON). No CMDB, no
-;;; HTTP — the state is just a nested alist built once from inventory.yml.
+;;; NOT here: fanning a role over a group (one play per host) is an
+;;; *example's* structure, built from kernel compose-ops/map — see
+;;; examples/ansible.scm. *Rendering* is the CLI's job: `hexol render -o
+;;; ansible` JSON-encodes `(ansible_plays)` (a playbook is valid JSON). No
+;;; CMDB, no HTTP — state is a nested alist built once from inventory.yml.
 ;;;
 ;;; State shape (mirrors what we'd put in the CMDB if we did):
 ;;;
@@ -47,9 +45,9 @@
 
 ;; ---------- YAML -> Scheme normalisation ----------
 ;;
-;; (yaml) returns alists with string keys, vectors for sequences,
-;; strings for scalars (not auto-typed). We convert to symbol-keyed
-;; alists with proper scalar types.
+;; (yaml) returns string-keyed alists, vectors for sequences, strings for
+;; scalars (not auto-typed). Convert to symbol-keyed alists with typed
+;; scalars.
 
 (define (looks-like-bool s) (or (string=? s "true") (string=? s "false")))
 (define (string->bool s) (string=? s "true"))
@@ -82,8 +80,8 @@
   (if (pair? hosts-block) (map car hosts-block) '()))
 
 (define (collect-hosts inv)
-  ;; ((host-name . merged-attrs) ...) from all.hosts plus inline
-  ;; overrides under all.children.<g>.hosts.<h>.<inline-vars>.
+  ;; ((host-name . merged-attrs) ...) from all.hosts plus inline overrides
+  ;; under all.children.<g>.hosts.<h>.<inline-vars>.
   (let* ((all      (assq-ref inv 'all))
          (top      (or (kv all 'hosts) '()))
          (children (or (kv all 'children) '()))
@@ -105,7 +103,7 @@
     (reverse acc)))
 
 (define (collect-groups inv)
-  ;; ((group-name . (host-name ...)) ...), incl. an implicit `all`.
+  ;; ((group-name . (host-name ...)) ...), incl. implicit `all`.
   (let* ((all      (assq-ref inv 'all))
          (children (or (kv all 'children) '()))
          (all-hs   (host-names (or (kv all 'hosts) '())))
@@ -116,8 +114,7 @@
     (cons (cons 'all all-hs) per-g)))
 
 (define (collect-group-vars inv)
-  ;; ((group-name (key . value) ...) ...) — all.vars plus each
-  ;; children.<g>.vars.
+  ;; ((group-name (key . value) ...) ...) — all.vars plus children.<g>.vars.
   (let* ((all      (assq-ref inv 'all))
          (top-vars (or (kv all 'vars) '()))
          (children (or (kv all 'children) '()))
@@ -132,7 +129,7 @@
   "Read the Ansible inventory YAML at INVENTORY-PATH and return the full
 state alist with `hosts' and `groups' roots, normalising YAML scalars to
 proper Scheme types and folding in per-group and inline host vars."
-  ;; Returns the full state alist in one shot.
+  ;; Full state alist in one shot.
   (let* ((raw   (read-yaml-file inventory-path))
          (inv   (yaml->scm raw))
          (hosts (collect-hosts inv))
@@ -204,18 +201,17 @@ a path (list of symbols) into a nested var."
   (state-ref state (list 'groups gname 'vars key)))
 
 (define (%var-defined? host-name key state)
-  ;; Top-level membership of `key` in host's vars (host-level explicit
-  ;; #f must beat group-level defaults).
+  ;; `key` present at top level of host's vars (host-level explicit #f must
+  ;; beat group-level defaults).
   (let ((vars (host-attrs host-name state)))
     (and (pair? vars) (assq key vars) #t)))
 
 ;; ---------- task constructors ----------
 ;;
-;; `task` and `handler` are macros over the shared `block`/`body` surface
-;; (the same one terraform-resource uses): each entry is an attribute
-;; `(key <expr>)` whose value is evaluated Scheme, or a nested module dict
-;; `(block <module> <entry>…)`. So a task reads like its YAML, without
-;; quasiquote or dotted pairs:
+;; `task`/`handler` are macros over the shared `block`/`body` surface (same
+;; one terraform-resource uses): each entry is an attribute `(key <expr>)`
+;; (evaluated Scheme) or a nested module dict `(block <module> <entry>…)`. A
+;; task reads like its YAML, no quasiquote/dotted pairs:
 ;;
 ;;   (task
 ;;     (name "Install nginx")
@@ -223,8 +219,8 @@ a path (list of symbols) into a nested var."
 ;;     (become #t)
 ;;     (notify "Reload nginx"))
 ;;
-;; `%check-task` raises early if the body has no `name` (Ansible silently
-;; accepts nameless tasks but they're miserable to debug).
+;; `%check-task` raises early on a missing `name` (Ansible accepts nameless
+;; tasks but they're miserable to debug).
 
 (define (%check-task tag alist)
   (unless (assq 'name alist)
@@ -241,10 +237,9 @@ a path (list of symbols) into a nested var."
 
 ;; ---------- task transformers ----------
 ;;
-;; `(as user tasks)` wraps a list of tasks: defaults `become: #t` (and
-;; `become_user: <user>` for non-root) on each task that doesn't
-;; already declare `become`. Replaces Ansible's `block: become:` with
-;; a Scheme-level scope. Nests cleanly — innermost `as` wins, so:
+;; `(as user tasks)` defaults `become: #t` (and `become_user: <user>` for
+;; non-root) on each task not already declaring `become`. A Scheme-level
+;; scope replacing Ansible's `block: become:`. Nests — innermost `as` wins:
 ;;
 ;;   (as 'root
 ;;     (list
@@ -284,20 +279,20 @@ back to the `all' group's var."
 
 ;; ---------- the play sink ----------
 ;;
-;; `(play host-name tasks [handlers])` emits one Ansible play — but as a
-;; *bundle of ops*, not a single append: a skeleton (hosts + gather_facts)
-;; under `(ansible_plays <host>)`, then one op per task and per handler
-;; appending into that play's list. Because each task is its own op, the op
-;; tree descends play -> tasks (and `explain` can reach a task's path). The
-;; accumulator is keyed by host; the CLI flattens it back into the
-;; playbook's top-level list at render time (`hexol render -o ansible`).
+;; `(play host-name tasks [handlers])` emits one Ansible play as a *bundle of
+;; ops*, not a single append: a skeleton (hosts + gather_facts) under
+;; `(ansible_plays <host>)`, then one op per task/handler appending into the
+;; play's list. Each task being its own op, the op tree descends play ->
+;; tasks (so `explain` reaches a task's path). The accumulator is host-keyed;
+;; the CLI flattens it into the playbook's top-level list at render time
+;; (`hexol render -o ansible`).
 ;;
-;; How to fan a role over a group (one play per host) stays an example's
-;; organizing structure, built from the kernel's ordinary make-op/fold.
+;; Fanning a role over a group (one play per host) stays an example's
+;; structure, built from kernel make-op/fold.
 
 (define (%task-op host-sym key t)
-  ;; append task/handler alist `t` into (ansible_plays <host> tasks|handlers),
-  ;; labelled by its name so the tree reads well.
+  ;; append task/handler `t` into (ansible_plays <host> tasks|handlers),
+  ;; labelled by its name.
   (let* ((lead (if (eq? key 'handlers) "handler " "task "))
          (name (or (assq-ref t 'name) "?"))
          (op   (op:append (list 'ansible_plays host-sym key) t `(task ,name))))
@@ -320,7 +315,7 @@ time."
                                          `((hosts . ,host) (gather_facts . #f))))
                       (built  (fold (lambda (op s) (apply-op op s)) seeded kids))
                       (p      (state-get built path))
-                      ;; appends prepend keys; restore conventional play order.
+                      ;; appends prepend keys; restore play order.
                       (ordered (filter-map (lambda (k) (assq k p))
                                            '(hosts gather_facts tasks handlers))))
                  (state-set built path ordered)))

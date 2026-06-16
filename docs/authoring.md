@@ -273,7 +273,7 @@ hexol/
                     #                   daemonset/custom-resource/service-monitor sugar,
                     #                   service-account + cluster-rbac, expose (derive a
                     #                   Service from a workload), with-namespace scope,
-                    #                   `res` compact limits, app/public-app/worker,
+                    #                   `res` compact limits, app/public-app,
                     #                   tls-all, checksum, compliance
   yaml.scm          # (hexol yaml)     — state -> YAML emitter (the k8s render back-end)
   terraform.scm     # (hexol terraform)— terraform-resource/-provider/-settings/-output

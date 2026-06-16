@@ -1,22 +1,21 @@
 ;;; hexol/secret-tool.scm — the engine behind `hexol secret …`.
 ;;;
-;;; Every mutating verb is one pipeline: locate the `(secrets-store …)' form
-;;; in an inventory file (tracking its exact character span), decrypt it to a
-;;; plaintext map, mutate the map, re-seal it with sops, regenerate the
-;;; structured Scheme form, and splice the new text back into *just that span*
-;;; — the rest of the file stays byte-for-byte identical.
+;;; Each mutating verb is one pipeline: locate the `(secrets-store …)' form
+;;; (tracking its span), decrypt to a plaintext map, mutate, re-seal with
+;;; sops, regenerate the structured form, splice back into *just that span* —
+;;; the rest of the file stays byte-for-byte identical.
 ;;;
-;;;   ls    parse the form, list `data' keys            (no decrypt)
+;;;   ls    list `data' keys                             (no decrypt)
 ;;;   get   decrypt, print one value
 ;;;   set   decrypt, add/replace a key, re-seal, splice
 ;;;   edit  decrypt one value into $EDITOR, re-seal on change, splice
 ;;;   rm    decrypt, drop a key, re-seal, splice
-;;;   rekey decrypt, re-seal to the current .sops.yaml recipients, splice
+;;;   rekey decrypt, re-seal to current .sops.yaml recipients, splice
 ;;;   init  splice an empty `(secrets-store (data))' form
 ;;;
-;;; Re-sealing always re-encrypts the whole plaintext map afresh (one sops
-;;; doc, one data key, one MAC), so a verb never needs the prior metadata —
-;;; it just needs the decrypted values plus a `.sops.yaml' creation rule.
+;;; Re-sealing re-encrypts the whole map afresh (one sops doc, one data key,
+;;; one MAC), so a verb never needs prior metadata — just the decrypted values
+;;; plus a `.sops.yaml' creation rule.
 
 (define-module (hexol secret-tool)
   #:use-module (hexol secrets)
@@ -32,7 +31,7 @@
   #:export (secret-ls secret-get secret-set secret-edit secret-edit-all
             secret-rm secret-rekey secret-init))
 
-;; ---------- clause accessors (a store form's cdr is a plain alist) ----------
+;; ---------- clause accessors (a store form's cdr is an alist) ----------
 
 (define (clause-tail clauses tag)
   (let ((c (assq tag clauses))) (and c (cdr c))))
@@ -42,23 +41,21 @@
 (define (store-keys clauses) (map (lambda (kv) (car kv)) (store-data clauses)))
 
 ;; Raise in the (scm-error) shape bin/hexol's reporter formats cleanly:
-;; the ~a/~p holes in FMT are filled with ARGS.
+;; ~a/~p holes in FMT filled with ARGS.
 (define (fail fmt . args)
   (scm-error 'misc-error #f fmt args #f))
 
 ;; ---------- position-aware reader ----------
 ;;
-;; Read top-level forms from the file, and when we hit the `(secrets-store …)'
-;; one return its parsed clauses plus the [start,end) span it occupies, so a
-;; mutated form can be spliced back over exactly that region.
+;; Read top-level forms; on the `(secrets-store …)' one, return its parsed
+;; clauses plus the [start,end) span, so a mutated form splices back over it.
 ;;
-;; All offsets are *byte* offsets into the file's UTF-8 bytes — `ftell' on the
-;; reader port reports bytes, not characters, so multibyte characters (the `—'
-;; em-dashes in the comments) would desync a char-indexed splice. We keep the
-;; file as a bytevector, scan and splice on bytes, and only decode to a string
-;; for `read'. `read' reports the offset just past a form (end); the matching
-;; `(' is the first paren at/after the previous form's end (start), skipping
-;; the whitespace and `;'/`#| |#' comments between forms (all ASCII bytes).
+;; Offsets are *byte* offsets into the file's UTF-8 — `ftell' reports bytes,
+;; so multibyte chars (the `—' em-dashes) would desync a char-indexed splice.
+;; We keep the file as a bytevector, scan/splice on bytes, decode to a string
+;; only for `read'. `read' reports the offset just past a form (end); the
+;; matching `(' is the first paren at/after the previous end (start), skipping
+;; whitespace and `;'/`#| |#' comments between forms (all ASCII).
 
 (define (slurp-bytes path)
   (call-with-input-file path get-bytevector-all #:binary #t))
@@ -71,8 +68,8 @@
 (define b/lparen 40) (define b/semi 59) (define b/hash 35)
 (define b/bar 124)   (define b/nl 10)
 
-;; From byte I in BV, skip whitespace and comments; return the byte index of
-;; the next `(' (the start of the upcoming form).
+;; From byte I in BV, skip whitespace/comments; return the byte index of the
+;; next `(' (start of the upcoming form).
 (define (scan-to-open bv i)
   (let ((n (bytevector-length bv)))
     (let loop ((i i))
@@ -98,7 +95,7 @@
               (else (fail "unexpected text before store form at byte ~a" i))))))))
 
 ;; Find the `(secrets-store …)' form: (values CLAUSES START END BV), or
-;; (values #f #f #f BV) when there is none. START/END are byte offsets.
+;; (values #f #f #f BV) if none. START/END are byte offsets.
 (define (find-store-form path)
   (let* ((bv   (slurp-bytes path))
          (port (open-input-string (utf8->string bv))))
@@ -120,8 +117,8 @@
 
 ;; ---------- decrypt / plaintext ----------
 
-;; The plaintext map ((kstr . value) …).  An empty `data' clause means the
-;; store was never sealed (e.g. just `init'd) — no sops call, just '().
+;; Plaintext map ((kstr . value) …). Empty `data' means never sealed (e.g.
+;; just `init'd) — no sops call, just '().
 (define (load-plaintext clauses)
   (if (null? (store-data clauses))
       '()
@@ -130,8 +127,8 @@
 
 ;; ---------- sealing (mutate → fresh sops doc → structured clauses) ----------
 
-;; Search upward from the inventory's directory for the `.sops.yaml' that
-;; carries the creation rule (recipients + encrypted_regex) to seal with.
+;; Search upward from the inventory's dir for the `.sops.yaml' carrying the
+;; creation rule (recipients + encrypted_regex) to seal with.
 (define (find-sops-config inv)
   (let loop ((dir (dirname (canonicalize-path inv))))
     (let ((cand (string-append dir "/.sops.yaml")))
@@ -143,19 +140,17 @@
 
 (define (mk-seal-dir) (mkdtemp "/tmp/hexol-seal-XXXXXX"))
 
-;; Encrypt the plaintext map PLAIN ((kstr . val) …) into fresh structured
-;; store clauses, using the creation rule in SOPS-CONFIG.  An empty map seals
-;; to just `((data))' (nothing to encrypt).
+;; Encrypt PLAIN ((kstr . val) …) into fresh structured store clauses via the
+;; creation rule in SOPS-CONFIG. An empty map seals to `((data))'.
 (define (seal-data plain sops-config)
   (if (null? plain)
       '((data))
       (let* ((sops (or (which-cmd "sops") (fail "sops not on PATH")))
              (dir  (mk-seal-dir))
              (file (string-append dir "/store.sops.yaml"))
-             ;; Seal in the same sorted key order `clauses->sops-yaml' feeds
-             ;; sops at decrypt time: the MAC is computed over the data values
-             ;; in tree order, so the two orders must agree or decrypt fails
-             ;; with a MAC mismatch.
+             ;; Sort in the same order `clauses->sops-yaml' feeds sops at
+             ;; decrypt: the MAC covers data values in tree order, so the two
+             ;; orders must agree or decrypt fails with a MAC mismatch.
              (sorted (sort plain (lambda (a b) (string<? (car a) (car b)))))
              (json (scm->json-string (list (cons "data" sorted)))))
         (call-with-output-file file (lambda (p) (display json p)))
@@ -172,8 +167,8 @@
 
 (define (lines-of s) (if (string? s) (string-split s #\newline) '()))
 
-;; sops emits the recipient id under different field names; keep only the
-;; load-bearing ones, dropping any the encrypt didn't populate.
+;; sops emits the recipient id under varying field names; keep only the
+;; load-bearing ones, dropping any the encrypt left empty.
 (define (pgp-entry->clause e)
   `(pgp ,@(filter identity
             (list (let ((fp (assoc-ref e "fp")))
@@ -188,7 +183,7 @@
 
 (define (vec->list x) (if (vector? x) (vector->list x) '()))
 
-;; Turn sops' encrypted JSON ({data, sops}) into structured store clauses.
+;; sops' encrypted JSON ({data, sops}) → structured store clauses.
 (define (json->clauses parsed)
   (let* ((data (or (assoc-ref parsed "data") '()))
          (sops (or (assoc-ref parsed "sops") '()))
@@ -228,7 +223,7 @@
         (enc  (assq 'enc body)))
     (for-each (lambda (f) (format p "      (~a ~s)~%" (car f) (cadr f))) rest)
     (emit-enc p (if enc (cdr enc) '()))
-    (format p "      )")))     ; close the recipient
+    (format p "      )")))     ; close recipient
 
 (define (emit-store-form clauses)
   (call-with-output-string
@@ -251,7 +246,7 @@
            (let ((k (car ks)))
              (emit-recipient p (car k) (cdr k))
              (if (null? (cdr ks))
-                 (format p ")~%")        ; close (keys …)
+                 (format p ")~%")        ; close keys
                  (begin (newline p) (loop (cdr ks)))))))
        (format p "  (data")
        (if (null? data)
@@ -262,14 +257,14 @@
            (let ((kv (car ds)))
              (format p "    (~a . ~s)" (sym->text (car kv)) (cdr kv))
              (if (null? (cdr ds))
-                 (format p ")")          ; close (data …)
+                 (format p ")")          ; close data
                  (begin (newline p) (loop (cdr ds)))))))
-       (format p ")")))))                ; close (secrets-store …)
+       (format p ")")))))                ; close secrets-store
 
 ;; ---------- splice ----------
 
-;; Replace the bytes [START,END) of the file with NEW-FORM (a string), leaving
-;; everything outside that span untouched.
+;; Replace bytes [START,END) with NEW-FORM (a string), leaving the rest of
+;; the file untouched.
 (define (splice-store! path start end new-form)
   (let ((bv (slurp-bytes path)))
     (call-with-output-file path
@@ -279,7 +274,7 @@
         (put-bytevector p (subbv bv end (bytevector-length bv))))
       #:binary #t)))
 
-;; Re-seal PLAIN and write the regenerated form over the [START,END) span.
+;; Re-seal PLAIN and write the regenerated form over [START,END).
 (define (reseal! path start end plain)
   (let* ((cfg     (find-sops-config path))
          (clauses (seal-data plain cfg)))
@@ -361,17 +356,15 @@
 ;; ---------- whole-store edit (the decrypted alist in $EDITOR) ----------
 ;;
 ;; `edit` with no KEY opens the *entire* decrypted store as one editable
-;; s-expression — an alist of (KEY . "VALUE") — so you can add, remove, and
-;; change keys in place, then save to re-encrypt the whole thing. It is the
-;; plaintext counterpart of the sealed `(data …)' clause: same shape, just
-;; decrypted. Comment lines are ignored; the value side is a Scheme string, so
-;; a multi-line secret round-trips as "line1\nline2". The plaintext lives only
-;; in a 0600 temp file (mkstemp!) deleted the moment the editor exits — the
-;; same exposure window as single-key `edit`.
+;; alist of (KEY . "VALUE") — add/remove/change keys, then save to re-encrypt
+;; the whole thing. The plaintext counterpart of the sealed `(data …)' clause.
+;; Comments ignored; values are Scheme strings, so a multi-line secret
+;; round-trips as "line1\nline2". Plaintext lives only in a 0600 temp file
+;; deleted the moment the editor exits — same exposure as single-key `edit`.
 
-;; Render the plaintext map ((kstr . val) …) as the editable alist text, keys
-;; sorted so diffs are stable. Keys print as symbols and values via ~s, so the
-;; whole thing reads back unambiguously even for `/`-bearing keys or odd chars.
+;; Render PLAIN ((kstr . val) …) as editable alist text, keys sorted for
+;; stable diffs. Keys print as symbols, values via ~s, so it reads back
+;; unambiguously even for `/`-bearing keys or odd chars.
 (define (render-plain-sexp plain)
   (let ((sorted (sort plain (lambda (a b) (string<? (car a) (car b))))))
     (call-with-output-string
@@ -392,9 +385,9 @@
                        sorted)
              (format p ")~%")))))))
 
-;; Parse the edited alist text back into a plaintext map ((kstr . val) …),
-;; validating shape and rejecting duplicate keys (a silent last-wins would
-;; quietly drop a secret).
+;; Parse edited alist text back into a plaintext map ((kstr . val) …),
+;; validating shape and rejecting duplicate keys (last-wins would silently
+;; drop a secret).
 (define (parse-plain-sexp text)
   (let* ((port (open-input-string text))
          (form (read port)))
@@ -429,7 +422,7 @@
             (delete-file tmpl)
             (fail "$EDITOR exited non-zero — leaving the store unchanged")))
         (let ((new-text (call-with-input-file tmpl get-string-all)))
-          (delete-file tmpl)                       ; plaintext off disk before we parse
+          (delete-file tmpl)                       ; plaintext off disk before parsing
           (let* ((next (parse-plain-sexp new-text))
                  (norm (lambda (m) (sort (map (lambda (kv) (cons (car kv) (cdr kv))) m)
                                          (lambda (a b) (string<? (car a) (car b)))))))
@@ -449,9 +442,9 @@
         (format (current-error-port) "✓ rekeyed ~a secret~p to ~a → ~a~%"
                 (length plain) (length plain) (find-sops-config path) path)))))
 
-;; Insert an empty store form.  Refuses if one already exists.  We splice it
-;; just before the inventory's final top-level form (typically the `(hx-ops …)'
-;; the secret-refs feed into), so a subsequent `set' has somewhere to land.
+;; Insert an empty store form; refuses if one exists. Spliced just before the
+;; inventory's final top-level form (typically the `(hx-ops …)' the secret-refs
+;; feed), so a later `set' has somewhere to land.
 (define (secret-init path)
   (call-with-values (lambda () (find-store-form path))
     (lambda (existing s e bv)
@@ -466,7 +459,7 @@
         (format (current-error-port)
                 "✓ inserted an empty (secrets-store …) — add secrets with `hexol secret set`~%")))))
 
-;; Byte offset of the last top-level form's opening `(' — where `init' inserts.
+;; Byte offset of the last top-level form's `(' — where `init' inserts.
 (define (last-form-start bv)
   (let ((port (open-input-string (utf8->string bv))))
     (let loop ((last 0))

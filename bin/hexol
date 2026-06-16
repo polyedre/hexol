@@ -2,46 +2,37 @@
 !#
 ;;; bin/hexol — the hexol command-line front-end.
 ;;;
-;;; Subcommands are not hardcoded into the dispatcher: each is an <action> —
-;;; a predicate over the invocation, (subcommand full-args) -> bool, plus a
-;;; runner that receives the full post-program args — registered in *actions*.
-;;; `dispatch` owns only a thin frame (help and the no-match error), then runs
-;;; the first action whose predicate fires. `help` is the one verb that stays
-;;; in the frame: it lists the others (reading them back off *actions*) and
-;;; must work before any inventory loads, so it can't be one of the dispatched
-;;; things. Each action is still a view of one computation — the same op record
-;;; and the same `resolve` fold:
+;;; Subcommands aren't hardcoded: each is an <action> — a predicate
+;;; (subcommand full-args) -> bool plus a runner over the full post-program
+;;; args — registered in *actions*. `dispatch` is a thin frame (help + no-match
+;;; error), then runs the first action whose predicate fires. `help` stays in
+;;; the frame: it lists the others off *actions* and must work before any
+;;; inventory loads. Each action is a view of one computation — same op record,
+;;; same `resolve` fold:
 ;;;
-;;;   hexol render [-o FMT] [-q Q] [--path P] [-i INV]  resolve + emit (default)
-;;;   hexol tree [-v]                     [-i INV]   the op tree, indented
+;;;   hexol render [-o FMT] [--path P]    [-i INV]   resolve + emit (default)
+;;;   hexol tree [-v]                     [-i INV]   op tree, indented
 ;;;                                                  (-v: + per-op fold time)
-;;;   hexol explain [-q Q] PATH|HASH      [-i INV]   ops that touched PATH
+;;;   hexol explain PATH|HASH             [-i INV]   ops that touched PATH
 ;;;                                                  (or every path an op changed)
 ;;;
-;;; The inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
+;;; Inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
 ;;;
 ;;; render formats (-o / --output): sexp (default), json, yaml, terraform, ansible,
-;;; plus any name an inventory file registers with `renders-with`.
-;;;   sexp / json render the whole resolved state;
-;;;   yaml    targets the (kubernetes_resources) manifest stream;
-;;;   terraform targets the (terraform_config) subtree (Terraform JSON config);
-;;;   ansible targets the (ansible_plays) accumulator (a playbook, as JSON);
-;;;   a file-registered name (e.g. sql, ledger) runs that file's own
-;;;     (state -> text) adapter — its accumulated domain output.
+;;; plus any name an inventory registers with `renders-with`.
+;;;   sexp / json — whole resolved state;
+;;;   yaml    — the (kubernetes_resources) manifest stream;
+;;;   terraform — the (terraform_config) subtree (Terraform JSON config);
+;;;   ansible — the (ansible_plays) accumulator (a playbook, as JSON);
+;;;   a file-registered name (e.g. sql, ledger) — that file's own
+;;;     (state -> text) adapter.
 ;;;
-;;;   -q / --query K=V,…   seed the resolve with these attributes — the
-;;;                  query the engine folds over (e.g. -q dc=alpha,role=web).
-;;;                  Default is the empty query. Applies to render + explain.
+;;;   --path a.b.c   render only that subtree (integer-parsing tokens are
+;;;                  list indices, e.g. kubernetes_resources.3.spec.replicas).
 ;;;
-;;;   --path a.b.c   render only that subtree (tokens that parse as
-;;;                  integers are list indices, e.g. regions.alpha5 or
-;;;                  kubernetes_resources.3.spec.replicas).
-;;;
-;;; When --path is omitted and the resolved state has a top-level
-;;; `kubernetes_resources` list, render targets that list — so
-;;;   hexol render -o yaml chart.scm
-;;; emits the manifest stream a `helm template` would, ready for
-;;; `kubectl apply -f -`. Otherwise render targets the whole state.
+;;; With --path omitted and a top-level `kubernetes_resources` list, render
+;;; targets that list — so `hexol render -o yaml chart.scm` emits the manifest
+;;; stream `helm template` would. Otherwise render targets the whole state.
 ;;;
 ;;; Examples:
 ;;;   hexol render examples/inventory.scm
@@ -53,9 +44,8 @@
 
 (add-to-load-path (dirname (dirname (current-filename))))
 
-;; The CLI only needs the kernel — it reads inventories into ops and folds
-;; them; it never authors ops. (The author surface is hx-prefixed now, so it
-;; no longer shadows anything, but there's still no reason to import it here.)
+;; CLI needs only the kernel — it reads inventories into ops and folds them,
+;; never authors ops (so the hx-prefixed author surface isn't imported).
 (use-modules (hexol kernel)
              (hexol cache)
              (hexol yaml)
@@ -75,30 +65,27 @@
 ;; ---------------------------------------------------------------------------
 ;; color — ANSI styling, gated per-port on a TTY and the NO_COLOR convention
 ;; ---------------------------------------------------------------------------
-;; Coloring is decoration only: it never reaches piped output (the port isn't
-;; a terminal then) and honors NO_COLOR. stdout and stderr are gated
-;; independently, so `… 2>&1 | less` strips both. The data renders (sexp /
-;; json / yaml / terraform / ansible) are left untouched — only the
-;; human-facing views (tree / ops / explain / show) and diagnostics paint.
+;; Decoration only: stays out of piped output and honors NO_COLOR. stdout and
+;; stderr gate independently, so `… 2>&1 | less` strips both. Data renders
+;; (sexp/json/yaml/terraform/ansible) stay untouched — only the human-facing
+;; views (tree/ops/explain/show) and diagnostics paint.
 
 (define no-color? (and (getenv "NO_COLOR") #t))
 
 ;; Color mode, set by the global `--color[=WHEN]` flag (parsed in `dispatch`):
-;;   auto    (default) paint only on a TTY, honoring NO_COLOR — the original
-;;           behavior, so a pipe/file stays clean;
-;;   always  force color on regardless of TTY/NO_COLOR — for `… | less -R` or a
-;;           captured log you'll view colored;
-;;   never   force it off.
-;; `--color` with no value means `always` (the GNU optional-arg convention).
+;;   auto    (default) paint only on a TTY, honoring NO_COLOR;
+;;   always  force on regardless of TTY/NO_COLOR — for `… | less -R` or a log;
+;;   never   force off.
+;; Bare `--color` (no value) means `always` (GNU optional-arg convention).
 (define color-mode 'auto)
 (define (port-color? port)
   (case color-mode
     ((always) #t)
     ((never)  #f)
     (else     (and (not no-color?) (isatty? port)))))
-;; Recomputed from `port-color?`, so they reflect `color-mode`. `set-color-mode!`
-;; re-derives them once the flag is parsed (they're read by the painters at call
-;; time, so updating them before any output repaints everything downstream).
+;; Derived from `port-color?`. `set-color-mode!` re-derives them once the flag
+;; is parsed; painters read them at call time, so updating before any output
+;; repaints everything downstream.
 (define stdout-color? (port-color? (current-output-port)))
 (define stderr-color? (port-color? (current-error-port)))
 (define (set-color-mode! mode)
@@ -106,10 +93,9 @@
   (set! stdout-color? (port-color? (current-output-port)))
   (set! stderr-color? (port-color? (current-error-port))))
 
-;; Build the ESC byte explicitly: Guile's string \x escape is version-
-;; dependent (2.2+ wants a `\xHH;` terminator and consumes it; 3.0 in some
-;; builds reads `\x1b` greedily and leaves a stray `;` in the string, which
-;; turns ESC[…m into a malformed ESC;[…m that no terminal renders).
+;; Build the ESC byte explicitly: Guile's string \x escape is version-dependent
+;; (2.2+ wants/consumes a `\xHH;` terminator; some 3.0 builds read `\x1b`
+;; greedily, leaving a stray `;` that makes ESC[…m a malformed ESC;[…m).
 (define esc (string (integer->char 27)))
 (define (paint on? code s)
   (if on? (string-append esc "[" code "m" s esc "[0m") s))
@@ -126,11 +112,10 @@
 (define (e-dim s)   (paint stderr-color? "2"  s))
 (define (e-red s)   (paint stderr-color? "31" s))
 
-;; Tint a tree/ops label by its leading keyword so the views scan at a glance.
-;; Keying on the displayed label (rather than the internal op-kind) keeps the
-;; palette aligned with what the reader actually sees — `module`, `data`,
-;; `terraform`, etc. A bare one-word label is a section/group op and reads as
-;; bold; an unrecognized keyword is left unpainted.
+;; Tint a tree/ops label by its leading keyword so views scan at a glance.
+;; Keying on the displayed label (not the internal op-kind) keeps the palette
+;; aligned with what the reader sees. A bare one-word label is a section/group
+;; op → bold; an unrecognized keyword is left unpainted.
 (define (label-paint label)
   (let* ((sp   (string-index label #\space))
          (head (if sp (substring label 0 sp) label))
@@ -147,16 +132,15 @@
                  (else #f))))
     (if code (paint stdout-color? code label) label)))
 
-;; A `;;`-prefixed informational line on stdout (the comment-style headers the
-;; views print). The format string keeps its own trailing ~%.
+;; A `;;`-prefixed info line on stdout (the comment-style view headers). The
+;; format string keeps its own trailing ~%.
 (define (note fmt . args)
   (display (o-dim (apply format #f fmt args))))
 
-;; jj-style hash gutter. `show` accepts any unambiguous prefix, so the part of
-;; the hash worth typing is its shortest prefix unique among all addressable
-;; ops; that prefix is highlighted and the rest of the shown short-hash dimmed.
-;; current-uniq holds (hash -> shortest-unique-prefix-length) for the tree
-;; being printed; the default treats every hash as already-unique at 1 char.
+;; jj-style hash gutter. `show` takes any unambiguous prefix, so the part worth
+;; typing is the hash's shortest prefix unique among all addressable ops; that
+;; prefix is highlighted, the rest of the short-hash dimmed. current-uniq holds
+;; (hash -> shortest-unique-prefix-length) for the tree; default: unique at 1.
 (define (make-uniq-len hashes)
   (lambda (h)
     (let ((hlen (string-length h)))
@@ -172,7 +156,7 @@
   (let* ((shown (substring hash 0 (min hash-width (string-length hash))))
          (uniq  ((current-uniq) hash)))
     (if (> uniq (string-length shown))
-        ;; not disambiguable within the shown width — nothing to highlight
+        ;; not disambiguable within shown width — nothing to highlight
         (o-dim shown)
         (string-append (paint stdout-color? "35" (substring shown 0 uniq))  ; magenta
                        (o-dim (substring shown uniq))))))
@@ -187,30 +171,19 @@
 (define (parse-path s)
   (map parse-token (string-split s #\.)))
 
-;; "k=v,k=v" -> ((k . v) …): the query attributes seeded as the initial
-;; state, the way `(resolve ops attrs)` is called directly. Values parse
-;; like path tokens (numbers stay numbers, everything else is a symbol);
-;; an empty string is the empty query.
-(define (parse-query s)
-  (if (string=? s "")
-      '()
-      (map (lambda (kv)
-             (let ((eq (string-index kv #\=)))
-               (unless eq (usage-error "bad --query item ~s (want K=V)" kv))
-               (cons (string->symbol (substring kv 0 eq))
-                     (parse-token (substring kv (+ eq 1))))))
-           (string-split s #\,))))
+;; Value of a "FLAG=value" arg; prefix length computed, not hand-counted, so it
+;; can't drift from the literal. (flag-value "--path=" "--path=a.b") => "a.b"
+(define (flag-value prefix arg) (substring arg (string-length prefix)))
 
 (define (load-ops inv)
   (unless inv (usage-error "missing INVENTORY file"))
   (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
   (load-inventory-file inv))
 
-;; Like `load-ops`, but also collect whatever the file registered onto
-;; COLLECTOR — one of the kernel's registration collectors (current-renderers
-;; / current-appliers / current-actions). Returns (values ops entries) with
-;; entries in registration order. The three registries share this one loader;
-;; tree / explain / show don't collect and use plain `load-ops`.
+;; Like `load-ops`, but also collect what the file registered onto COLLECTOR —
+;; a kernel registration collector (current-renderers / -appliers / -actions).
+;; Returns (values ops entries) in registration order. tree/explain/show don't
+;; collect and use plain `load-ops`.
 (define (load-ops+collected collector inv)
   (unless inv (usage-error "missing INVENTORY file"))
   (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
@@ -226,33 +199,30 @@
 ;; render
 ;; ---------------------------------------------------------------------------
 
-;; What to render: an explicit --path always wins. Otherwise the data
-;; formats (sexp / json) render the WHOLE resolved state, while the
-;; structural formats extract their accumulator — yaml the k8s manifest
-;; list, hcl the Terraform resources — since a manifest stream is only
-;; meaningful for that sub-list.
+;; What to render: explicit --path always wins. Otherwise data formats
+;; (sexp/json) render the WHOLE state, while structural formats extract their
+;; accumulator — yaml the k8s manifest list, terraform the TF config.
 (define (render-target fmt state path)
   (cond
     (path (path-get state path))
     ((string=? fmt "terraform") (or (state-get state '(terraform_config)) '()))
-    ;; (ansible_plays) is keyed by host; a playbook is the list of its plays.
+    ;; (ansible_plays) is host-keyed; a playbook is the list of its plays.
     ((string=? fmt "ansible")
      (map cdr (or (state-get state '(ansible_plays)) '())))
     ((and (string=? fmt "yaml") (pair? state) (assq 'kubernetes_resources state))
      (state-get state '(kubernetes_resources)))
     (else state)))
 
-;; A sequence of maps (each a k8s resource) prints as a multi-doc stream.
+;; A sequence of maps (each a k8s resource) → multi-doc stream.
 (define (sequence-of-maps? x)
   (and (pair? x) (list? x) (every object-shape? x)))
 
 (define (emit-sexp obj) (pretty-print obj))
 
-;; A whole-state sexp dump (no --path) can be hundreds of lines — the very
-;; first thing a newcomer runs. When it's big, nudge toward the drill-down
-;; views on stderr (so piped stdout stays clean).
+;; A whole-state sexp dump (no --path) can be hundreds of lines. When it's big,
+;; nudge toward the drill-down views on stderr (piped stdout stays clean).
 (define (size-hint inv text)
-  ;; pretty-print ends with a newline, so the newline count is the line count.
+  ;; pretty-print ends with a newline, so newline count = line count.
   (let ((lines (1- (length (string-split text #\newline)))))
     (when (> lines 80)
       (format (current-error-port) "~a~%"
@@ -272,40 +242,35 @@
 (define (cmd-render args)
   (call-with-values (lambda () (extract-inventory "render" args))
     (lambda (inv rest)
-      (let loop ((args rest) (fmt "sexp") (path #f) (query '()))
+      (let loop ((args rest) (fmt "sexp") (path #f))
         (match args
-          (() (do-render (inventory-or-default "render" inv) fmt path query))
-          (((or "-o" "--output") f . rest) (loop rest f path query))
-          (("--path" p . rest) (loop rest fmt (parse-path p) query))
-          (((or "-q" "--query") q . rest) (loop rest fmt path (parse-query q)))
+          (() (do-render (inventory-or-default "render" inv) fmt path))
+          (((or "-o" "--output") f . rest) (loop rest f path))
+          (("--path" p . rest) (loop rest fmt (parse-path p)))
           ((arg . rest)
            (cond
              ((string-prefix? "--output=" arg)
-              (loop rest (substring arg 9) path query))
+              (loop rest (flag-value "--output=" arg) path))
              ((string-prefix? "--path=" arg)
-              (loop rest fmt (parse-path (substring arg 7)) query))
-             ((string-prefix? "--query=" arg)
-              (loop rest fmt path (parse-query (substring arg 8))))
+              (loop rest fmt (parse-path (flag-value "--path=" arg))))
              ((string-prefix? "-" arg) (usage-error "render: unknown flag ~a" arg))
              (else (usage-error "render: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
-;; The full format list for error messages: the built-ins plus whatever
-;; names this file registered via `renders-with`, joined uniformly.
+;; Full format list for error messages: built-ins plus `renders-with` names.
 (define builtin-formats '("sexp" "json" "yaml" "terraform" "ansible"))
 
 (define (format-list renderers)
   (string-join (append builtin-formats (map renderer-name renderers)) " | "))
 
-(define (do-render inv fmt path query)
+(define (do-render inv fmt path)
   (call-with-values (lambda () (load-ops+collected current-renderers inv))
     (lambda (ops renderers)
-      (let ((state (resolve ops query))
+      (let ((state (resolve ops '()))
             (custom (and (not path)
                          (find (lambda (r) (string=? (renderer-name r) fmt)) renderers))))
         (cond
-          ;; A file-registered renderer wins for its own name. `--path` is a
-          ;; state-subtree selector that only makes sense for the generic
-          ;; formats, so it suppresses the custom renderer.
+          ;; A file-registered renderer wins for its own name; `--path` (generic
+          ;; formats only) suppresses it.
           (custom ((renderer-proc custom) state))
           (else
            (let ((target (render-target fmt state path)))
@@ -325,61 +290,80 @@
                                   fmt (format-list renderers)))))))))))
 
 ;; ---------------------------------------------------------------------------
-;; apply — run the inventory's registered appliers (effects) against ONE
-;; resolved state, in order. `render` makes artifacts; `apply` pushes them.
+;; apply — run the inventory's appliers against ONE resolved state, in order.
+;; `render` makes artifacts; `apply` pushes them.
 ;; ---------------------------------------------------------------------------
 ;;
-;;   hexol apply [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] [-i INVENTORY]
+;;   hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY]
 ;;
-;; Resolve once, run the appliers an inventory registered with `applies-with`
-;; in registration order, optionally keep only the named ones, and call each (proc state
-;; dry?). No hexol-level prompt — appliers lean on their tool's own gate
-;; (`tofu apply` prompts). --dry-run delegates to each tool's native dry-run
-;; and is meant to be paired with --only (a whole-pipeline dry-run is
-;; incoherent: the k8s dry-run needs the cluster the terraform phase builds).
-
-(define (parse-only s) (string-split s #\,))
+;; Resolve once, then run the `applies-with` appliers in registration order,
+;; each (proc state dry?). --list prints that order. --dry-run delegates to each
+;; tool's native dry-run (pair with --only; a whole-pipeline dry-run is
+;; incoherent — k8s dry-run needs the cluster terraform builds). No hexol
+;; prompt — appliers lean on their tool's gate (`tofu apply` prompts).
+;;
+;; --only SPEC selects a subset, keeping pipeline order. SPEC is comma-separated
+;; terms, each a NAME or a jj-style range: A::B (through), A:: (to end), ::B
+;; (from start) — so `--only kubernetes::` resumes a deploy from the k8s step.
 
 (define (cmd-apply args)
   (call-with-values (lambda () (extract-inventory "apply" args))
     (lambda (inv rest)
-      (let loop ((args rest) (only #f) (dry? #f) (query '()))
+      (let loop ((args rest) (only #f) (dry? #f) (list? #f))
         (match args
-          (() (do-apply (inventory-or-default "apply" inv) only dry? query))
-          (("--dry-run" . rest) (loop rest only #t query))
-          (((or "--only" "-o") names . rest) (loop rest (parse-only names) dry? query))
-          (((or "-q" "--query") q . rest) (loop rest only dry? (parse-query q)))
+          (() (do-apply (inventory-or-default "apply" inv) only dry? list?))
+          (("--dry-run" . rest) (loop rest only #t list?))
+          (("--list" . rest) (loop rest only dry? #t))
+          (("--only" spec . rest) (loop rest spec dry? list?))
           ((arg . rest)
            (cond
-             ((string-prefix? "--only=" arg) (loop rest (parse-only (substring arg 7)) dry? query))
+             ((string-prefix? "--only=" arg) (loop rest (flag-value "--only=" arg) dry? list?))
              ((string-prefix? "-" arg) (usage-error "apply: unknown flag ~a" arg))
              (else (usage-error "apply: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
-(define (do-apply inv only dry? query)
+;; Select a subset of ordered APPLIERS by SPEC (see cmd-apply), in pipeline
+;; order; errors on an unknown name or reversed range.
+(define (select-appliers appliers spec)
+  (let* ((names (map applier-name appliers))
+         (last  (1- (length names)))
+         (index (lambda (n)
+                  (or (list-index (lambda (x) (string=? x n)) names)
+                      (die "apply: no applier named ~s (have: ~a)"
+                           n (string-join names ", ")))))
+         (keep  (make-vector (length names) #f)))
+    (define (mark-term t)
+      (let* ((sep (string-contains t "::"))
+             (lo  (if sep (substring t 0 sep) t))
+             (hi  (if sep (substring t (+ sep 2)) t))
+             (i   (if (string=? lo "") 0    (index lo)))
+             (j   (if (string=? hi "") last (index hi))))
+        (when (> i j) (die "apply: reversed range ~s" t))
+        (let mark ((k i)) (when (<= k j) (vector-set! keep k #t) (mark (1+ k))))))
+    (for-each mark-term (string-split spec #\,))
+    (let pick ((as appliers) (i 0) (acc '()))
+      (cond ((null? as) (reverse acc))
+            ((vector-ref keep i) (pick (cdr as) (1+ i) (cons (car as) acc)))
+            (else (pick (cdr as) (1+ i) acc))))))
+
+(define (do-apply inv only dry? list?)
   (call-with-values (lambda () (load-ops+collected current-appliers inv))
     (lambda (ops appliers)
       (when (null? appliers)
         (die "apply: ~a registers no appliers (use applies-with in the inventory)" inv))
-      ;; Validate every requested name before doing anything irreversible.
-      (when only
-        (for-each (lambda (name)
-                    (unless (find (lambda (a) (string=? (applier-name a) name)) appliers)
-                      (die "apply: no applier named ~s (have: ~a)"
-                           name (string-join (map applier-name appliers) ", "))))
-                  only))
-      ;; Registration order IS the run order; --only keeps just the named ones,
-      ;; preserving that order.
-      (let ((chosen (if only
-                        (filter (lambda (a) (member (applier-name a) only)) appliers)
-                        appliers))
-            (state  (resolve ops query)))   ; resolve ONCE; all appliers share it
-        (for-each
-          (lambda (a)
-            (format (current-error-port) ";; apply: ~a~a~%"
-                    (applier-name a) (if dry? " (dry-run)" ""))
-            (force-output (current-error-port))
-            ((applier-proc a) state dry?))
-          chosen)))))
+      (cond
+        (list?
+         (note ";; ~a appliers (pipeline order):~%" (length appliers))
+         (for-each (lambda (a) (format #t "  ~a~%" (applier-name a))) appliers))
+        (else
+         (let ((chosen (if only (select-appliers appliers only) appliers))
+               (state  (resolve ops '())))   ; resolve ONCE; appliers share it
+           (for-each
+             (lambda (a)
+               (format (current-error-port) ";; apply: ~a~a~%"
+                       (applier-name a) (if dry? " (dry-run)" ""))
+               (force-output (current-error-port))
+               ((applier-proc a) state dry?))
+             chosen)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; tree — concise op-tree view (walks captured source recursively)
@@ -426,33 +410,32 @@
         (walk-item (car xs) bars (= i (- n 1)))
         (loop (cdr xs) (+ i 1))))))
 
-;; Width of the short-hash gutter `tree` prints at the start of each op line.
-;; `show` accepts any unambiguous prefix, so this is just the display width.
+;; Width of the short-hash gutter `tree` prints per op line. `show` takes any
+;; unambiguous prefix, so this is just the display width.
 (define hash-width 8)
 (define hash-gutter (make-string (+ hash-width 2) #\space))
 
 ;; Target width for the human-facing blob views (`show`'s source s-expression
-;; and state-delta values). pretty-print wraps to this minus each view's own
-;; left margin, so the emitted lines land at ~line-width columns.
+;; and state-delta values). pretty-print wraps to this minus each view's left
+;; margin, so emitted lines land at ~line-width columns.
 (define line-width 120)
 
-;; `tree -v` timing column. When bound (verbose mode), holds the hashq table
-;; of op -> internal-real-time units that `resolve-with-timings` populated;
-;; otherwise #f and the column collapses to nothing. The column is 10 chars
-;; (a right-justified "NN.NNms") plus a two-space gap, so op and source lines
-;; stay aligned under the hash gutter.
+;; `tree -v` timing column. When bound (verbose), holds the op -> internal-
+;; real-time-units hashq table `resolve-with-timings` populated; else #f and the
+;; column collapses. 10 chars (right-justified "NN.NNms") + 2-space gap, so op
+;; and source lines stay aligned under the hash gutter.
 (define tree-timings (make-parameter #f))
 (define time-col-width 12)
 
 (define (op-time-ms op)
-  ;; OP's measured fold time in milliseconds, or #f if it wasn't measured
-  ;; (e.g. a `when` whose predicate never fired, so its effect never ran).
+  ;; OP's measured fold time in ms, or #f if unmeasured (e.g. a `when` whose
+  ;; predicate never fired, so its effect never ran).
   (let ((table (tree-timings)))
     (and table
          (let ((u (hashq-ref table op)))
            (and u (/ (* 1000.0 u) internal-time-units-per-second))))))
 
-;; The timing cell for an op line (empty unless verbose).
+;; Timing cell for an op line (empty unless verbose).
 (define (time-cell op)
   (if (tree-timings)
       (let ((ms (op-time-ms op)))
@@ -472,8 +455,8 @@
   (walk-op-children op (concatenate (list bars (list (not last?))))))
 
 (define (walk-source form bars last?)
-  ;; Source-derived children have no op record (hence no addressable hash);
-  ;; pad the hash and timing gutters so the tree stays aligned.
+  ;; Source-derived children have no op record (no addressable hash); pad the
+  ;; hash and timing gutters so the tree stays aligned.
   (when (printable-source? form)
     (format #t "~a~a~a~%" hash-gutter (time-blank)
             (line bars last? (label-paint (label-from-source form))))
@@ -508,9 +491,9 @@
         (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
           (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
           (if verbose?
-              ;; Run the fold once to measure each op's time, then annotate the
-              ;; tree. Times are inclusive of children (a parent line totals its
-              ;; subtree); the seed query is empty, matching `render` with no -q.
+              ;; Fold once to measure each op's time, then annotate the tree.
+              ;; Times include children (a parent totals its subtree). Seeded
+              ;; with the empty query, like `render`.
               (let ((timings (make-hash-table)))
                 (resolve-with-timings ops '() timings)
                 (note ";; -v: fold time per op (inclusive of children)~%")
@@ -549,25 +532,22 @@
                    hits)))))))
 
 (define (cmd-explain args)
-  ;; explain [-q K=V,…] TARGET  — TARGET is the sole positional, either a state
-  ;; PATH (a.b.c) or an op hash prefix (see do-explain). Inventory is -i/env.
+  ;; explain TARGET — sole positional, a state PATH (a.b.c) or an op hash
+  ;; prefix (see do-explain). Inventory is -i/env.
   (call-with-values (lambda () (extract-inventory "explain" args))
     (lambda (inv rest)
-      (let loop ((args rest) (target #f) (query '()))
+      (let loop ((args rest) (target #f))
         (match args
           (()
            (unless target (usage-error "explain: missing PATH or HASH"))
-           (do-explain (inventory-or-default "explain" inv) target query))
-          (((or "-q" "--query") q . rest) (loop rest target (parse-query q)))
+           (do-explain (inventory-or-default "explain" inv) target))
           ((arg . rest)
-           (cond ((string-prefix? "--query=" arg)
-                  (loop rest target (parse-query (substring arg 8))))
-                 ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
-                 ((not target) (loop rest arg query))
+           (cond ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
+                 ((not target) (loop rest arg))
                  (else (usage-error "explain: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
-;; The state paths OP changed when it fired — the keys of its state delta.
-;; Mirrors show-delta's trace walk, but returns the paths instead of printing.
+;; The state paths OP changed when it fired — its delta's keys. Mirrors
+;; show-delta's trace walk, but returns the paths instead of printing.
 (define (op-changed-paths op trace)
   (let loop ((prev '((attributes))) (steps trace))
     (cond
@@ -576,9 +556,9 @@
       (else (loop (cdar steps) (cdr steps))))))
 
 ;; Print the explain trace for one PATH: its final value and every op that
-;; changed it during the fold.
-(define (explain-path final trace path query)
-  (let ((hits (trace-hits trace path (list (cons 'attributes query)))))
+;; changed it.
+(define (explain-path final trace path)
+  (let ((hits (trace-hits trace path '((attributes)))))
     (note ";; path:      ~s~%" path)
     (note ";; final:     ~s~%" (path-get final path))
     (note ";; ~a op(s) touched this path:~%~%" (length hits))
@@ -593,19 +573,17 @@
           (format #t "    after:  ~a~%~%" (o-green (format #f "~s" (assq-ref hit 'after))))))
       hits)))
 
-;; TARGET is a state PATH or an op hash prefix. A dot-free TARGET that matches
-;; an op's content hash is taken as that op (the hash `tree`/`show` print), and
-;; explain traces every path that op changed. Otherwise TARGET is parsed as a
-;; PATH. A hash prefix wins over a single-segment path of the same spelling;
-;; qualify with a `.` (or use the full path) to force path mode.
-(define (do-explain inv target query)
+;; TARGET is a state PATH or an op hash prefix. A dot-free TARGET matching an
+;; op's content hash is taken as that op, tracing every path it changed;
+;; otherwise parsed as a PATH. A hash prefix wins over a same-spelled single-
+;; segment path; qualify with a `.` (or full path) to force path mode.
+(define (do-explain inv target)
   (let* ((ops (load-ops inv))
          (op  (and (not (string-index target #\.))
                    (let ((ms (hash-matches ops target))) (and (pair? ms) (car ms))))))
-    (call-with-values (lambda () (resolve-with-trace ops query))
+    (call-with-values (lambda () (resolve-with-trace ops '()))
       (lambda (final trace)
         (note ";; inventory: ~a~%" inv)
-        (note ";; query:     ~s~%" query)
         (if op
             (let ((paths (op-changed-paths op trace)))
               (note ";; op:        ~a  ~a~%" (op-short-hash op hash-width) (op-display op))
@@ -613,22 +591,21 @@
               (note ";; ~a path~p this op changed:~%~%" (length paths) (length paths))
               (if (null? paths)
                   (note ";; (this op fired no leaf delta — it's a wrapper; explain its children)~%")
-                  (for-each (lambda (path) (explain-path final trace path query)) paths)))
-            (explain-path final trace (parse-path target) query))))))
+                  (for-each (lambda (path) (explain-path final trace path)) paths)))
+            (explain-path final trace (parse-path target)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; show — one op by its content hash (the hash `tree` prints)
 ;; ---------------------------------------------------------------------------
 
-;; Every op record in the tree, depth-first (parents before children), so a
-;; hash prefix can be matched against the whole tree, not just the top level.
+;; Every op in the tree, depth-first (parents before children), so a hash
+;; prefix matches the whole tree, not just the top level.
 (define (tree-op-list ops)
   (append-map (lambda (op) (cons op (tree-op-list (op-children op)))) ops))
 
-;; Resolve a hash PREFIX against every op in the tree. Returns the list of
-;; matching ops (empty when nothing matches, so callers can fall back to other
-;; addressing). Exits with the candidate list when the prefix is ambiguous —
-;; i.e. it spans more than one distinct content hash.
+;; Resolve a hash PREFIX against every op in the tree. Returns matching ops
+;; (empty when none match, so callers can fall back to other addressing). Exits
+;; with the candidate list when the prefix spans >1 distinct content hash.
 (define (hash-matches ops prefix)
   (let* ((all      (tree-op-list ops))
          (matches  (filter (lambda (op) (string-prefix? prefix (op-content-hash op)))
@@ -649,15 +626,15 @@
        (exit 2))
       (else matches))))
 
-;; Is X a map-shaped alist (every entry a (symbol . _) pair)? Used to decide
-;; whether to recurse into a state node or treat it as a changed leaf.
+;; Is X a map-shaped alist (every entry a (symbol . _) pair)? Decides whether
+;; to recurse into a state node or treat it as a changed leaf.
 (define (map-alist? x)
   (and (pair? x) (list? x)
        (every (lambda (e) (and (pair? e) (symbol? (car e)))) x)))
 
-;; Leaf-level diff of two state nodes: a list of (path before after) for every
-;; path whose value differs. Recurses through map-shaped alists; anything else
-;; (scalars, vectors, plain lists) is compared whole.
+;; Leaf-level diff of two state nodes: (path before after) for every path whose
+;; value differs. Recurses through map-shaped alists; anything else (scalars,
+;; vectors, plain lists) is compared whole.
 (define (state-diff a b path)
   (cond
     ((equal? a b) '())
@@ -669,10 +646,10 @@
                    keys)))
     (else (list (list path a b)))))
 
-;; Walk the fire-order trace to the step where OP fired (by eq? identity) and
-;; print the state delta it introduced — `before` is the prior step's
-;; after-state. Wrappers (compose/when/case) fire after their children and so
-;; show no delta of their own; that's reported rather than left blank.
+;; Walk the fire-order trace to where OP fired (by eq?) and print the delta it
+;; introduced — `before` is the prior step's after-state. Wrappers
+;; (compose/when/case) fire after their children and show no delta; that's
+;; reported rather than left blank.
 (define (show-delta op trace)
   (let loop ((prev '((attributes))) (steps trace))
     (cond
@@ -698,11 +675,11 @@
 ;; ---------------------------------------------------------------------------
 ;; source blob — `show` prints the op's raw source s-expression. pretty-print
 ;; lays it out; this adds light syntax tinting and a 2-space indent so the blob
-;; sits under the `;; source:` header and scans like the rest of the views.
+;; sits under the `;; source:` header and scans like the other views.
 ;; ---------------------------------------------------------------------------
 
-;; Where a bare token ends: the next whitespace, paren/bracket, string quote,
-;; or comment. Used to lift one atom out of the pretty-printed text at a time.
+;; Where a bare token ends: next whitespace, paren/bracket, string quote, or
+;; comment. Lifts one atom out of the pretty-printed text at a time.
 (define (token-end s i n)
   (let loop ((j i))
     (if (>= j n)
@@ -713,9 +690,9 @@
               j
               (loop (+ j 1)))))))
 
-;; Tint one atom. A symbol heading a list (the operator slot) reads as a
-;; keyword; numbers, booleans/char/vector literals (#…), and :keywords each
-;; get their own hue; everything else is left in the default weight.
+;; Tint one atom. A symbol heading a list (operator slot) reads as a keyword;
+;; numbers, #-literals, and :keywords each get their own hue; everything else
+;; stays default.
 (define (tint-atom tok head?)
   (cond
     (head?                          (o-cyan tok))
@@ -724,10 +701,9 @@
     ((string-prefix? ":" tok)       (o-magenta tok))
     (else                           tok)))
 
-;; Colorize pretty-printed Scheme. A flat character scan, string-aware so we
-;; never paint inside a "literal" (where parens/semicolons aren't syntax). The
-;; token right after an opening paren is the list head; everything else after
-;; an open paren is an argument.
+;; Colorize pretty-printed Scheme. A flat char scan, string-aware so we never
+;; paint inside a "literal" (where parens/semicolons aren't syntax). The token
+;; right after an opening paren is the list head; the rest are arguments.
 (define (highlight-sexp s)
   (if (not stdout-color?)
       s
@@ -739,7 +715,7 @@
               (let ((c (string-ref s i)))
                 (cond
                   ;; string literal — consume through the closing quote,
-                  ;; honoring backslash escapes.
+                  ;; honoring backslash escapes
                   ((char=? c #\")
                    (let scan ((j (+ i 1)))
                      (cond
@@ -761,8 +737,8 @@
                    (write-char c out) (loop (+ i 1) #t))
                   ((or (char=? c #\)) (char=? c #\]))
                    (write-char c out) (loop (+ i 1) #f))
-                  ;; whitespace carries the head? flag across (so `(\n  foo`
-                  ;; still tints foo as the head)
+                  ;; whitespace carries head? across (so `(\n  foo` still tints
+                  ;; foo as the head)
                   ((char-whitespace? c)
                    (write-char c out) (loop (+ i 1) head?))
                   ;; reader prefixes ' ` , don't consume the head slot
@@ -790,16 +766,15 @@
     (display (highlight-sexp indented))
     (newline)))
 
-;; Render one side of a state-delta entry as `;;` comment lines. A scalar (or
-;; any value pretty-print keeps on one line) stays a single `;;     - val`
-;; line, as before; a compound value is pretty-printed and each line is
-;; comment-prefixed, with the -/+ marker only on the first and continuation
-;; lines aligned under it. The whole value is painted in one hue (red/green)
-;; so the diff direction stays legible — no per-token tinting here.
+;; Render one side of a state-delta entry as `;;` comment lines. A one-line
+;; value stays a single `;;     - val` line; a compound value is pretty-printed
+;; and each line comment-prefixed, with the -/+ marker only on the first and
+;; continuations aligned under it. The whole value is painted in one hue
+;; (red/green) so the diff direction stays legible — no per-token tinting.
 (define (render-delta-value marker paint val)
   (let* ((raw   (string-trim-right
                   ;; ";;     - " is a 9-char left margin (`;;` + 5 spaces +
-                  ;; marker + space); wrap so the prefixed lines reach line-width.
+                  ;; marker + space); wrap so prefixed lines reach line-width.
                   (call-with-output-string
                     (lambda (p)
                       (pretty-print val p
@@ -858,11 +833,10 @@
 ;; secret — manage the inline (secrets-store …) in an inventory
 ;; ---------------------------------------------------------------------------
 ;;
-;; Like every verb, the inventory is -i/--inventory (or $HEXOL_INVENTORY), never
-;; a positional — so a secret verb's positionals are purely its domain tokens
-;; (KEY, VALUE). The mutating verbs rewrite only the store form's span in place;
-;; plaintext only ever reaches stdout (`get`) or $EDITOR (`edit`), never the
-;; file or a log.
+;; Inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional — so a
+;; secret verb's positionals are purely its domain tokens (KEY, VALUE). The
+;; mutating verbs rewrite only the store form's span in place; plaintext reaches
+;; only stdout (`get`) or $EDITOR (`edit`), never the file or a log.
 
 (define secret-usage "\
 usage:
@@ -891,8 +865,8 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
        (lambda (inv vrest)
          (let* ((pos (filter (lambda (a) (not (string-prefix? "-" a))) vrest))
                 (sym string->symbol)
-                ;; Inventory or a secret-usage error (secret-error, not the
-                ;; generic usage-error, so the secret usage block is shown).
+                ;; Inventory or secret-error (not generic usage-error, so the
+                ;; secret usage block is shown).
                 (inv* (lambda ()
                         (or inv (env-inventory)
                             (secret-error "secret ~a: no inventory — pass -i FILE or set $HEXOL_INVENTORY"
@@ -916,35 +890,30 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 ;; verbs — the dispatch registry
 ;; ---------------------------------------------------------------------------
 ;;
-;; A subcommand is no longer a hardcoded arm of `dispatch`. It is a <verb>:
-;; a NAME, a PREDICATE over the invocation — (subcommand full-args) -> bool —
-;; and a RUNNER that receives the full post-program args (the verb included)
-;; and does the work. `dispatch` walks *verbs* and runs the first whose
-;; predicate fires, so a new verb is one `register-verb!` away with nothing
-;; in the dispatcher to touch.
+;; A subcommand isn't a hardcoded arm of `dispatch`. It's a <verb>: a NAME, a
+;; PREDICATE over the invocation — (subcommand full-args) -> bool — and a RUNNER
+;; over the full post-program args (verb included). `dispatch` walks *verbs* and
+;; runs the first whose predicate fires, so a new verb is one `register-verb!`
+;; away with nothing in the dispatcher to touch.
 ;;
 ;; The predicate sees the full args, not just the verb, so a future verb can
-;; fire on a flag or an inventory shape rather than an exact name; the runner
-;; likewise gets every argument and slices off what it needs. The built-in
-;; verbs all just match their own name (`cmd-is`) and delegate to the existing
-;; cmd-* handler. `help` deliberately stays OUT of this set — it lists the
-;; verbs by reading them back off *verbs* and must work before any inventory
-;; loads, so it lives in the dispatch frame instead.
+;; fire on a flag or inventory shape rather than an exact name; the runner gets
+;; every arg and slices what it needs. The built-ins just match their own name
+;; (`cmd-is`) and delegate to their cmd-* handler. `help` stays OUT of this set
+;; — it lists the verbs off *verbs* and must work before any inventory loads,
+;; so it lives in the dispatch frame.
 ;;
-;; *verbs* holds the BUILT-IN verbs (fixed at load). An inventory can ALSO
+;; *verbs* holds the BUILT-IN verbs (fixed at load). An inventory can also
 ;; contribute verbs: `defines-action NAME PROC` (sugar: `actions`) registers a
-;; (state args -> effects) procedure as a kernel <action>, and when `dispatch`
-;; finds no built-in match it loads the inventory collecting these and runs the
-;; one named SUBCMD (see `run-inventory-action`). Built-ins are tried first, so
-;; an inventory can only ADD verbs, never shadow a core one. This is how an
-;; inventory ships its own teardown/diff/bootstrap verb — e.g.
-;; examples/homelab.scm's `destroy`.
+;; (state args -> effects) proc as a kernel <action>; when `dispatch` finds no
+;; built-in match it loads the inventory collecting these and runs the one named
+;; SUBCMD. Built-ins are tried first, so an inventory can only ADD verbs, never
+;; shadow a core one — e.g. examples/homelab.scm's `destroy`.
 
-;; A dispatchable CLI verb: a NAME, a PREDICATE over the invocation, a RUNNER
-;; that does the work, and a one-line SYNOPSIS for `--help'. The built-ins are
-;; <verb> records directly; an inventory-contributed action (a kernel <action>)
-;; is adapted into one of these (see `inventory-verbs'), so dispatch and help
-;; iterate a single record type rather than forking over two shapes.
+;; A dispatchable CLI verb: NAME, PREDICATE over the invocation, RUNNER, and a
+;; one-line SYNOPSIS for `--help'. Built-ins are <verb> records directly; an
+;; inventory-contributed action (a kernel <action>) is adapted into one (see
+;; `inventory-verbs'), so dispatch and help iterate one record type.
 (define-record-type <verb>
   (make-verb name predicate runner synopsis)
   verb?
@@ -958,26 +927,26 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 (define (register-verb! v)
   (set! *verbs* (append *verbs* (list v))))
 
-;; The common predicate: fire when the leading subcommand is exactly NAME.
+;; Common predicate: fire when the leading subcommand is exactly NAME.
 (define (cmd-is name)
   (lambda (subcmd args) (and subcmd (string=? subcmd name))))
 
-;; The cmd-* handlers want the args *after* the verb; the runner is handed the
-;; full list, so drop the head.
+;; cmd-* handlers want the args *after* the verb; the runner gets the full
+;; list, so drop the head.
 (define (delegating-runner cmd) (lambda (args) (cmd (cdr args))))
 
 (register-verb!
  (make-verb "render" (cmd-is "render") (delegating-runner cmd-render)
-   "render [-o sexp|json|yaml|terraform|ansible] [-q K=V,…] [--path a.b.c] [-i INVENTORY]"))
+   "render [-o sexp|json|yaml|terraform|ansible] [--path a.b.c] [-i INVENTORY]"))
 (register-verb!
  (make-verb "apply" (cmd-is "apply") (delegating-runner cmd-apply)
-   "apply  [--only NAME[,NAME…]] [--dry-run] [-q K=V,…] [-i INVENTORY]"))
+   "apply  [--only SPEC] [--dry-run] [--list] [-i INVENTORY]"))
 (register-verb!
  (make-verb "tree" (cmd-is "tree") (delegating-runner cmd-tree)
    "tree    [-v] [-i INVENTORY]"))
 (register-verb!
  (make-verb "explain" (cmd-is "explain") (delegating-runner cmd-explain)
-   "explain [-q K=V,…] PATH|HASH [-i INVENTORY]"))
+   "explain PATH|HASH [-i INVENTORY]"))
 (register-verb!
  (make-verb "show" (cmd-is "show") (delegating-runner cmd-show)
    "show    HASH [-i INVENTORY]"))
@@ -985,22 +954,21 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
  (make-verb "secret" (cmd-is "secret") (delegating-runner cmd-secret)
    "secret  <ls|get|set|edit|rm|rekey|init> … [-i INVENTORY]"))
 
-;; A "|"-joined verb list for terse usage lines.
+;; "|"-joined verb list for terse usage lines.
 (define (verb-list) (string-join (map verb-name *verbs*) "|"))
 
 ;; ---------------------------------------------------------------------------
 ;; dispatch — the frame: help, then run the first matching action
 ;; ---------------------------------------------------------------------------
 
-;; The inventory is invariant across an exploration session, so it is NOT a
-;; positional on any verb: pass it with -i/--inventory (or --inventory=FILE),
-;; or set $HEXOL_INVENTORY once for the session. That leaves every verb's
-;; positionals carrying only the domain token you actually iterate on
-;; (PATH / HASH / KEY) — no trailing inventory to cursor back past, and no
-;; KEY-vs-INVENTORY ambiguity to resolve.
+;; Inventory is invariant across a session, so it's NOT a positional on any
+;; verb: pass -i/--inventory (or --inventory=FILE), or set $HEXOL_INVENTORY
+;; once. That leaves each verb's positionals carrying only the domain token you
+;; iterate on (PATH/HASH/KEY) — no trailing inventory to cursor past, no
+;; KEY-vs-INVENTORY ambiguity.
 
-;; $HEXOL_INVENTORY when set to a non-empty value, else #f. The shared stand-in
-;; every verb falls back to when -i/--inventory is omitted.
+;; $HEXOL_INVENTORY if non-empty, else #f. The shared fallback when
+;; -i/--inventory is omitted.
 (define (env-inventory)
   (and=> (getenv "HEXOL_INVENTORY")
          (lambda (v) (and (not (string-null? v)) v))))
@@ -1010,9 +978,9 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
       (usage-error "~a: no inventory — pass -i/--inventory FILE or set $HEXOL_INVENTORY" cmd)))
 
 ;; Pull -i/--inventory FILE (and --inventory=FILE) out of ARGS wherever it
-;; appears, and return (values INV REST): INV is the file or #f, REST is ARGS
-;; with the flag and its value removed, so each command then parses only its
-;; own flags and domain positionals. CMD names the verb for error messages.
+;; appears; return (values INV REST): INV the file or #f, REST without the flag
+;; and value, so each command parses only its own flags/positionals. CMD names
+;; the verb for error messages.
 (define (extract-inventory cmd args)
   (let loop ((args args) (inv #f) (acc '()))
     (match args
@@ -1025,8 +993,8 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
            (loop rest inv (cons arg acc)))))))
 
 ;; Pull -v/--verbose out of ARGS wherever it appears, returning (values
-;; VERBOSE? REST) so a verb can opt into it without `inventory-only` (which
-;; rejects stray args) tripping over the flag.
+;; VERBOSE? REST) so a verb can opt in without `inventory-only` (which rejects
+;; stray args) tripping over the flag.
 (define (extract-verbose args)
   (let loop ((args args) (v #f) (acc '()))
     (match args
@@ -1034,23 +1002,7 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
       (((or "-v" "--verbose") . rest) (loop rest #t acc))
       ((arg . rest) (loop rest v (cons arg acc))))))
 
-;; Pull -q/--query Q (and --query=Q) out of ARGS wherever it appears, parse it,
-;; and return (values QUERY REST) — the parsed query alist (empty when absent)
-;; and ARGS with the flag and its value removed. The custom-action fallback
-;; strips -q itself (to seed the resolve) and hands the action the remaining
-;; args, so an inventory verb owns every flag except the shared -i/-q.
-(define (extract-query args)
-  (let loop ((args args) (query '()) (acc '()))
-    (match args
-      (() (values query (reverse acc)))
-      (((or "-q" "--query")) (usage-error "missing Q after ~a" (car args)))
-      (((or "-q" "--query") q . rest) (loop rest (parse-query q) acc))
-      ((arg . rest)
-       (if (string-prefix? "--query=" arg)
-           (loop rest (parse-query (substring arg 8)) acc)
-           (loop rest query (cons arg acc)))))))
-
-;; For verbs whose only input is the inventory (tree, ops): resolve it from
+;; For verbs whose only input is the inventory (tree, ops): resolve from
 ;; -i/--inventory or $HEXOL_INVENTORY and reject any stray argument.
 (define (inventory-only cmd args)
   (call-with-values (lambda () (extract-inventory cmd args))
@@ -1061,7 +1013,7 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
       (inventory-or-default cmd inv))))
 
 ;; The prose tail of `hexol --help`; the verb synopses above it are generated
-;; from *actions* so the help can never drift from the registered set.
+;; from *actions*, so the help can't drift from the registered set.
 (define usage-footer "\
 sexp (default) and json render the whole resolved state. -o yaml targets the
 (kubernetes_resources) list (a `helm template` equivalent); -o tf targets the
@@ -1069,14 +1021,15 @@ sexp (default) and json render the whole resolved state. -o yaml targets the
 *.tf.json file); -o ansible targets the (ansible_plays) accumulator (an Ansible
 playbook, emitted as JSON). -o NAME runs a renderer the inventory registered via
 `renders-with` (e.g. -o sql / -o ledger emit that file's domain text). --path
-overrides the target. -q/--query seeds the resolve with attributes (the query
-the engine folds over), e.g. -q dc=alpha,role=web.
+overrides the target.
 
 apply runs the effect adapters an inventory registers with `applies-with`
 (e.g. tofu apply, kubectl apply), in their registered order, against one
-resolved state. --only NAME[,NAME…] runs just those; --dry-run delegates to
-each tool's native dry-run (pair it with --only). Appliers prompt via their
-own tool; there is no separate hexol confirmation.
+resolved state. --list prints that order. --only SPEC runs a subset, keeping
+order: SPEC is comma-separated NAMEs or jj-style ranges over the pipeline —
+A::B, A:: (A to end), ::B (start to B), e.g. --only kubernetes:: to resume.
+--dry-run delegates to each tool's native dry-run (pair it with --only).
+Appliers prompt via their own tool; there is no separate hexol confirmation.
 
 tree prints a stable content hash beside each op; `show HASH` resolves any
 unambiguous prefix of one to that op's kind, label, source, location(s),
@@ -1095,29 +1048,25 @@ auto (default) paints only on a TTY and honors NO_COLOR; always forces it on
 always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
 
 ;; Adapt a kernel <action> — an inventory-contributed (state args -> effects)
-;; verb — into a dispatch <verb>, so built-ins and inventory verbs are the one
-;; type and run through the one `(verb-runner v) args` path. The predicate
-;; fires on the action's own name; the runner strips -i (already known) and -q
-;; (seeds the resolve) off the post-verb args, resolves OPS once, and calls the
-;; action proc with the remainder. OPS is the inventory's loaded ops, shared
-;; from `inventory-verbs` so the runner needn't reload.
+;; verb — into a dispatch <verb>, so built-ins and inventory verbs share one
+;; type and the one `(verb-runner v) args` path. The predicate fires on the
+;; action's name; the runner strips -i off the post-verb args, resolves OPS
+;; once, and calls the proc with the rest. OPS is shared from `inventory-verbs`
+;; so the runner needn't reload.
 (define (action->verb ops a)
   (make-verb
     (action-name a)
     (cmd-is (action-name a))
     (lambda (args)
-      ;; ARGS leads with the verb itself; drop it so the action sees only its
-      ;; own flags/positionals, the way the cmd-* handlers receive `(cdr args)`.
+      ;; ARGS leads with the verb; drop it so the action sees only its own
+      ;; flags/positionals, like the cmd-* handlers' `(cdr args)`.
       (call-with-values (lambda () (extract-inventory (action-name a) (cdr args)))
         (lambda (_inv rest)
-          (call-with-values (lambda () (extract-query rest))
-            (lambda (query arest)
-              (let ((state (resolve ops query)))
-                ((action-proc a) state arest)))))))
+          ((action-proc a) (resolve ops '()) rest))))
     (or (action-synopsis a) (action-name a))))
 
 ;; The verbs INV contributes via `defines-action`, each adapted into a dispatch
-;; <verb> (see action->verb) over the ops loaded here once. Errors propagate —
+;; <verb> (see action->verb) over the ops loaded once here. Errors propagate —
 ;; a broken inventory on a real verb should fail loudly; the help path catches.
 (define (inventory-verbs inv)
   (call-with-values (lambda () (load-ops+collected current-actions inv))
@@ -1134,9 +1083,9 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
 (define (show-help inv)
   (display "hexol — resolve a hexol inventory and view it.\n\nusage:\n")
   (for-each (lambda (v) (format #t "  hexol ~a~%" (verb-synopsis v))) *verbs*)
-  ;; Inventory-contributed verbs, when an inventory is resolvable (from this
-  ;; invocation's -i/--inventory, else $HEXOL_INVENTORY). Listed under their own
-  ;; heading so they read as belonging to this inventory, not to hexol itself.
+  ;; Inventory-contributed verbs, when an inventory is resolvable (this
+  ;; invocation's -i/--inventory, else $HEXOL_INVENTORY). Under their own
+  ;; heading so they read as the inventory's, not hexol's.
   (let ((custom (inventory-verbs-safe inv)))
     (unless (null? custom)
       (format #t "~%inventory actions (~a):~%" inv)
@@ -1145,8 +1094,8 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
   (display usage-footer)
   (newline))
 
-;; The WHEN of `--color=WHEN`, validated. A bare `--color` (no value) is
-;; handled by the caller as `always`.
+;; The WHEN of `--color=WHEN`, validated. Bare `--color` is handled by the
+;; caller as `always`.
 (define (parse-color-when s)
   (cond
     ((string=? s "always") 'always)
@@ -1154,11 +1103,10 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
     ((string=? s "auto")   'auto)
     (else (usage-error "bad --color value ~s (want always|never|auto)" s))))
 
-;; Pull the global `--color`/`--color=WHEN` flag out of ARGS wherever it appears
-;; and return (values MODE REST): MODE is the color mode (or #f when absent, so
-;; the default `auto' stands), REST is ARGS with the flag removed. Global, not
-;; per-verb — it governs every view's painting — so it is stripped before
-;; dispatch picks the verb, the way nothing else slices a flag out up front.
+;; Pull the global `--color`/`--color=WHEN` flag out of ARGS wherever it appears;
+;; return (values MODE REST): MODE the color mode (or #f when absent, so default
+;; `auto' stands), REST without the flag. Global, not per-verb — it governs
+;; every view's painting — so it's stripped before dispatch picks the verb.
 (define (extract-color args)
   (let loop ((args args) (mode #f) (acc '()))
     (match args
@@ -1169,10 +1117,10 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
            (loop rest (parse-color-when (substring arg 8)) acc)
            (loop rest mode (cons arg acc)))))))
 
-;; Best-effort: the inventory this invocation will resolve (the -i/--inventory
-;; value or $HEXOL_INVENTORY), or #f. A peek, not a consume — the verb still
-;; parses -i itself; this only lets `dispatch` open the render cache once,
-;; around every verb, without threading it through each resolve site.
+;; Best-effort: the inventory this invocation will resolve (-i/--inventory or
+;; $HEXOL_INVENTORY), or #f. A peek, not a consume — the verb still parses -i
+;; itself; this just lets `dispatch` open the render cache once around every
+;; verb, without threading it through each resolve site.
 (define (peek-inventory args)
   (let loop ((args args))
     (match args
@@ -1181,10 +1129,9 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
       ((arg . rest)
        (if (string-prefix? "--inventory=" arg) (substring arg 12) (loop rest))))))
 
-;; Is this invocation a help request? `-h`/`--help` anywhere (it commonly
-;; trails an `-i FILE`, e.g. `hexol --help -i homelab.scm`), or a leading
-;; `help` verb. Kept loose on purpose: help should win over dispatch so a
-;; user can always see an inventory's actions, even alongside other flags.
+;; A help request? `-h`/`--help` anywhere (often trailing `-i FILE`, e.g.
+;; `hexol --help -i homelab.scm`), or a leading `help` verb. Loose on purpose:
+;; help wins over dispatch, so a user can always see an inventory's actions.
 (define (wants-help? args)
   (match args
     (("help" . _) #t)
@@ -1195,25 +1142,22 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
    (lambda (mode rest)
     (when mode (set-color-mode! mode))
     ;; One render cache per invocation, scoped to this inventory's content, so
-    ;; helm-template / remote-manifest shell-outs are reused across runs. #f
-    ;; (no inventory, or an unusable cache dir) disables it — results are
-    ;; identical either way.
+    ;; helm-template / remote-manifest shell-outs are reused across runs. #f (no
+    ;; inventory, or an unusable cache dir) disables it — results are identical.
     (let ((inv (peek-inventory rest)))
       (parameterize ((current-render-cache
                       (and inv (file-exists? inv) (open-render-cache inv))))
         (match rest
           (() (show-help inv) (exit 0))
-          ;; A help request — `-h`/`--help` anywhere in the args, or a leading
-          ;; `help` — shows help for INV (so `hexol --help -i FILE` and
+          ;; A help request shows help for INV (so `hexol --help -i FILE` and
           ;; `hexol -i FILE help` both list that inventory's actions, not just
           ;; the $HEXOL_INVENTORY one).
           ((? wants-help?) (show-help inv) (exit 0))
           ((subcmd . _)
-           ;; Built-ins first, then the verbs INV contributes — both are <verb>
-           ;; records run through the same `(verb-runner v) rest` path, so an
-           ;; inventory can ADD verbs but never shadow a built-in. With no
-           ;; resolvable inventory there is nothing to fall through to, so the
-           ;; unknown-subcommand usage error stands.
+           ;; Built-ins first, then INV's contributed verbs — both <verb>
+           ;; records on the same `(verb-runner v) rest` path, so an inventory
+           ;; can ADD verbs but never shadow a built-in. With no resolvable
+           ;; inventory, the unknown-subcommand usage error stands.
            (let ((v (or (find (lambda (v) ((verb-predicate v) subcmd rest)) *verbs*)
                         (and inv
                              (find (lambda (v) ((verb-predicate v) subcmd rest))
@@ -1222,15 +1166,14 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
                  ((verb-runner v) rest)
                  (usage-error "unknown subcommand: ~a" subcmd))))))))))
 
-;; Turn a raised error into one clean stderr line instead of a Guile
-;; backtrace — the common case being a typo or a mistake inside the
-;; inventory the user is editing. Most Guile errors arrive as
-;; (subr message message-args . _); we print the filled-in message.
-;; Set HEXOL_DEBUG=1 to bypass this and get the full backtrace.
+;; Turn a raised error into one clean stderr line, not a Guile backtrace — the
+;; common case being a typo or mistake in the inventory being edited. Most Guile
+;; errors arrive as (subr message message-args . _); we print the filled-in
+;; message. HEXOL_DEBUG=1 bypasses this for the full backtrace.
 (define (report-error key args)
   (match args
-    ;; The standard (scm-error) shape: (subr message message-args . _),
-    ;; where subr may be #f. Fill the ~S/~A holes in the message.
+    ;; Standard (scm-error) shape: (subr message message-args . _), subr may be
+    ;; #f. Fill the ~S/~A holes in the message.
     ((subr (? string? msg) margs . _)
      (format (current-error-port) "~a" (e-red "hexol: "))
      (when subr (format (current-error-port) "~a" (e-red (format #f "~a: " subr))))
@@ -1244,8 +1187,8 @@ always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
       (dispatch args)
       (catch #t
         (lambda () (dispatch args))
-        ;; `exit` (from die / usage-error) raises 'quit — let it through
-        ;; with its own status; everything else is an unexpected error.
+        ;; `exit` (from die/usage-error) raises 'quit — let it through with its
+        ;; own status; everything else is unexpected.
         (lambda (key . rest)
           (if (eq? key 'quit)
               (apply exit rest)

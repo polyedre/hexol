@@ -1,10 +1,9 @@
 ;;; examples/ledger.scm — a worked personal-ledger journal.
 ;;;
-;;; A consumer of (hexol ledger), the same way examples/database-schema.scm
-;;; consumes (hexol sql). Every form is an op; folding the inventory
-;;; accumulates the journal into `(ledger_journal)` (and split rules into
-;;; `(ledger_rules)`), and the trailing `(apply-splits)` expands the rules
-;;; into the transactions. Every CLI view works:
+;;; Consumes (hexol ledger), like database-schema.scm consumes (hexol sql).
+;;; Every form is an op; folding accumulates the journal into
+;;; `(ledger_journal)` (split rules into `(ledger_rules)`), and the trailing
+;;; `(apply-splits)` expands rules into transactions. Every CLI view works:
 ;;;
 ;;;   ./bin/hexol render -o ledger examples/ledger.scm   # ledger-cli text
 ;;;   ./bin/hexol render           examples/ledger.scm   # resolved state (sexp)
@@ -18,7 +17,7 @@
 (use-modules (hexol ledger)
              (srfi srfi-1))        ; any, filter-map
 
-;; Expose the ledger-cli text view as `hexol render -o ledger`.
+;; Expose ledger-cli text view as `hexol render -o ledger`.
 (renders-with "ledger" render-ledger)
 
 (hx-ops
@@ -37,10 +36,9 @@
 
   ;; ---------- split-finance rules ----------
   ;;
-  ;; Roommate "Alex" splits groceries and utilities 50/50 for all of 2024.
-  ;; Every matching expense gets a counter-posting auto-generated into
-  ;; Asset:Receivable:Alex (an IOU). Declarative intent here; `apply-splits`
-  ;; below expands it into the transactions.
+  ;; Roommate "Alex" splits groceries and utilities 50/50 all of 2024. Each
+  ;; matching expense gets a counter-posting into Asset:Receivable:Alex (an
+  ;; IOU). Declarative intent; `apply-splits` below expands it.
 
   (split-with 'alex 1/2
     #:from '(2024 1 1)
@@ -54,7 +52,7 @@
     #:tag  'shared-utility
     #:peer-account 'Asset:Receivable:Alex)
 
-  ;; A trip with two friends, three-way split, tag-driven.
+  ;; Trip with two friends: three-way split, tag-driven.
   (split-with 'jamie 1/3
     #:from '(2024 7 1) #:to '(2024 7 31)
     #:tag 'trip-2024
@@ -64,8 +62,8 @@
     #:tag 'trip-2024
     #:peer-account 'Asset:Receivable:Morgan)
 
-  ;; A custom predicate over the tx alist — anything whose description or a
-  ;; posting note mentions "team lunch" is expensed against the employer.
+  ;; Custom predicate over the tx alist — any "team lunch" in the
+  ;; description or a posting note is expensed against the employer.
   (split-with 'employer 1
     #:from '(2024 1 1) #:to '(2024 12 31)
     #:where (lambda (tx)
@@ -136,8 +134,8 @@
         (on-day 28
           (balance-assert 'Asset:Checking 8423.10)))
 
-      ;; July: a weekend trip abroad. Currency scope swaps EUR for USD,
-      ;; tagged so the 3-way split rules above apply automatically.
+      ;; July: weekend trip abroad. Currency scope swaps EUR for USD;
+      ;; tagged so the 3-way split rules above apply.
       (in-month 'july
         (on-day 12
           (in-currency 'USD
@@ -157,8 +155,8 @@
           (price '(2024 7 20) 'EUR (usd 1.09)))
 
         (on-day 25
-          ;; Jamie pays us back for their share — clears the IOU partially.
-          ;; Balancing post is the receivable, not the with-default-account.
+          ;; Jamie pays back their share — partially clears the IOU.
+          ;; Balancing post is the receivable, not with-default-account.
           (tx "Reimbursement from Jamie"
             (post 'Asset:Checking            146.80)
             (post 'Asset:Receivable:Jamie))))
@@ -176,6 +174,6 @@
           (balance-assert 'Asset:Brokerage     14200.00
             #:note "Brokerage YE statement")))))
 
-  ;; Expand the split rules into the accumulated transactions. Last, the
-  ;; way k8s examples end with (tls-all) / (compliance-all …).
+  ;; Expand split rules into the accumulated transactions. Last, like
+  ;; k8s examples end with (tls-all) / (compliance-all …).
   (apply-splits))

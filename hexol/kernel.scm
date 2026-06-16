@@ -1,13 +1,11 @@
-;;; hexol/kernel.scm — the whole engine.
+;;; hexol/kernel.scm — the engine.
 ;;;
 ;;; State is a nested alist with `attributes` at the root holding the query.
 ;;; An op is a record (kind, source, effect) where effect : state -> state.
-;;; Resolution is a left fold of apply-op over a list of ops, seeded with
-;;; the query.
+;;; Resolution is a left fold of apply-op over ops, seeded with the query.
 ;;;
-;;; This module is the kernel only. No surface macros (`merge`, `when`,
-;;; `attrs`) live here — those come in a separate module and expand to
-;;; calls to `op:merge`, `op:when`, etc.
+;;; Kernel only — surface macros (`merge`, `when`, `attrs`) live elsewhere and
+;;; expand to `op:merge`, `op:when`, etc.
 
 (define-module (hexol kernel)
   #:use-module (srfi srfi-1)
@@ -50,31 +48,25 @@
   (kind   op-kind)
   (source op-source)
   (effect op-effect)
-  ;; Optional human-friendly one-line label for debug/listing tools.
-  ;; #f means "fall back to the kind". Set at construction by ops
-  ;; that have meaningful identity (e.g. (load "path"), (resource
-  ;; "Deployment/api")). `merge` and other content-shaped ops typically
-  ;; leave it #f because their source is the better description.
+  ;; Optional one-line label for debug/listing. #f falls back to the kind.
+  ;; Set by ops with meaningful identity ((load "path"), (resource
+  ;; "Deployment/api")); content-shaped ops leave it #f since source describes
+  ;; them better.
   (label    op-label)
-  ;; Optional list of nested op records. Ops that conditionally or
-  ;; unconditionally fold sub-ops (when, case, user-defined compose
-  ;; helpers) put them here so introspection can descend past the
-  ;; closure boundary. Empty for leaf ops.
+  ;; Optional nested op records. Ops that fold sub-ops (when, case, compose
+  ;; helpers) put them here so introspection descends past the closure
+  ;; boundary. Empty for leaf ops.
   (children op-children)
-  ;; Optional (file . line) of the authored inventory form responsible for
-  ;; this op — even when the op is built deep inside a library helper
-  ;; (e.g. `(public-app ...)` -> several `resource` ops, all blamed on the
-  ;; one `public-app` call). #f when no source info is available. Captured
-  ;; from `current-author-loc`, which the body-taking surface macros bind
-  ;; to each authored form's `syntax-source` while it is evaluated.
+  ;; Optional (file . line) of the authored form responsible — even when the
+  ;; op is built deep in a library helper ((public-app ...) -> several resource
+  ;; ops, all blamed on the public-app call). #f if unknown. From
+  ;; current-author-loc.
   (loc      op-loc))
 
-;; Bound by the body-taking surface macros (inventory / when / case /
-;; with-namespace) to a (file . line) pair around evaluating each authored
-;; body form. `make-op` snapshots it, so every op — including ones built by
-;; ordinary library *functions* called from that form — inherits the line
-;; the author actually wrote. Inner forms shadow outer ones, so the most
-;; specific authored location wins.
+;; (file . line) of the authored form currently evaluating, bound by the
+;; body-taking macros (inventory/when/case/with-namespace). make-op snapshots
+;; it, so every op — including ones built by library functions called from that
+;; form — inherits the line the author wrote; inner forms shadow outer.
 (define current-author-loc (make-parameter #f))
 
 (define* (make-op kind source effect #:optional (label #f) (children '()))
@@ -85,27 +77,21 @@ introspection.  The op's source location is snapshotted from
 `current-author-loc'."
   (%make-op kind source effect label children (current-author-loc)))
 
-;; Return OP with only its human-friendly LABEL changed, preserving kind,
-;; source, effect, children, and source location. The combinator that
-;; target libraries (and surface) use to stamp a domain identity —
-;; "resource Deployment/api", "tx Rent", "table users" — onto an op built
-;; by a generic constructor (op:append / op:merge), which otherwise carries
-;; the bland "append kubernetes_resources" label. Unlike rebuilding via
-;; `make-op`, this keeps the original `op-loc` rather than re-snapshotting
-;; `current-author-loc`, so it is correct to call any time, not just
-;; immediately after construction.
+;; Stamps a domain identity ("resource Deployment/api", "tx Rent") onto an op
+;; built by a generic constructor (op:append/op:merge) that otherwise carries a
+;; bland label. Unlike make-op, keeps the original op-loc rather than
+;; re-snapshotting current-author-loc, so it is safe to call any time.
 (define (relabel op label)
   "Return OP with its LABEL replaced, preserving kind, source, effect,
 children, and source location."
   (%make-op (op-kind op) (op-source op) (op-effect op)
             label (op-children op) (op-loc op)))
 
-;; (stamp-loc form) evaluates `form` with `current-author-loc` bound to
-;; `form`'s own source location, so any ops built while it runs are blamed
-;; on the line the author wrote. The body-taking surface macros wrap each
-;; of their sub-forms in this. When `form` carries no source info (REPL,
-;; macro-generated) it is evaluated unchanged. Line numbers from
-;; `syntax-source` are 0-based; we store them 1-based to match editors.
+;; (stamp-loc form) evaluates form with current-author-loc bound to form's own
+;; source location, so ops built while it runs are blamed on the authored line.
+;; The body-taking macros wrap each sub-form in this. No source info (REPL,
+;; macro-gen) -> evaluated unchanged. syntax-source lines are 0-based; stored
+;; 1-based to match editors.
 (define-syntax stamp-loc
   (lambda (x)
     (syntax-case x ()
@@ -121,20 +107,16 @@ children, and source location."
 
 ;; ---------- content hashing ----------
 ;;
-;; A stable, content-derived hash for each op — the addressable identity
-;; `hexol tree` prints and `hexol show <hash>` resolves. It is a Merkle hash:
-;; an op's hash folds in its kind, its captured source form, its label, and
-;; the hashes of its children, so editing any op changes its own hash and
-;; its ancestors' (like a git tree) while leaving siblings untouched. The
-;; op's *effect* (an opaque closure) and its source *location* are
-;; deliberately excluded — the hash names what an op DOES structurally, not
-;; where it was written, so moving code between lines does not churn hashes.
+;; Stable content-derived hash per op — the addressable identity `hexol tree`
+;; prints and `hexol show <hash>` resolves. Merkle hash: folds in kind, source
+;; form, label, and children's hashes, so editing an op changes its own and its
+;; ancestors' hashes (like a git tree) but not siblings'. Effect (opaque
+;; closure) and location are excluded — the hash names what an op DOES, not
+;; where it was written, so moving code doesn't churn hashes.
 ;;
-;; Genuinely identical sibling subtrees (same kind/source/label/children)
-;; share a hash; that is honest — there is nothing to tell them apart — and
-;; `show` reports the ambiguity rather than guessing. The hash is FNV-1a/64
-;; (no crypto needed for addressing, no external dependency); swap
-;; `fnv1a-64` for a gcrypt digest if collision resistance is ever required.
+;; Identical sibling subtrees share a hash; that is honest, and `show` reports
+;; the ambiguity rather than guessing. FNV-1a/64 (no crypto/deps needed for
+;; addressing); swap for a gcrypt digest if collision resistance is needed.
 
 (define %fnv-offset 14695981039346656037)
 (define %fnv-prime  1099511628211)
@@ -173,20 +155,16 @@ from its kind, source form, label, and the content hashes of its children."
 
 ;; ---------- tracing ----------
 ;;
-;; `current-trace`, when bound to a mutable box (a one-element list),
-;; collects every apply-op call's (op . after-state) tuple. The trace
-;; is recorded in *fire order*, which means nested ops inside compose
-;; wrappers / when / case appear before the wrapper itself. Wrappers
-;; don't change state independently of their children, so explain-like
-;; tools typically filter the trace to leaves (ops with empty children).
+;; When bound to a mutable box, collects every apply-op call's (op .
+;; after-state) tuple in *fire order* — nested ops appear before their compose/
+;; when/case wrapper. Wrappers don't change state independently of children, so
+;; explain tools typically filter the trace to leaves (empty children).
 
 (define current-trace (make-parameter #f))
 
-;; `current-timings`, when bound to a hash table, accumulates each apply-op
-;; call's elapsed real-time (internal time units) keyed by op identity (eq?).
-;; Because a compose op's effect folds its children through apply-op, a
-;; parent's recorded time is *inclusive* of its subtree — the same shape a
-;; profiler tree shows. Unbound (the default) means zero timing overhead.
+;; When bound to a hash table, accumulates each apply-op's elapsed real-time
+;; keyed by op identity (eq?). A compose op's time is *inclusive* of its subtree
+;; (folds children through apply-op). Unbound -> zero timing overhead.
 (define current-timings (make-parameter #f))
 
 (define (apply-op op state)
@@ -213,8 +191,7 @@ under the `attributes' root key, returning the final resolved state."
         `((attributes . ,attributes))
         ops))
 
-;; Returns two values: the final state and the trace as a list of
-;; (op . after-state) pairs in fire order.
+;; Returns two values: final state and the fire-order trace.
 (define (resolve-with-trace ops attributes)
   "Like `resolve', but return two values: the final state and the trace as
 a list of (op . after-state) pairs in fire order."
@@ -231,13 +208,9 @@ final resolved state."
   (parameterize ((current-timings table))
     (resolve ops attributes)))
 
-;; Walk a nested state by a path of symbols (alist keys) and integers
-;; (list indices). Returns #f if any step is missing.
-;;
-;; A symbol step looks the key up in an alist (a map); an integer step
-;; indexes into a list. List-valued fields are stored as a plain list of
-;; their elements, so `(... rules 0 host)` reads the host of the first
-;; rule with no special-casing.
+;; Walk a nested state by a path of symbols (alist keys) and integers (list
+;; indices); #f if any step is missing. List fields are plain lists, so
+;; (... rules 0 host) reads the first rule's host with no special-casing.
 (define (path-get state path)
   "Walk STATE by PATH, a list of symbol alist-keys and integer list
 indices, returning the value found or #f if any step is missing."
@@ -275,7 +248,7 @@ subtree found where one was expected."
   (cond
     ((null? path) value)
     ((not (alist? state))
-     ;; not an alist where we expected one — overwrite the subtree.
+     ;; not an alist where one was expected — overwrite the subtree.
      (state-set '() path value))
     (else
      (let* ((key      (car path))
@@ -323,20 +296,16 @@ overrides, so the two share one algorithm."
 
 ;; ---------- deep-merge-with: per-path strategy overrides ----------
 ;;
-;; `deep-merge-with target incoming strategies` is `deep-merge` with an
-;; alist of (path . strategy) overrides. At each recursion step the
-;; current path is matched against the strategies alist; if matched,
-;; the strategy decides; otherwise the default alist-merge applies.
+;; deep-merge plus an alist of (path . strategy) overrides, matched against the
+;; current path at each step; matched -> strategy decides, else default merge.
 ;;
 ;; Strategies:
-;;   replace                — incoming wins outright (skip the recursion)
-;;   append                 — list-concat target and incoming
-;;   (replace-by-key K)     — both are lists of alists; for each incoming
-;;                            entry, replace the target entry whose K
-;;                            field matches; otherwise append.
+;;   replace            — incoming wins outright (skip recursion)
+;;   append             — list-concat target and incoming
+;;   (replace-by-key K) — lists of alists; for each incoming entry, replace the
+;;                        target entry whose K field matches, else append.
 ;;
-;; The default behavior at unmatched paths is identical to `deep-merge`,
-;; so this is a strict superset.
+;; Unmatched paths behave like deep-merge, so this is a strict superset.
 
 (define (deep-merge-with target incoming strategies)
   "Like `deep-merge', but STRATEGIES is an alist of (path . strategy)
@@ -355,7 +324,7 @@ entries matching field K).  Unmatched paths behave exactly like
                (if (list? incoming) incoming (list incoming))))
       ((and (pair? strat) (eq? (car strat) 'replace-by-key))
        (merge-by-key target incoming (cadr strat)))
-      ;; default: same as deep-merge, but recurse with strategy table.
+      ;; default: deep-merge, recursing with the strategy table.
       ((not (alist? incoming)) incoming)
       ((not (alist? target))   incoming)
       (else
@@ -370,8 +339,8 @@ entries matching field K).  Unmatched paths behave exactly like
              incoming)))))
 
 (define (merge-by-key target incoming key)
-  ;; target and incoming are lists of alists. For each incoming entry,
-  ;; replace the target entry with a matching `key` value, or append.
+  ;; lists of alists; each incoming entry replaces the target entry with a
+  ;; matching `key` value, or is appended.
   (fold (lambda (new acc)
           (let ((k-val (assq-ref new key)))
             (if (any (lambda (rec) (equal? (assq-ref rec key) k-val)) acc)
@@ -440,7 +409,6 @@ the state, leaving a missing PATH unchanged.  SOURCE is the authored form."
   "Return an op that folds BODY (a list of ops) into the state only when
 PRED, a (state -> bool) procedure, holds.  SOURCE is the authored form;
 BODY is exposed as the op's children for introspection."
-  ;; body is a list of ops; pred is (state -> bool).
   (make-op 'when source
            (lambda (state)
              (if (pred state)
@@ -454,8 +422,8 @@ BODY is exposed as the op's children for introspection."
 op-list of the first matching arm in ARMS.  Each arm is (vals . op-list)
 where `vals' is the symbol `else' or a list of literals matched with eqv?.
 SOURCE is the authored form."
-  ;; arms is a list of (vals . op-list). `vals` is either the symbol 'else
-  ;; or a list of literals matched with eqv?. First matching arm wins.
+  ;; arms: (vals . op-list); vals is 'else or a literal list matched eqv?.
+  ;; First matching arm wins.
   (make-op 'case source
            (lambda (state)
              (let ((v (thunk state)))
@@ -467,15 +435,14 @@ SOURCE is the authored form."
                     (fold (lambda (op s) (apply-op op s)) state (cdr (car arms))))
                    (else (loop (cdr arms)))))))
            #f
-           ;; Flatten all arm bodies as children. Loses arm-association
-           ;; but exposes the inner ops to introspection tools.
+           ;; Flatten arm bodies as children — loses arm-association but
+           ;; exposes inner ops to introspection.
            (concatenate (map cdr arms))))
 
-;; Bundle a list of ops into ONE op whose effect folds them in order, and
-;; whose children are those ops — so introspection (tree/explain) descends
-;; through it. This is the combinator every target library leans on to make
-;; a builder (an `app`, an `aws-rds`, a `fleet`) look like one operation
-;; while being a fold of smaller ops underneath. Domain-agnostic, hence here.
+;; Bundle ops into ONE op whose effect folds them in order and whose children
+;; are those ops, so introspection descends through it. The combinator every
+;; target library uses to make a builder (app, aws-rds, fleet) look like one
+;; operation. Domain-agnostic, hence here.
 (define (compose-ops kind source ops)
   "Bundle OPS into a single op of KIND whose effect folds them in order and
 whose children are OPS, so introspection descends through it.  This is the
@@ -486,13 +453,11 @@ SOURCE is the authored form."
            #f
            ops))
 
-;; Build-time *scope*: bind a dynamic PARAM to VAL while the body's ops are
-;; *constructed* (so the value bakes into each op), then bundle them into one
-;; composing op of KIND whose label is LABEL-PREFIX followed by VAL. Each body
-;; form is `stamp-loc`'d so the most specific authored line wins. This is the
-;; combinator behind k8s `with-namespace`, sql `with-schema`, and ledger's
-;; `in-year` / `in-currency` / … — same shape, one definition. It is
-;; `compose-ops` plus a `parameterize` plus a value-stamped label.
+;; Build-time scope: bind PARAM to VAL while the body's ops are *constructed*
+;; (baking the value into each op), then bundle them into a composing op of KIND
+;; labeled LABEL-PREFIX+VAL. Each body form is stamp-loc'd. The combinator
+;; behind k8s with-namespace, sql with-schema, ledger in-year/in-currency — i.e.
+;; compose-ops + parameterize + value-stamped label.
 (define-syntax scope-ops
   (syntax-rules ()
     ((_ kind (param val) label-prefix body ...)
@@ -504,13 +469,11 @@ SOURCE is the authored form."
                 (string-append label-prefix (format #f "~a" v))
                 ops)))))
 
-;; Map a body over a keyed table, isolating each element. `table` is an
-;; alist `((key . seed) …)`; for each entry we run a FRESH `resolve` of
-;; `body` (a list of ops) seeded with that entry's attributes, and stash
-;; the resulting sub-state under `(base… key)`. So a list/mapping of seeds
-;; becomes a mapping of resolved sub-states — the combinator behind
-;; enumerations like the region fleet. `body` is exposed as children so
-;; introspection descends through it.
+;; Map a body over a keyed table, isolating each element. table is ((key .
+;; seed) …); each entry runs a FRESH resolve of body seeded with that entry's
+;; attributes, stashed under (base… key). A mapping of seeds becomes a mapping
+;; of resolved sub-states — the combinator behind enumerations like the region
+;; fleet. body is exposed as children.
 (define (for-each-into base table body)
   "Return an op that maps BODY (a list of ops) over TABLE, an alist of
 (key . seed).  For each entry it runs a fresh `resolve' of BODY seeded with
@@ -531,17 +494,14 @@ children for introspection."
 
 ;; ---------- registration collectors ----------
 ;;
-;; The three optional per-file registries below — renderers, appliers, and
-;; actions — share ONE shape, named here once so each is an instance rather
-;; than a reimplementation. A *collector* is a parameter that is either #f
-;; (inert — the default, so registration forms vanish wherever nothing is
-;; collecting) or bound to a one-element box (a mutable list) into which
-;; registrations accumulate in reverse. `collect!' pushes an entry onto the
-;; bound box (a harmless no-op when the parameter is #f); `collect-from' binds
-;; a fresh box around a thunk and returns two values — the thunk's result and
-;; the entries in registration order. `renders-with' / `applies-with' /
-;; `defines-action' are each just a `collect!' onto their own collector, and
-;; the CLI reads each back with one `collect-from'.
+;; The three optional per-file registries below (renderers, appliers, actions)
+;; share ONE shape, named once so each is an instance. A *collector* is a
+;; parameter, either #f (inert default — registration forms vanish when nothing
+;; collects) or bound to a box into which registrations accumulate in reverse.
+;; collect! pushes (no-op when #f); collect-from binds a fresh box around a
+;; thunk and returns two values (result, entries in registration order).
+;; renders-with/applies-with/defines-action each collect! onto their own
+;; collector; the CLI reads each back with one collect-from.
 
 (define (make-collector)
   "Return a fresh collector: a parameter holding #f (inert) until bound to a
@@ -563,12 +523,10 @@ order."
     (let ((result (parameterize ((collector box)) (thunk))))
       (values result (reverse (car box))))))
 
-;; What each `collect!' stores: a named record rather than a positional tuple,
-;; for the same reason an op is a record and not a bare closure — the shape
-;; stops being load-bearing-by-position and the consumer reads named fields.
-;; A renderer carries a (state -> text) proc; an applier a (state dry? ->
-;; effects) proc (run in registration order); an action a (state args ->
-;; effects) proc plus a one-line SYNOPSIS for --help.
+;; What each collect! stores: a named record, not a positional tuple, so the
+;; consumer reads named fields. A renderer carries a (state -> text) proc; an
+;; applier a (state dry? -> effects) proc; an action a (state args -> effects)
+;; proc plus a one-line SYNOPSIS for --help.
 (define-record-type <renderer>
   (make-renderer name proc)
   renderer?
@@ -590,15 +548,12 @@ order."
 
 ;; ---------- optional per-file render adapters ----------
 ;;
-;; The resolved state IS the output; the builtin formats (sexp / json /
-;; yaml) render it generically. A target library that also wants a domain
-;; text view (SQL DDL, ledger-cli text) provides a (state -> writes text)
-;; procedure, and the *inventory file* registers it under a name with
-;; `renders-with`. The CLI binds `current-renderers` to a collector box
-;; around the load and exposes each registration as `hexol render -o NAME`.
-;; Outside that (e.g. a bare `(load-inventory-file …)`), the parameter is
-;; #f and `renders-with` is a harmless no-op — so the ops contract is
-;; unchanged and `op:load` / introspection keep seeing a plain list of ops.
+;; The resolved state IS the output; builtin formats (sexp/json/yaml) render it
+;; generically. A library wanting a domain text view (SQL DDL, ledger-cli)
+;; provides a (state -> writes text) proc, which the inventory registers by name
+;; with renders-with; the CLI binds current-renderers around the load and
+;; exposes each as `hexol render -o NAME`. Outside that the parameter is #f and
+;; renders-with is a no-op, so the ops contract is unchanged.
 
 (define current-renderers (make-collector))
 
@@ -610,19 +565,14 @@ render -o NAME`.  A no-op when no collector is bound."
 
 ;; ---------- optional per-file apply adapters (effects) ----------
 ;;
-;; The mirror of `renders-with`, but for *effects* rather than text. Where a
-;; renderer is a (state -> writes text) view, an applier is a (state dry? ->
-;; performs effects) procedure: it reads its slice of the resolved state and
-;; pushes it to the world (a `tofu apply`, a `kubectl apply`). The *inventory*
-;; registers each one under a NAME with `applies-with`, and `hexol apply` runs
-;; them in *registration order* — the order the `applies-with` calls appear in
-;; the file — against a single `resolve`. An explicit ORDER may be passed to
-;; override that placement. Selecting a subset (`--only NAME`) is just a filter
-;; on the registered set (order preserved); `--dry-run` is threaded through as
-;; the applier's second argument so each delegates to its tool's native
-;; dry-run. As with `renders-with`, the collector parameter is #f outside
-;; `apply`, so `applies-with` is a harmless no-op for render/tree/ops and the
-;; ops contract is unchanged.
+;; The mirror of renders-with, but for *effects*. An applier is a (state dry? ->
+;; performs effects) proc: it reads its slice of resolved state and pushes it to
+;; the world (tofu apply, kubectl apply). The inventory registers each by NAME
+;; with applies-with; `hexol apply` runs them in *registration order* against a
+;; single resolve. --only NAME filters the set (order preserved); --dry-run is
+;; threaded as the applier's second arg, delegating to the tool's native
+;; dry-run. The parameter is #f outside apply, so applies-with is a no-op
+;; elsewhere.
 
 (define current-appliers (make-collector))
 
@@ -634,21 +584,16 @@ no collector is bound."
 
 ;; ---------- optional per-file CLI verbs (actions) ----------
 ;;
-;; The third collector, alongside `renders-with` and `applies-with`. Where a
-;; renderer is a state view and an applier is a step in the `hexol apply`
-;; pipeline, an *action* is a standalone CLI verb the inventory contributes —
-;; `hexol destroy`, `hexol diff`, whatever the inventory wants. The CLI tries
-;; its built-in verbs first (so an inventory can never shadow `render` /
-;; `secret`); only when none match does it load the inventory collecting these
-;; and look for a matching custom verb.
+;; The third collector. An *action* is a standalone CLI verb the inventory
+;; contributes (hexol destroy, hexol diff). The CLI tries built-in verbs first
+;; (so an inventory can't shadow render/secret); only on no match does it load
+;; the inventory collecting these and look for a custom verb.
 ;;
-;; An action is a (state args -> performs effects) procedure: STATE is the
-;; inventory resolved once by the CLI, ARGS the post-verb argument list with
-;; `-i'/`-q' already stripped, so the action owns its own flags (a `--dry-run'
-;; is the action's to interpret — by convention spelled like `apply's). SYNOPSIS
-;; is the one-line usage `hexol --help' shows. As with the other two collectors,
-;; the parameter is #f outside the CLI's action-discovery load, so
-;; `defines-action' is a harmless no-op for render/apply/tree/ops.
+;; An action is a (state args -> performs effects) proc: STATE is resolved once
+;; by the CLI, ARGS the post-verb args with -i/-q stripped, so the action owns
+;; its own flags (--dry-run is the action's to interpret). SYNOPSIS is the
+;; one-line `hexol --help' usage. The parameter is #f outside action-discovery,
+;; so defines-action is a no-op elsewhere.
 
 (define current-actions (make-collector))
 
@@ -666,16 +611,11 @@ the (hexol surface) module (falling back to (hexol kernel)), and return the
 value of the last form, which must be a list of ops.  Earlier forms may be
 `define's of helper procedures.  Source positions are attached so ops can
 be blamed on the authored line."
-  ;; Reads every top-level form in `path`, evaluates them in order, and
-  ;; returns the value of the last (which must be a list of ops). Earlier
-  ;; forms can be `define`s — useful for declaring method procedures
-  ;; that build resources, then calling them inside the inventory.
   (let* ((module (or (resolve-module '(hexol surface) #:ensure #f)
                      (resolve-module '(hexol kernel))))
          (port   (open-input-file path)))
-    ;; Attach (filename line column) source-properties to every form we
-    ;; read, so the body-taking macros' `stamp-loc` can recover each
-    ;; authored form's `syntax-source` and blame ops on the right line.
+    ;; Attach source-properties to every form read, so stamp-loc can recover
+    ;; each authored form's syntax-source and blame ops on the right line.
     (set-port-filename! port path)
     (read-enable 'positions)
     (let loop ((last #f) (seen-any? #f))

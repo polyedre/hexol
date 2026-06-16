@@ -1,8 +1,8 @@
 ;;; cmdb/libraries/v1.scm — version 1 of the CMDB op library.
 ;;;
-;;; Library versions are addressable from facts via (bump-lib "<sha>").
-;;; For the POC, <sha> is a short tag like "v1" that maps to module
-;;; (cmdb libraries v<sha>) at file cmdb/libraries/<sha>.scm.
+;;; Library versions are selected from facts via (bump-lib "<sha>"). For
+;;; the POC <sha> is a short tag like "v1" -> module (cmdb libraries v1)
+;;; at cmdb/libraries/v1.scm.
 
 (define-module (cmdb libraries v1)
   #:use-module (hexol kernel)

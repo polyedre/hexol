@@ -1,13 +1,11 @@
 ;;; cmdb/json.scm — JSON adapter for CMDB state shapes.
 ;;;
-;;; Delegates to guile-json. guile-json renders Scheme lists as JSON
-;;; objects (treating them as alists) and Scheme vectors as JSON arrays.
-;;; Our state stores arrays as plain lists (e.g. (kubernetes_resources
-;;; <r1> <r2>)), so we preprocess: any list that isn't a list of
-;;; (symbol . X) entries gets converted to a vector first.
+;;; Delegates to guile-json: it renders lists as JSON objects (alists)
+;;; and vectors as arrays. Our state holds arrays as plain lists (e.g.
+;;; (kubernetes_resources <r1> <r2>)), so we preprocess: any list whose
+;;; entries aren't all (symbol . X) becomes a vector first.
 ;;;
-;;; Empty list `()` is rendered as `{}` (typical for empty alists in our
-;;; state); to force an empty array, pass `#()`.
+;;; `()` renders as `{}` (empty alist); for an empty array pass `#()`.
 
 (define-module (cmdb json)
   #:use-module (json)
@@ -15,9 +13,8 @@
   #:export (sexp->json-string state->json-ready))
 
 (define (object-shape? obj)
-  ;; An object is a non-empty list whose entries are all (symbol . X)
-  ;; with distinct keys. The unique-keys check disambiguates from arrays
-  ;; that happen to have symbol-headed elements (e.g. a list of facts
+  ;; Non-empty list of (symbol . X) with distinct keys. Unique-keys check
+  ;; disambiguates from arrays of symbol-headed elements (e.g. a fact list
   ;; `((merge ...) (merge ...))` is an array, not an object).
   (and (pair? obj)
        (list? obj)
@@ -31,21 +28,20 @@
     ((object-shape? obj)
      (map (lambda (e) (cons (car e) (state->json-ready (cdr e)))) obj))
     ((and (pair? obj) (not (list? obj)) (symbol? (car obj)))
-     ;; standalone dotted pair (k . v) -> one-entry object
+     ;; dotted pair (k . v) -> one-entry object
      (list (cons (car obj) (state->json-ready (cdr obj)))))
     ((and (pair? obj) (not (list? obj)))
-     ;; dotted pair without a symbol key — best-effort 2-element array
+     ;; non-symbol-keyed dotted pair -> 2-element array
      (vector (state->json-ready (car obj))
              (state->json-ready (cdr obj))))
     ((list? obj)
      (list->vector (map state->json-ready obj)))
     (else obj)))
 
-;; guile-json doesn't escape ASCII control characters in strings; raw
-;; bytes (ANSI escapes, NULs, etc.) pass through verbatim and produce
-;; invalid JSON. We post-process the output to encode any control byte
-;; as a \uXXXX sequence. Control bytes only legitimately appear inside
-;; string literals in our outputs, so a flat byte-scan is sufficient.
+;; guile-json doesn't escape ASCII control chars; raw bytes (ANSI, NUL)
+;; pass through and make invalid JSON. Post-process to \uXXXX-encode any
+;; control byte. They only appear inside string literals here, so a flat
+;; byte-scan suffices.
 (define (escape-control-chars s)
   (let loop ((chars (string->list s)) (acc '()))
     (cond

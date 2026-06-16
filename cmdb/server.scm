@@ -7,10 +7,9 @@
 ;;;   GET  /facts              -> sexp list of all facts
 ;;;   POST /facts              -> body is one fact sexp; appended + applied
 ;;;
-;;; Bodies in are application/scheme (s-expressions). Bodies out default
-;;; to application/scheme; pass `Accept: application/json` or `?fmt=json`
-;;; to get JSON instead. The server is single-threaded; the underlying
-;;; CMDB store is not safe for concurrent writes.
+;;; Bodies in/out are application/scheme (s-expressions); pass
+;;; `Accept: application/json` or `?fmt=json` for JSON out. Server is
+;;; single-threaded — the CMDB store isn't safe for concurrent writes.
 
 (define-module (cmdb server)
   #:use-module (cmdb store)
@@ -35,10 +34,8 @@
 
 (define (text-bv s) (string->utf8 s))
 
-;; Picks output format from request:
-;;   ?fmt=json query param OR Accept: application/json header  -> 'json
-;;   otherwise -> 'sexp
-;; Query param wins over Accept so the dot-suffix style is curl-friendly.
+;; Output format from request: ?fmt=json or Accept: application/json
+;; -> 'json, else 'sexp. ?fmt wins over Accept (curl-friendly).
 (define (uri-query-pairs uri)
   (let ((q (uri-query uri)))
     (if (or (not q) (string=? q ""))
@@ -61,8 +58,8 @@
       ((and fmt (string=? fmt "sexp")) 'sexp)
       ((and accept-hdr
             (any (lambda (a)
-                   ;; guile parses "application/json" into the symbol
-                   ;; `application/json`; the entry is a one-element list.
+                   ;; guile parses "application/json" to the symbol
+                   ;; `application/json`; entry is a one-element list.
                    (and (pair? a) (eq? (car a) 'application/json)))
                  accept-hdr))
        'json)
@@ -103,8 +100,7 @@
       (map string->symbol (string-split s #\.))))
 
 (define (split-path uri-path)
-  ;; uri-path is like "/state/regions.alpha5" -> ("state" "regions.alpha5").
-  ;; Empty segments are dropped.
+  ;; "/state/regions.alpha5" -> ("state" "regions.alpha5"); drop empties.
   (filter (lambda (s) (not (string=? s "")))
           (string-split uri-path #\/)))
 

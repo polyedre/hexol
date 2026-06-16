@@ -1,36 +1,40 @@
-;;; hexol/k8s.scm — the Kubernetes library.
+;;; hexol/k8s.scm — Kubernetes library.
 ;;;
-;;; A `(hexol k8s)` submodule: schema-driven record-body constructors (built
-;;; on `define-construct`) that each return a `resource` op (so they drop
-;;; straight into an `(inventory ...)`), plus the composites and cross-cutting
-;;; transforms.
+;;; A `(hexol k8s)` submodule: schema-driven record-body constructors (on
+;;; `define-construct`) each returning a `resource` op, plus composites and
+;;; cross-cutting transforms.
 ;;;
 ;;; Resource sugar (each returns one op) — positional name, then `(key value)`
-;;; entries; values are evaluated Scheme, the schema fills defaults / validates
-;;; / reports unknown keys with a suggestion:
+;;; entries; values are evaluated Scheme:
 ;;;   (deployment "api" (image "…") (port 8080) …)   -> Deployment
 ;;;   (daemonset  "node" (image "…") …)              -> DaemonSet
 ;;;   (service    "api" (port 80) …)                 -> Service
 ;;;   (ingress    "api" (port 80) …)                 -> Ingress
 ;;;   (configmap  "cfg" (data (K "v") …))            -> ConfigMap
 ;;;   (secret     "sec" (data (K "v") …))            -> Secret
+;;;   (storage-class "fast" (provisioner "…") …)     -> StorageClass
+;;;   (persistent-volume-claim "data" (size "5Gi"))  -> PersistentVolumeClaim
+;;;   (gateway-class "cilium" (controller-name "…")) -> GatewayClass
+;;;   (gateway "edge" (gateway-class-name "…") (listener …)) -> Gateway
+;;;   (http-route "app" (parent-name "edge") (backend-service "…") …) -> HTTPRoute
 ;;;   (custom-resource (api "…") (kind "…") (name "…") (spec …)) -> any CRD
 ;;;   (service-monitor "api" …)                      -> ServiceMonitor
 ;;;
-;;; Volume / env source refs (small helpers, evaluate-default-safe — they do
-;;; NOT clash with the `secret`/`configmap` resource constructors):
+;;; Volume / env source refs (do NOT clash with the secret/configmap
+;;; constructors):
 ;;;   (cm  "name")               configMap source
 ;;;   (sec "name")               secret source
 ;;;   (pvc "name")               PersistentVolumeClaim source
-;;;   (mount <source> "/path")   a volume mount: pair a source with a path
+;;;   (host-path "/p")           hostPath source
+;;;   (mount <source> "/path" [#:read-only #t])   volume mount: source + path
 ;;;     (env-from (cm "api-config"))            ; whole-source env injection
 ;;;     (volumes  (mount (sec "tls") "/etc/tls")); mounted volume
 ;;;
-;;; Composites (a compose-ops bundle):  (app …) (public-app …) (worker …)
+;;; Composites:  (app …) (public-app …)
 ;;; Transforms / policy:  (tls-all) (checksum-config) (compliance-all registry)
 ;;;
-;;; Selector convention: every workload/service keys on (app . <name>); layer
-;;; org-wide labels on top with surface's `label-all`.
+;;; Selector convention: workloads/services key on (app . <name>); layer
+;;; org-wide labels via surface's `label-all`.
 
 (define-module (hexol k8s)
   #:use-module (hexol kernel)
@@ -47,7 +51,7 @@
   #:re-export (resource transform-resources annotate-all label-all
                compose-ops
                which-cmd
-               ;; render cache (so an inventory's own shell-out ops can use it)
+               ;; render cache (for inventory shell-out ops)
                current-render-cache)
   #:export (;; namespace scope
             with-namespace current-k8s-namespace namespace
@@ -55,16 +59,18 @@
             res
             ;; resource sugar
             deployment daemonset service ingress configmap secret
+            storage-class persistent-volume-claim
+            gateway-class gateway listener http-route
             custom-resource service-monitor
             ;; volume / env source refs
-            cm sec pvc mount
+            cm sec pvc mount host-path
             ;; RBAC
             service-account role role-binding rule
             cluster-role cluster-role-binding cluster-rbac
-            ;; external manifests (render-time splice into kubernetes_resources)
+            ;; external manifests (render-time splice)
             json-manifests cached-json-manifests remote-manifest
             ;; composites
-            app public-app worker
+            app public-app
             ;; derive a Service from a workload
             expose service-from-workload
             ;; cross-cutting transforms / policy
@@ -90,8 +96,8 @@
   #:fields ((labels #:map))
   #:build (%namespace name #:labels labels))
 
-;; Build-time scope over the kernel's `scope-ops`. Prepends the Namespace
-;; resource to the bundle so scoping a body into a namespace also creates it.
+;; Build-time scope over `scope-ops`; prepends the Namespace resource so
+;; scoping a body also creates the namespace.
 (define-syntax-rule (with-namespace ns body ...)
   (scope-ops 'with-namespace (current-k8s-namespace ns) "namespace "
     (%namespace ns) body ...))
@@ -145,8 +151,17 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                  (else (error "unknown env-from kind:" kind)))))
        refs))
 
-(define (volume-name kind res-name)
-  (string-append (symbol->string kind) "-" res-name))
+;; A DNS-safe volume name: alnum kept, everything else → "-", ends trimmed.
+;; Lets a hostPath ("/lib/modules" → "lib-modules") name its own volume.
+(define (sanitize-name s)
+  (string-trim-both
+   (string-map (lambda (c) (if (or (char-alphabetic? c) (char-numeric? c)) c #\-)) s)
+   #\-))
+
+(define (volume-name kind ident)
+  (if (eq? kind 'hostPath)
+      (string-append "host-" (sanitize-name ident))
+      (string-append (symbol->string kind) "-" ident)))
 
 (define (volume-entries refs)
   (map (lambda (ref)
@@ -157,35 +172,48 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                   `((name . ,(volume-name kind n)) (secret (secretName . ,n))))
                  ((eq? kind 'pvc)
                   `((name . ,(volume-name kind n)) (persistentVolumeClaim (claimName . ,n))))
+                 ((eq? kind 'hostPath)
+                  `((name . ,(volume-name kind n)) (hostPath (path . ,n))))
                  (else (error "unknown volume kind:" kind)))))
        refs))
 
+;; A mount tuple is (kind ident mountPath [read-only?]); the optional 4th
+;; element marks the mount read-only.
 (define (volumeMount-entries refs)
   (map (lambda (ref)
-         (let ((kind (car ref)) (n (cadr ref)) (path (caddr ref)))
-           `((name . ,(volume-name kind n)) (mountPath . ,path))))
+         (let ((kind (car ref)) (n (cadr ref)) (path (caddr ref))
+               (ro (and (> (length ref) 3) (list-ref ref 3))))
+           `((name . ,(volume-name kind n)) (mountPath . ,path)
+             ,@(if ro '((readOnly . #t)) '()))))
        refs))
 
 (define* (container-alist #:key name image (port 0) (args '()) (command '())
                           (env '()) (env-from '()) (volumes '()) (resources '())
-                          (privileged #f))
-  (let ((resources (normalize-resources resources)))
+                          (privileged #f) (capabilities '()) (host-port #f) (protocol #f))
+  (let ((resources (normalize-resources resources))
+        (sec-ctx   (append (if privileged '((privileged . #t)) '())
+                           (if (pair? capabilities)
+                               `((capabilities (add ,@capabilities))) '()))))
     `((name . ,name)
       (image . ,image)
       ,@(if (null? command) '() `((command ,@command)))
       ,@(if (null? args)    '() `((args ,@args)))
-      ,@(if (and (number? port) (> port 0)) `((ports ((containerPort . ,port)))) '())
+      ,@(if (and (number? port) (> port 0))
+            `((ports ((containerPort . ,port)
+                      ,@(if host-port `((hostPort . ,host-port)) '())
+                      ,@(if protocol  `((protocol . ,protocol)) '()))))
+            '())
       ,@(if (null? env)      '() `((env ,@env)))
       ,@(if (null? env-from) '() `((envFrom ,@(envFrom-entries env-from))))
       ,@(if (null? volumes)  '() `((volumeMounts ,@(volumeMount-entries volumes))))
       ,@(if (null? resources) '() `((resources ,@resources)))
-      ,@(if privileged `((securityContext (privileged . #t))) '()))))
+      ,@(if (null? sec-ctx) '() `((securityContext ,@sec-ctx))))))
 
 (define* (workload-alist #:key kind name image (port 0) (replicas #f)
                          (namespace (current-k8s-namespace)) (env '()) (env-from '()) (volumes '())
                          (resources '()) (privileged #f) (args '()) (command '())
                          (service-account #f) (host-network #f) (host-pid #f)
-                         (labels '()))
+                         (labels '()) (capabilities '()) (host-port #f) (protocol #f))
   `((apiVersion . "apps/v1")
     (kind . ,kind)
     (metadata ,@(k8s-metadata name namespace labels))
@@ -199,23 +227,25 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                   (containers ,(container-alist #:name name #:image image #:port port
                                                 #:args args #:command command
                                                 #:env env #:env-from env-from #:volumes volumes
-                                                #:resources resources #:privileged privileged))
+                                                #:resources resources #:privileged privileged
+                                                #:capabilities capabilities
+                                                #:host-port host-port #:protocol protocol))
                   ,@(if (null? volumes) '() `((volumes ,@(volume-entries volumes)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; volume / env source refs
 ;; ---------------------------------------------------------------------------
 ;;
-;; Evaluate-default-safe builders for the workload `env-from` / `volumes`
-;; surface. `cm`/`sec`/`pvc` name a source; `mount` pairs a source with a
-;; mount path. They produce the internal tuples `workload-alist` consumes —
-;; `(configMap name)` / `(secret name)` / `(pvc name)` and, with a path,
-;; `(kind name path)`.
+;; Builders for the workload env-from/volumes surface. `cm`/`sec`/`pvc` name a
+;; source; `mount` adds a path. Produce the tuples `workload-alist` consumes:
+;; `(kind name)` and `(kind name path)`.
 
 (define (cm name)  (list 'configMap name))
 (define (sec name) (list 'secret name))
 (define (pvc name) (list 'pvc name))
-(define (mount source path) (append source (list path)))
+(define (host-path path) (list 'hostPath path))
+(define* (mount source path #:key (read-only #f))
+  (append source (list path read-only)))
 
 ;; ---------------------------------------------------------------------------
 ;; resource sugar
@@ -246,12 +276,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 (define* (%daemonset #:key name image (port 0) (namespace (current-k8s-namespace))
                      (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
                      (args '()) (command '()) (service-account #f)
-                     (host-network #f) (host-pid #f) (labels '()))
+                     (host-network #f) (host-pid #f) (labels '())
+                     (capabilities '()) (host-port #f) (protocol #f))
   (resource (workload-alist #:kind "DaemonSet" #:name name #:image image #:port port
                             #:replicas #f #:namespace namespace #:env env #:env-from env-from
                             #:volumes volumes #:resources resources #:privileged privileged
                             #:args args #:command command #:service-account service-account
-                            #:host-network host-network #:host-pid host-pid #:labels labels)))
+                            #:host-network host-network #:host-pid host-pid #:labels labels
+                            #:capabilities capabilities #:host-port host-port #:protocol protocol)))
 
 (define-construct daemonset
   #:head name
@@ -260,12 +292,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
             (env #:list) (env-from #:list) (volumes #:list)
             (resources #:default '()) (privileged #:flag)
             (args #:list) (command #:list) (service-account #:default #f)
-            (host-network #:flag) (host-pid #:flag) (labels #:map))
+            (host-network #:flag) (host-pid #:flag) (labels #:map)
+            (capabilities #:list) (host-port #:default #f) (protocol #:default #f))
   #:build (%daemonset #:name name #:image image #:port port #:namespace namespace
                       #:env env #:env-from env-from #:volumes volumes #:resources resources
                       #:privileged privileged #:args args #:command command
                       #:service-account service-account #:host-network host-network
-                      #:host-pid host-pid #:labels labels))
+                      #:host-pid host-pid #:labels labels #:capabilities capabilities
+                      #:host-port host-port #:protocol protocol))
 
 (define* (%service #:key name port (target-port port) (port-name "http")
                    (namespace (current-k8s-namespace)) (type #f) (selector-name #f) (labels '()))
@@ -317,19 +351,70 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
   #:fields ((data #:map) (namespace #:default (current-k8s-namespace)) (labels #:map))
   #:build (%configmap #:name name #:data data #:namespace namespace #:labels labels))
 
-(define* (%secret #:key name data (namespace (current-k8s-namespace)) (type "Opaque") (labels '()))
+(define* (%secret #:key name (data '()) (string-data '())
+                  (namespace (current-k8s-namespace)) (type "Opaque") (labels '()))
   (resource
     `((apiVersion . "v1")
       (kind . "Secret")
       (metadata ,@(k8s-metadata name namespace labels))
       (type . ,type)
-      (data ,@data))))
+      ,@(if (null? data)        '() `((data ,@data)))
+      ,@(if (null? string-data) '() `((stringData ,@string-data))))))
 
 (define-construct secret
   #:head name
-  #:fields ((data #:map) (namespace #:default (current-k8s-namespace))
+  #:fields ((data #:map) (string-data #:map) (namespace #:default (current-k8s-namespace))
             (type #:default "Opaque") (labels #:map))
-  #:build (%secret #:name name #:data data #:namespace namespace #:type type #:labels labels))
+  #:build (%secret #:name name #:data data #:string-data string-data
+                   #:namespace namespace #:type type #:labels labels))
+
+;; ---------------------------------------------------------------------------
+;; storage
+;; ---------------------------------------------------------------------------
+
+(define* (%storage-class #:key name provisioner (default #f) (volume-binding-mode #f)
+                         (reclaim-policy #f) (allow-volume-expansion #f)
+                         (parameters '()) (labels '()))
+  (resource
+    `((apiVersion . "storage.k8s.io/v1")
+      (kind . "StorageClass")
+      (metadata ,@(k8s-metadata name #f labels)   ; cluster-scoped: no namespace
+                ,@(if default
+                      '((annotations (storageclass.kubernetes.io/is-default-class . "true")))
+                      '()))
+      (provisioner . ,provisioner)
+      ,@(if volume-binding-mode `((volumeBindingMode . ,volume-binding-mode)) '())
+      ,@(if allow-volume-expansion '((allowVolumeExpansion . #t)) '())
+      ,@(if reclaim-policy `((reclaimPolicy . ,reclaim-policy)) '())
+      ,@(if (null? parameters) '() `((parameters ,@parameters))))))
+
+(define-construct storage-class
+  #:head name
+  #:fields ((provisioner #:required) (default #:flag) (volume-binding-mode #:default #f)
+            (reclaim-policy #:default #f) (allow-volume-expansion #:flag)
+            (parameters #:map) (labels #:map))
+  #:build (%storage-class #:name name #:provisioner provisioner #:default default
+                          #:volume-binding-mode volume-binding-mode #:reclaim-policy reclaim-policy
+                          #:allow-volume-expansion allow-volume-expansion
+                          #:parameters parameters #:labels labels))
+
+(define* (%persistent-volume-claim #:key name size (namespace (current-k8s-namespace))
+                                   (access-mode "ReadWriteOnce") (storage-class #f) (labels '()))
+  (resource
+    `((apiVersion . "v1")
+      (kind . "PersistentVolumeClaim")
+      (metadata ,@(k8s-metadata name namespace labels))
+      (spec (accessModes ,access-mode)
+            ,@(if storage-class `((storageClassName . ,storage-class)) '())
+            (resources (requests (storage . ,size)))))))
+
+(define-construct persistent-volume-claim
+  #:head name
+  #:fields ((size #:required) (namespace #:default (current-k8s-namespace))
+            (access-mode #:default "ReadWriteOnce") (storage-class #:default #f) (labels #:map))
+  #:build (%persistent-volume-claim #:name name #:size size #:namespace namespace
+                                    #:access-mode access-mode #:storage-class storage-class
+                                    #:labels labels))
 
 (define* (%custom-resource #:key api kind name (namespace (current-k8s-namespace)) (spec '()) (labels '()))
   (resource
@@ -342,7 +427,7 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
   #:head name
   #:fields ((api #:required) (kind #:required)
             (namespace #:default (current-k8s-namespace))
-            (spec #:default '()) (labels #:map))   ; spec: a raw alist (escape hatch)
+            (spec #:default '()) (labels #:map))   ; spec: raw alist escape hatch
   #:build (%custom-resource #:api api #:kind kind #:name name
                             #:namespace namespace #:spec spec #:labels labels))
 
@@ -362,10 +447,79 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                             #:namespace namespace #:labels labels))
 
 ;; ---------------------------------------------------------------------------
+;; Gateway API
+;; ---------------------------------------------------------------------------
+
+(define* (%gateway-class #:key name controller-name (labels '()))
+  (resource
+    `((apiVersion . "gateway.networking.k8s.io/v1")
+      (kind . "GatewayClass")
+      (metadata ,@(k8s-metadata name #f labels))   ; cluster-scoped: no namespace
+      (spec (controllerName . ,controller-name)))))
+
+(define-construct gateway-class
+  #:head name
+  #:fields ((controller-name #:required) (labels #:map))
+  #:build (%gateway-class #:name name #:controller-name controller-name #:labels labels))
+
+;; A Gateway listener (sub-construct). #:tls-certificate names one or more
+;; Secrets → a Terminate-mode tls block; absent → a plain listener.
+(define-construct listener
+  #:head name
+  #:fields ((protocol #:default "HTTP") (port #:required) (hostname #:default #f)
+            (tls-certificate #:list) (allowed-routes-from #:default "All"))
+  #:build (filter pair?
+            (list (cons 'name name)
+                  (cons 'protocol protocol)
+                  (cons 'port port)
+                  (and hostname (cons 'hostname hostname))
+                  (cons 'allowedRoutes `((namespaces (from . ,allowed-routes-from))))
+                  (and (pair? tls-certificate)
+                       (cons 'tls
+                         `((mode . "Terminate")
+                           (certificateRefs
+                             ,@(map (lambda (s) `((kind . "Secret") (name . ,s)))
+                                    tls-certificate))))))))
+
+(define* (%gateway #:key name gateway-class-name (namespace (current-k8s-namespace))
+                   (listeners '()) (labels '()))
+  (%custom-resource #:api "gateway.networking.k8s.io/v1" #:kind "Gateway"
+    #:name name #:namespace namespace #:labels labels
+    #:spec `((gatewayClassName . ,gateway-class-name) (listeners ,@listeners))))
+
+(define-construct gateway
+  #:head name
+  #:fields ((gateway-class-name #:required) (namespace #:default (current-k8s-namespace))
+            (listener #:repeated #:construct listener) (labels #:map))
+  #:build (%gateway #:name name #:gateway-class-name gateway-class-name
+                    #:namespace namespace #:listeners listener #:labels labels))
+
+(define* (%http-route #:key name (namespace (current-k8s-namespace)) parent-name
+                      (parent-namespace #f) (hostnames '()) backend-service backend-port
+                      (labels '()))
+  (%custom-resource #:api "gateway.networking.k8s.io/v1" #:kind "HTTPRoute"
+    #:name name #:namespace namespace #:labels labels
+    #:spec `((parentRefs ((name . ,parent-name)
+                          ,@(if parent-namespace `((namespace . ,parent-namespace)) '())))
+             (hostnames ,@hostnames)
+             (rules ((backendRefs ((name . ,backend-service) (port . ,backend-port))))))))
+
+(define-construct http-route
+  #:head name
+  #:fields ((namespace #:default (current-k8s-namespace))
+            (parent-name #:required) (parent-namespace #:default #f)
+            (hostnames #:list) (backend-service #:required) (backend-port #:required)
+            (labels #:map))
+  #:build (%http-route #:name name #:namespace namespace #:parent-name parent-name
+                       #:parent-namespace parent-namespace #:hostnames hostnames
+                       #:backend-service backend-service #:backend-port backend-port
+                       #:labels labels))
+
+;; ---------------------------------------------------------------------------
 ;; RBAC
 ;; ---------------------------------------------------------------------------
 ;;
-;; A `rule` is a record-body sub-construct producing a policy-rule alist:
+;; `rule` is a sub-construct producing a policy-rule alist:
 ;;   (rule (api-groups "") (resources "pods" "services") (verbs "get" "list"))
 ;;     => ((apiGroups "") (resources "pods" "services") (verbs "get" "list"))
 
@@ -569,25 +723,6 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
                        #:resources resources #:privileged privileged
                        #:service-account service-account #:host host))
-
-(define* (%worker #:key name image (replicas 1) (namespace (current-k8s-namespace))
-                  (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                  (service-account #f))
-  (compose-ops 'worker `(worker ,name)
-    (list (%deployment #:name name #:image image #:port 0 #:replicas replicas
-                       #:namespace namespace #:env env #:env-from env-from #:volumes volumes
-                       #:resources resources #:privileged privileged
-                       #:service-account service-account))))
-
-(define-construct worker
-  #:head name
-  #:fields ((image #:required) (replicas #:default 1)
-            (namespace #:default (current-k8s-namespace))
-            (env #:list) (env-from #:list) (volumes #:list)
-            (resources #:default '()) (privileged #:flag) (service-account #:default #f))
-  #:build (%worker #:name name #:image image #:replicas replicas #:namespace namespace
-                   #:env env #:env-from env-from #:volumes volumes #:resources resources
-                   #:privileged privileged #:service-account service-account))
 
 ;; ---------------------------------------------------------------------------
 ;; expose — derive a Service from a workload.

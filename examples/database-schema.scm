@@ -1,9 +1,8 @@
 ;;; examples/database-schema.scm — a worked relational schema.
 ;;;
-;;; A consumer of (hexol sql), the same way examples/kubernetes.scm consumes
-;;; (hexol k8s). Each `table` / `index` form is an op; folding the inventory
-;;; appends each rendered `CREATE …` statement to the `(sql_commands)`
-;;; accumulator, which is just resolved state. So every CLI view works:
+;;; Consumes (hexol sql), like kubernetes.scm consumes (hexol k8s). Each
+;;; `table` / `index` is an op; folding appends each `CREATE …` to the
+;;; `(sql_commands)` accumulator (resolved state). Every CLI view works:
 ;;;
 ;;;   ./bin/hexol render -o sql  examples/database-schema.scm   # the DDL
 ;;;   ./bin/hexol render         examples/database-schema.scm   # resolved state (sexp)
@@ -13,23 +12,22 @@
 ;;;
 ;;; `-o sql` runs the (state -> SQL text) adapter the next line registers.
 ;;;
-;;; The point is what a schema-as-a-program buys over hand-written SQL:
+;;; What schema-as-a-program buys over hand-written SQL:
 ;;;
-;;;   • Type sugar — `(id)`, `(text …)`, `(references …)` instead of
-;;;     spelling out `SERIAL PRIMARY KEY` / `INTEGER … REFERENCES …`.
-;;;   • Real abstraction — `audit-columns` is an ordinary function that
-;;;     returns a list of columns, spliced into any table (`table` flattens
-;;;     one level, so no `apply` is needed).
-;;;   • A namespace scope — `with-schema` qualifies every table in it.
+;;;   • Type sugar — `(id)`, `(text …)`, `(references …)` vs spelling out
+;;;     `SERIAL PRIMARY KEY` / `INTEGER … REFERENCES …`.
+;;;   • Abstraction — `audit-columns` is a plain function returning a column
+;;;     list, spliced into any table (`table` flattens one level; no `apply`).
+;;;   • Scope — `with-schema` qualifies every table in it.
 
 (use-modules (hexol sql))
 
-;; Expose the SQL text view as `hexol render -o sql`.
+;; Expose SQL text view as `hexol render -o sql`.
 (renders-with "sql" render-sql)
 
-;; A reusable column bundle: every audited table gets the same two
-;; timestamps. A function returning a list of columns; `table` flattens it
-;; in (SQL has no equivalent — you copy/paste the columns).
+;; Reusable column bundle: same two timestamps on every audited table.
+;; A function returning columns; `table` flattens it in (SQL would force
+;; copy/paste).
 
 (define (audit-columns)
   (list (timestamp 'created_at (not-null) (default (raw "now()")))
@@ -47,7 +45,7 @@
       (numeric 'balance 12 2 (not-null) (default 0))   ; precision 12, scale 2
       (audit-columns))
 
-    ;; A per-user account row, with audit columns spliced in via the helper.
+    ;; Per-user account; audit columns spliced in via the helper.
     (table 'accounts
       (id)
       (references 'user_id 'users)
@@ -67,7 +65,7 @@
       (id)
       (text 'label (not-null) (unique)))
 
-    ;; Join table: composite primary key, two foreign keys, no surrogate id.
+    ;; Join table: composite PK, two FKs, no surrogate id.
     (table 'post_tags
       (references 'post_id 'posts)
       (references 'tag_id  'tags)

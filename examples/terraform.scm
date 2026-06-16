@@ -1,33 +1,29 @@
 ;;; examples/terraform.scm — one Terraform config spanning two providers.
 ;;;
-;;; A single-file consumer of (hexol terraform) that renders a combined,
-;;; `terraform init`-ready `*.tf.json`: AWS infrastructure (an RDS instance
-;;; + a network load balancer) alongside an OpenStack web fleet (a
-;;; keypair, a private network, and N VMs), with both providers declared in
-;;; one `terraform {}` block. One inventory, one resolved `(terraform_config)`
-;;; tree, one render:
+;;; A single-file consumer of (hexol terraform) rendering a combined,
+;;; init-ready `*.tf.json`: AWS (RDS + network LB) alongside an OpenStack web
+;;; fleet (keypair, private network, N VMs), both providers in one
+;;; `terraform {}` block. One inventory, one `(terraform_config)` tree, one render:
 ;;;
 ;;;   ./bin/hexol render -o terraform examples/terraform.scm > main.tf.json
 ;;;   terraform init && terraform apply        # creds via env / clouds.yaml
 ;;;   ./bin/hexol tree examples/terraform.scm  # the op tree
 ;;;
-;;; The point is to show what an inventory-as-a-program buys you over
-;;; hand-written HCL — each of these is a few lines of ordinary Scheme here,
-;;; and a dedicated language feature (or no clean equivalent) in HCL:
+;;; The point: what inventory-as-a-program buys over hand-written HCL. Each is
+;;; a few lines of Scheme here, a dedicated feature (or no equivalent) in HCL:
 ;;;
-;;;   • Fleet by a loop — `(map app-vm (iota vm-count))`; HCL needs count/for_each.
-;;;   • Computed values — per-VM static IPs are index arithmetic; cloud-init
-;;;     is a string function (HCL: cidrhost()/templatefile()).
-;;;   • Real abstraction — `aws-rds`, `aws-lb`, `web-security-group` are
-;;;     functions returning *bundles* of resources (HCL's unit is a module).
+;;;   • Fleet by loop — `(map app-vm (iota vm-count))`; HCL needs count/for_each.
+;;;   • Computed values — per-VM IPs are index arithmetic, cloud-init a string
+;;;     fn (HCL: cidrhost()/templatefile()).
+;;;   • Real abstraction — `aws-rds`, `aws-lb`, `web-security-group` return
+;;;     *bundles* of resources (HCL's unit is a module).
 ;;;   • Plain conditionals — dev/prod sizing is `(if prod? …)`.
 ;;;   • Cross-cutting edits — `metadata-all` stamps every instance in one pass.
-;;;   • Local inputs at render time — the keypair's public_key is read from ~/.ssh.
+;;;   • Local inputs at render time — keypair public_key read from ~/.ssh.
 ;;;
-;;; The provider names, resource types, and fleet shape are content and live
-;;; here; (hexol terraform) only knows the Terraform language. Credentials
-;;; are not baked in — AWS reads its usual env/profile, OpenStack reads OS_*
-;;; / clouds.yaml.
+;;; Provider names, resource types, and fleet shape are content here; (hexol
+;;; terraform) only knows the language. Creds aren't baked in — AWS reads its
+;;; env/profile, OpenStack reads OS_* / clouds.yaml.
 
 (use-modules (hexol terraform)
              (ice-9 textual-ports)
@@ -36,8 +32,7 @@
 
 ;; ---------- deployment knobs (content) ----------
 ;;
-;; One symbol flips the fleet between dev and prod: bigger flavor, more VMs,
-;; a production region.
+;; One symbol flips dev/prod: bigger flavor, more VMs, prod region.
 
 (define env      (string->symbol (or (getenv "HEXOL_ENV") "dev")))
 (define prod?    (eq? env 'prod))
@@ -48,8 +43,8 @@
 (define image    "Debian 12")
 (define net-cidr "192.168.42.0/24")
 
-;; Read the deployer's SSH public key from ~/.ssh at render time (ed25519
-;; first, then RSA). The one place the inventory touches the local machine.
+;; Read deployer's SSH public key from ~/.ssh at render time (ed25519, then
+;; RSA). The one place the inventory touches the local machine.
 (define (read-ssh-public-key)
   (let* ((home (or (getenv "HOME") "."))
          (path (find file-exists?
@@ -59,14 +54,14 @@
       (error "terraform: no SSH public key in ~/.ssh (id_ed25519.pub / id_rsa.pub)"))
     (string-trim-right (call-with-input-file path get-string-all))))
 
-;; Per-VM cloud-init, assembled in Scheme — no templatefile() indirection.
+;; Per-VM cloud-init in Scheme — no templatefile() indirection.
 (define (cloud-init hostname)
   (fmt "#cloud-config\nhostname: ~a\npackage_update: true\npackages: [nginx]\n"
        hostname))
 
 ;; ---------- AWS infrastructure (content) ----------
 ;;
-;; Each builder bundles a few `terraform-resource` ops plus the `tf-output`s
+;; Each builder bundles `terraform-resource` ops plus the `tf-output`s
 ;; downstream tooling reads back.
 
 (define* (aws-rds #:key name engine (engine-version "15")
@@ -132,12 +127,12 @@
 (define (os-subnet name network cidr)
   (terraform-resource "openstack_networking_subnet_v2" name
     (name       (str "hexol-" name))
-    ;; `network` is a parameter (computed), so we use `tf-ref`, not `ref`.
+    ;; `network` is a computed parameter, so `tf-ref`, not `ref`.
     (network_id (tf-ref "openstack_networking_network_v2" network "id"))
     (cidr       cidr)
     (ip_version 4)))
 
-;; A reusable bundle: a security group plus its one HTTP ingress rule.
+;; Reusable bundle: security group + its one HTTP ingress rule.
 (define (web-security-group)
   (compose-ops 'web-security-group '(web-security-group)
     (list
@@ -153,8 +148,8 @@
         (remote_ip_prefix  "0.0.0.0/0")
         (security_group_id (ref openstack_networking_secgroup_v2 web id))))))
 
-;; One VM from its fleet index: derived name, an IP computed from the index,
-;; and a cloud-init built for that host.
+;; One VM from its fleet index: derived name, index-computed IP, per-host
+;; cloud-init.
 (define (app-vm i)
   (let ((name (str "app-" (1+ i)))
         (ip   (str "192.168.42." (+ 10 i))))
@@ -172,8 +167,8 @@
 (define (web-fleet n)
   (compose-ops 'web-fleet `(web-fleet ,n) (map app-vm (iota n))))
 
-;; Stamp `md` into every compute instance's `metadata`, in one pass, built
-;; on the library's generic `transform-terraform-resources`.
+;; Stamp `md` into every compute instance's `metadata` in one pass, via the
+;; library's generic `transform-terraform-resources`.
 (define (metadata-all md)
   (let ((op (transform-terraform-resources
               (lambda (type name body)
@@ -186,7 +181,7 @@
 
 (hx-ops
 
-  ;; --- settings: both providers in one terraform {} block ---
+  ;; --- settings: both providers, one terraform {} block ---
   (terraform-settings
     (required_version ">= 1.3.0")
     (block required_providers

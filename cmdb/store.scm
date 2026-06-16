@@ -1,22 +1,15 @@
 ;;; cmdb/store.scm — fact-log CMDB with versioned library.
 ;;;
-;;; A fact is a sexp `(<op-name> <args>...)`. The store looks up
-;;; <op-name> in the *currently active* library module, calls it with
-;;; <args>, and folds the returned ops into the in-memory state.
+;;; A fact `(<op-name> <args>...)` is looked up in the active library
+;;; module, called with <args>, and the returned ops folded into state.
 ;;;
-;;; The active library is itself controlled by facts. The reserved op
+;;; The reserved op `(bump-lib "<sha>")` swaps the active library to
+;;; module `(cmdb libraries <sha>)` (cmdb/libraries/<sha>.scm) for every
+;;; subsequent fact, at append and refold alike — replay is
+;;; contemporaneous: each fact applies through the then-current library.
 ;;;
-;;;     (bump-lib "<sha>")
-;;;
-;;; switches the active library to module `(cmdb libraries <sha>)`
-;;; (file cmdb/libraries/<sha>.scm). It takes effect for every
-;;; subsequent fact in the log, both at append and during refold —
-;;; replay is contemporaneous, each fact applies through whichever
-;;; library was current when it was appended.
-;;;
-;;; The store starts a refold with the `initial-library` SHA (passed to
-;;; make-cmdb); the first bump-lib in the log overrides that for facts
-;;; after it.
+;;; Refold starts from the `initial-library` SHA (make-cmdb arg); the
+;;; first bump-lib overrides it for facts after it.
 
 (define-module (cmdb store)
   #:use-module (hexol kernel)
@@ -83,8 +76,7 @@
   (and (pair? fact) (eq? (car fact) 'bump-lib)))
 
 (define (fact->ops cmdb fact)
-  ;; Look up the op-name in the currently active library; call it with
-  ;; the fact's args; normalize to a list of ops.
+  ;; Look up op-name in the active library, apply args, normalize to ops.
   (unless (and (pair? fact) (symbol? (car fact)))
     (error "invalid fact (expected (op-name args ...)):" fact))
   (let* ((name (car fact))
@@ -103,8 +95,8 @@
           (else (error "library op did not return ops:" name result)))))))
 
 (define (apply-fact! cmdb fact)
-  ;; Mutating: handles bump-lib by swapping the active library; for
-  ;; ordinary facts, folds the resulting ops into the state.
+  ;; Mutating: bump-lib swaps the active library; ordinary facts fold
+  ;; their ops into state.
   (cond
     ((bump-lib-fact? fact)
      (let ((sha (cadr fact)))
@@ -128,7 +120,7 @@
     cmdb))
 
 (define (cmdb-refold! cmdb)
-  ;; Reset to initial library + empty state, then replay every fact.
+  ;; Reset to initial library + empty state, then replay all facts.
   (set-cmdb-library! cmdb (load-library-by-sha (cmdb-initial-library cmdb)))
   (set-cmdb-state!   cmdb '())
   (for-each (lambda (fact) (apply-fact! cmdb fact))
@@ -139,8 +131,8 @@
   (state-get (cmdb-state cmdb) path))
 
 (define (cmdb-append-fact! cmdb fact)
-  ;; Append to log first, then apply. If apply throws, the log is still
-  ;; consistent (next refold will catch the bad fact at the same point).
+  ;; Append to log first, then apply. If apply throws the log stays
+  ;; consistent (next refold hits the bad fact at the same point).
   (append-fact-to-log! (cmdb-log-path cmdb) fact)
   (apply-fact! cmdb fact)
   (cmdb-state cmdb))

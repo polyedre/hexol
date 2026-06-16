@@ -1,29 +1,26 @@
 ;;; hexol/cache.scm — a render-time cache for expensive fold-time shell-outs.
 ;;;
-;;; Folding an inventory is fast except where an op shells out to the world:
-;;; `helm template` and `remote-manifest`'s `curl` dominate a render. Their
-;;; output is a pure function of pinned inputs (a chart at a version with a
-;;; values alist; a versioned URL), so it is safe to cache the JSON they print
-;;; and skip the process on a hit.
+;;; Folding is fast except where an op shells out: `helm template` and
+;;; `remote-manifest`'s `curl` dominate a render. Their output is a pure
+;;; function of pinned inputs (chart+version+values; a versioned URL), so it is
+;;; safe to cache the JSON and skip the process on a hit.
 ;;;
 ;;; Two levels:
-;;;   1. an in-process table — one resolve that templates the same chart twice,
-;;;      or a `tree -v` that resolves once then a `render` in the same process,
-;;;      pays the cost once;
-;;;   2. an on-disk bucket under $XDG_CACHE_HOME/hexol — persists across runs,
-;;;      which is the real win (a re-render is instant).
+;;;   1. in-process table — templating the same chart twice, or a `tree -v`
+;;;      then `render` in one process, pays once;
+;;;   2. on-disk bucket under $XDG_CACHE_HOME/hexol — persists across runs, the
+;;;      real win (a re-render is instant).
 ;;;
-;;; Invalidation is deliberately coarse, per the project heuristic: ONE cache
-;;; per inventory file, keyed by a hash of the file's *content*. Edit the file
-;;; and the prefix changes — the new render misses, recomputes, and the stale
-;;; files (same inventory path, old content) are pruned, so a given inventory
-;;; never keeps more than its current cache. This means an unrelated edit (a
-;;; replica bump) also invalidates the chart cache; that is the accepted
-;;; trade for not having to reason about which edits touch which chart.
+;;; Invalidation is coarse by design: ONE cache per inventory file, keyed by a
+;;; hash of the file's *content*. Edit it and the prefix changes — the render
+;;; misses, recomputes, and stale files (same path, old content) are pruned, so
+;;; an inventory never keeps more than its current cache. So an unrelated edit
+;;; (a replica bump) also invalidates the chart cache — the accepted trade for
+;;; not reasoning about which edits touch which chart.
 ;;;
 ;;; `current-render-cache' is #f unless the CLI opened one, so a bare library
-;;; use (or a render on a host with no writable cache dir) just shells out as
-;;; before — caching is an optimization that never changes results.
+;;; use (or no writable cache dir) just shells out — caching never changes
+;;; results.
 
 (define-module (hexol cache)
   #:use-module (srfi srfi-1)
@@ -35,8 +32,8 @@
 
 ;; ---------- key hashing (FNV-1a/64, mirrors (hexol kernel)'s addresser) ----------
 ;; A cache key only needs to avoid accidental collisions, not resist attack —
-;; the same rationale as the op content hash, kept dependency-free here so the
-;; cache module stands alone.
+;; same rationale as the op content hash, kept dependency-free so this module
+;; stands alone.
 
 (define %fnv-offset 14695981039346656037)
 (define %fnv-prime  1099511628211)
@@ -57,9 +54,9 @@
 
 ;; ---------- the cache handle ----------
 
-;; A render cache is a flat directory plus a per-inventory filename PREFIX
-;; ("<pathhash>-<contenthash>-") and an in-process MEM table. Each entry is a
-;; file "<root>/<prefix><keyhash>.json"; the prefix scopes entries to one
+;; A render cache: a flat directory, a per-inventory filename PREFIX
+;; ("<pathhash>-<contenthash>-"), and an in-process MEM table. Each entry is
+;; "<root>/<prefix><keyhash>.json"; the prefix scopes entries to one
 ;; inventory's current content.
 (define-record-type <render-cache>
   (make-render-cache root prefix mem)
@@ -78,14 +75,14 @@
                    "/hexol")))
 
 (define (ensure-directory dir)
-  ;; mkdir -p: create DIR and any missing parents.
+  ;; mkdir -p: DIR plus missing parents.
   (unless (file-exists? dir)
     (ensure-directory (dirname dir))
     (catch #t (lambda () (mkdir dir)) (lambda _ #t))))   ; tolerate a race
 
-;; Drop cache files for the same inventory PATH-PREFIX ("<pathhash>-") whose
-;; content prefix differs from the live one — so an inventory keeps only its
-;; current cache. Best-effort: any IO error just leaves files in place.
+;; Drop files for the same inventory PATH-PREFIX ("<pathhash>-") whose content
+;; prefix differs from the live one — so an inventory keeps only its current
+;; cache. Best-effort: any IO error leaves files in place.
 (define (prune-stale root path-prefix live-prefix)
   (catch #t
     (lambda ()
@@ -102,9 +99,9 @@
           (closedir dir))))
     (lambda _ #t)))
 
-;; Open (and prune to) the one cache bucket for INV-PATH. Reads the inventory's
-;; content to derive the invalidation key. Returns a <render-cache>, or #f if
-;; the cache dir is unusable — in which case callers shell out uncached.
+;; Open (and prune to) the one cache bucket for INV-PATH; reads its content for
+;; the invalidation key. Returns a <render-cache>, or #f if the cache dir is
+;; unusable — then callers shell out uncached.
 (define (open-render-cache inv-path)
   (catch #t
     (lambda ()
@@ -134,12 +131,12 @@ on-disk bucket. Cache IO failures degrade to recomputation, never an error."
           (or hit
               (let ((file (string-append (rc-root c) "/" (rc-prefix c) kh ".json")))
                 (cond
-                  ;; level 2 hit: read the file back into level 1.
+                  ;; level 2 hit: read file back into level 1.
                   ((and (file-exists? file)
                         (catch #t (lambda () (call-with-input-file file get-string-all))
                                (lambda _ #f)))
                    => (lambda (s) (hash-set! mem kh s) s))
-                  ;; miss: compute, then write through both levels (best effort).
+                  ;; miss: compute, write through both levels (best effort).
                   (else
                    (let ((s (thunk)))
                      (catch #t

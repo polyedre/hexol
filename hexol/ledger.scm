@@ -1,13 +1,12 @@
 ;;; hexol/ledger.scm — the ledger target library.
 ;;;
-;;; A Scheme front-end for a personal ledger, built on the engine's op
-;;; model exactly like (hexol k8s) and (hexol sql). Every form is an *op*;
-;;; folding an inventory of them appends structured entries to the
-;;; `(ledger_journal)` accumulator (and split rules to `(ledger_rules)`),
-;;; so the resolved state *is* the journal. `tree` / `ops` / `explain` and
-;;; `render -o sexp | json | yaml` work on it generically; `render -o
-;;; ledger` runs `render-ledger` (registered by the file via
-;;; `renders-with`) to emit ledger-cli text.
+;;; Scheme front-end for a personal ledger on the engine's op model, like
+;;; (hexol k8s) and (hexol sql). Every form is an *op*; folding the
+;;; inventory appends entries to `(ledger_journal)` (and split rules to
+;;; `(ledger_rules)`), so the resolved state *is* the journal. `tree` /
+;;; `ops` / `explain` and `render -o sexp | json | yaml` work generically;
+;;; `render -o ledger` runs `render-ledger` (registered via `renders-with`)
+;;; to emit ledger-cli text.
 ;;;
 ;;;   (hx-ops
 ;;;     (with-default-account 'Asset:Checking
@@ -18,25 +17,22 @@
 ;;; Design notes:
 ;;;
 ;;; - Scope wrappers (`in-year`, `in-month`, `on-day`, `in-currency`,
-;;;   `with-default-account`) bind dynamic context while the body's ops are
-;;;   *constructed* — the date/currency/default bakes into each entry — then
-;;;   bundle them into one composing op. Same build-time scope mechanism as
-;;;   `with-namespace` in (hexol k8s); inner scopes win.
+;;;   `with-default-account`) bind dynamic context at construction time —
+;;;   date/currency/default bakes into each entry — then bundle into one op.
+;;;   Same mechanism as `with-namespace` in (hexol k8s); inner scopes win.
 ;;;
-;;; - Date components must be lexically determined: a leaf entry outside the
+;;; - Date components must be lexically determined: a leaf outside the
 ;;;   required scopes errors. The source stays a pure function of itself.
 ;;;
-;;; - The dominant form is `tx` (multi-posting); `spent` / `received` /
-;;;   `transfer` are sugar. Postings without an amount are balancing
-;;;   (ledger-cli semantics); inside `with-default-account` a tx with no
-;;;   balancing post gets one.
+;;; - `tx` (multi-posting) is the core form; `spent` / `received` /
+;;;   `transfer` are sugar. Amount-less postings are balancing (ledger-cli
+;;;   semantics); inside `with-default-account` an unbalanced tx gets one.
 ;;;
-;;; - `split-with` records a declarative finance rule into `(ledger_rules)`.
-;;;   `apply-splits` is a cross-cutting transform op (the analogue of k8s
-;;;   `tls-all`): placed last in the inventory, it rewrites every tx in
-;;;   `(ledger_journal)`, injecting the receivable/counter postings each
-;;;   matching rule implies, then clears `(ledger_rules)` (the rules carry
-;;;   `#:where` procedures, which don't serialize — they're intermediate).
+;;; - `split-with` records a finance rule into `(ledger_rules)`.
+;;;   `apply-splits` is a cross-cutting transform (the k8s `tls-all`
+;;;   analogue): placed last, it rewrites every tx in `(ledger_journal)`,
+;;;   injecting each matching rule's receivable/counter postings, then
+;;;   clears `(ledger_rules)` (its `#:where` procs don't serialize).
 
 (define-module (hexol ledger)
   #:use-module (hexol kernel)
@@ -66,11 +62,10 @@
 
 ;; ---------- scope wrappers ----------
 ;;
-;; Each binds its parameter while the body's ops are built, then bundles
-;; them into one composing op (so scopes nest, compose inside `hx-when`, and
-;; the most specific authored location wins via `stamp-loc`). All five share
-;; the kernel's `scope-ops` combinator, the same one behind k8s
-;; `with-namespace` and sql `with-schema`.
+;; Each binds its parameter at construction time, then bundles into one op
+;; (so scopes nest, compose inside `hx-when`, and the most specific location
+;; wins via `stamp-loc`). All five share the kernel's `scope-ops`, behind
+;; k8s `with-namespace` and sql `with-schema` too.
 
 (define-syntax-rule (in-year y body ...)
   (scope-ops 'in-year (current-year y) "year " body ...))
@@ -86,8 +81,8 @@
 ;; ---------- amount tagging ----------
 ;;
 ;; A tagged amount is the pair (currency . number). Bare numbers inherit
-;; `current-currency`. The constructors make the source explicit at the
-;; call site without a reader extension.
+;; `current-currency`. The constructors make currency explicit at the call
+;; site without a reader extension.
 
 (define (eur n) (cons 'EUR n))
 (define (sgd n) (cons 'SGD n))
@@ -123,9 +118,9 @@
 
 ;; ---------- entries as data ----------
 ;;
-;; Every entry is an alist with a `kind` tag, so it renders as a clean JSON
-;; object / YAML mapping. A posting splits its amount into number +
-;; currency; a #f amount is a balancing posting.
+;; Every entry is a `kind`-tagged alist, so it renders as clean JSON/YAML.
+;; A posting splits its amount into number + currency; #f amount means a
+;; balancing posting.
 
 (define* (post account #:optional amount #:key (note #f))
   (let ((a (and amount (tag-amount amount))))
@@ -141,9 +136,9 @@
 
 ;; ---------- the journal op ----------
 ;;
-;; Each builder renders its entry now (capturing the current scope) and
-;; returns an op whose effect appends it to `(ledger_journal)`. As with
-;; surface's `resource`, we override op:append's generic label.
+;; Each builder renders its entry now (capturing the scope) and returns an
+;; op appending it to `(ledger_journal)`. Like surface's `resource`, we
+;; override op:append's generic label.
 
 (define (journal-op entry source label)
   (relabel (op:append '(ledger_journal) entry source) label))
@@ -193,10 +188,10 @@
 
 ;; ---------- recurring / price / assertions ----------
 
-;; `recurring` splices its postings as a body (the way `tx` does), with the
-;; date bounds as leading keywords:
+;; `recurring` splices postings as a body (like `tx`), date bounds as
+;; leading keywords:
 ;;   (recurring 'monthly #:from '(Y M D) #:to '(Y M D) (post …) (post …) …)
-;; `#:to` is optional; a missing `#:from` errors via %recurring.
+;; `#:to` optional; missing `#:from` errors via %recurring.
 (define-syntax recurring
   (syntax-rules ()
     ((_ period #:from f #:to t post ...) (%recurring period f  t  (list post ...)))
@@ -229,9 +224,9 @@
 
 ;; ---------- split-with: a finance rule ----------
 ;;
-;; Declares that any transaction matching the predicate is shared with
-;; `peer` at `fraction` (e.g. 1/2). Stored as data in `(ledger_rules)`;
-;; `apply-splits` applies it. Predicate inputs:
+;; Declares that a matching transaction is shared with `peer` at `fraction`
+;; (e.g. 1/2). Stored in `(ledger_rules)`; `apply-splits` applies it.
+;; Predicate inputs:
 ;;   #:from / #:to  '(YYYY MM DD)  inclusive date bounds
 ;;   #:tag           'symbol        tx must carry this tag
 ;;   #:account-prefix 'sym          postings under this account are shared
@@ -290,8 +285,8 @@
           (else #f))))
 
 (define (expand-tx tx rules)
-  ;; For each posting, keep it, then append (receivable +share, expense
-  ;; -share) pairs from every matching rule.
+  ;; Keep each posting, then append (receivable +share, expense -share)
+  ;; pairs from every matching rule.
   (state-set tx '(postings)
     (append-map
      (lambda (p)
@@ -335,8 +330,8 @@ examples end with (tls-all)."
 ;; render-ledger: (ledger_journal) -> ledger-cli text
 ;; ===========================================================================
 ;;
-;; By the time this runs the journal is already split-expanded (apply-splits
-;; ran in the fold), so rendering is pure formatting.
+;; The journal is already split-expanded by now (apply-splits ran in the
+;; fold), so rendering is pure formatting.
 
 (define (date-string d)
   (format #f "~4,'0d/~2,'0d/~2,'0d" (car d) (cadr d) (caddr d)))
@@ -391,7 +386,7 @@ examples end with (tls-all)."
           (amount-string (assq-ref e 'amount) (assq-ref e 'currency))))
 
 (define (render-balance-assert e)
-  ;; ledger-cli syntax: zero-amount posting with `= EXPECTED`.
+  ;; ledger-cli: zero-amount posting with `= EXPECTED`.
   (let ((note (assq-ref e 'note)))
     (string-append
      (date-string (assq-ref e 'date)) " * Balance check"

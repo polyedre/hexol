@@ -1,36 +1,31 @@
 ;;; hexol/secrets.scm — an inline, sops-backed secrets store.
 ;;;
-;;; A render-time secret resolver that keeps every secret *in the inventory
-;;; file* — encrypted at rest — instead of in separate `*.sops.yaml` files.
-;;; Three pieces:
+;;; Render-time secret resolver keeping secrets *in the inventory file*,
+;;; encrypted at rest, instead of separate `*.sops.yaml` files. Three pieces:
 ;;;
-;;;   (secrets-store …)        ;; declare the encrypted store once (load time)
-;;;   (secret-ref 'key)        ;; reference a secret at a field (a marker)
-;;;   (resolve-secret-refs)    ;; one op that decrypts + substitutes (render)
+;;;   (secrets-store …)        ;; declare the encrypted store (load time)
+;;;   (secret-ref 'key)        ;; a marker referencing a secret at a field
+;;;   (resolve-secret-refs)    ;; op that decrypts + substitutes (render)
 ;;;
-;;; Why a marker + a terminal op, rather than decrypting where `secret-ref`
-;;; is written: inventory resources are built at *load* time (the quasiquote
-;;; `,(secret-ref …)` runs when the resource alist is constructed), but we
-;;; only want to shell out to `sops` at *render* time — never for `tree` /
-;;; `ops`, which load the file but never fold. So `secret-ref` returns a
-;;; cheap `<secret-ref>` marker baked into the resource, and the
-;;; `resolve-secret-refs` op — placed last in the inventory — walks the
-;;; resolved state and replaces every marker with its plaintext. Because it
-;;; runs only inside `resolve`, `tree`/`ops` stay sops-free.
+;;; Marker + terminal op, not decrypt-in-place: resources are built at *load*
+;;; time (the quasiquote `,(secret-ref …)` runs then), but we shell out to
+;;; `sops` only at *render* time — never for `tree`/`ops`, which load but
+;;; never fold. So `secret-ref` bakes a cheap `<secret-ref>` marker into the
+;;; resource, and `resolve-secret-refs` (last in the inventory) walks the
+;;; resolved state swapping each marker for plaintext. It runs only inside
+;;; `resolve`, so `tree`/`ops` stay sops-free.
 ;;;
-;;; One shared envelope. The whole store is ONE sops document: a single
-;;; age-encrypted data key and a single MAC cover every secret, so the
-;;; marginal cost of each added secret is just its `ENC[…]` ciphertext. The
-;;; data keys are emitted in sorted order on both seal and decrypt, so the
-;;; MAC (which is computed over the values in tree-walk order) always
-;;; verifies regardless of how the author arranged the alist in the file.
+;;; One shared envelope: the whole store is ONE sops document — a single
+;;; age-encrypted data key and one MAC cover every secret, so each added
+;;; secret costs only its `ENC[…]` ciphertext. Data keys emit in sorted order
+;;; on both seal and decrypt, so the MAC (computed over values in tree-walk
+;;; order) verifies regardless of the author's alist arrangement.
 ;;;
-;;; Decryption is lazy and memoized: the first `secret-ref` resolved forces
-;;; one `sops -d`, and the plaintext is cached for the rest of the render.
-;;; If `sops` is absent — or the decrypt fails because the deployer's key
-;;; isn't present — resolution degrades to a clearly-marked placeholder and
-;;; a warning, so the example still renders into a structurally-valid stream
-;;; for anyone without the secrets (matching the old `sops-manifest` skip).
+;;; Decryption is lazy + memoized: the first resolved `secret-ref` forces one
+;;; `sops -d`, cached for the render. If `sops` is absent — or the decrypt
+;;; fails (deployer's key missing) — resolution degrades to a marked
+;;; placeholder + warning, so the example still renders a structurally-valid
+;;; stream for anyone without the secrets (like the old `sops-manifest` skip).
 
 (define-module (hexol secrets)
   #:use-module (hexol kernel)
@@ -43,18 +38,16 @@
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (json)
-  #:re-export (which-cmd)              ; shared PATH helper (defined in (hexol sh))
+  #:re-export (which-cmd)              ; PATH helper from (hexol sh)
   #:export (secrets-store secret-ref secret-ref? secret-ref-key
             resolve-secret-refs
-            ;; reused by (hexol secret-tool): the same serializer and
-            ;; decrypt path the CLI seals/reads the store with.
+            ;; reused by (hexol secret-tool): serializer + decrypt path.
             clauses->sops-yaml decrypt-yaml secrets-warn))
 
 ;; ---------- the secret-ref marker ----------
 ;;
-;; `(secret-ref 'key)` returns one of these. It is data, not an op — it sits
-;; wherever the author wrote it (a Secret's stringData value, a terraform
-;; field) until `resolve-secret-refs` swaps it for the plaintext.
+;; `(secret-ref 'key)` returns one of these — data, not an op. It sits where
+;; the author wrote it until `resolve-secret-refs` swaps in the plaintext.
 
 (define-record-type <secret-ref>
   (make-secret-ref key)
@@ -68,11 +61,10 @@
 
 ;; ---------- the registered store ----------
 ;;
-;; `(secrets-store …)` is a top-level form: it quotes its clauses and records
-;; them — it does NOT decrypt. `registered-store` holds the clause alist
-;; (version / lastmodified / mac / age / data); `decrypt-memo` caches the
-;; one decryption per render ('unset until forced, then the plaintext
-;; string-keyed alist, or #f when sops is unavailable / the decrypt failed).
+;; `(secrets-store …)` quotes and records its clauses — it does NOT decrypt.
+;; `registered-store` holds the clause alist (version / lastmodified / mac /
+;; age / data); `decrypt-memo` caches the one per-render decryption ('unset
+;; until forced, then the plaintext string-keyed alist, or #f on failure).
 
 (define registered-store #f)
 (define decrypt-memo 'unset)
@@ -90,10 +82,9 @@ decryption.  Resets any cached plaintext."
   *unspecified*)
 
 ;; clause accessors: (version "x") → "x" (scalar); (data (k . v) …) → the
-;; ((k . v) …) tail (multi); likewise (age (recipient line …) …).  The
-;; `clause-*' forms take an explicit clause alist (so the CLI can serialize a
-;; store it parsed out of a file); `store-*' are the in-render shorthands over
-;; the registered store.
+;; tail (multi); likewise (age …). `clause-*' take an explicit alist (so the
+;; CLI can serialize a parsed store); `store-*' are shorthands over the
+;; registered store.
 (define (clause-scalar clauses tag)
   (let ((c (and clauses (assq tag clauses))))
     (and c (pair? (cdr c)) (cadr c))))
@@ -105,29 +96,28 @@ decryption.  Resets any cached plaintext."
 
 ;; ---------- serialization back to a sops document ----------
 ;;
-;; Rebuild the exact sops YAML tree the store was sealed as: a `data:` map
-;; (keys sorted, so the MAC verifies) plus the `sops:` metadata block. sops
-;; decrypts off the parsed tree, so indentation is free — we pick our own.
+;; Rebuild the sops YAML tree the store was sealed as: a sorted `data:` map
+;; (so the MAC verifies) plus the `sops:` metadata block. sops decrypts off
+;; the parsed tree, so indentation is free.
 ;;
-;; The `keys' clause carries the recipient key-groups as structured Scheme —
+;; The `keys' clause carries recipient groups as structured Scheme —
 ;; `(pgp (fp …) (created-at …) (enc <line> …))' and/or `(age (recipient …)
-;; (enc <line> …))' — and we emit the corresponding sops YAML block (grouping
-;; by type under `pgp:` / `age:`, re-indenting the armored `enc` lines). Only
-;; `enc' plus the recipient id (`fp' / `recipient') are load-bearing for
-;; decryption; sops parses the block into a struct, so field/indent choices
-;; are free. `mac' (encrypted with `lastmodified' as its AAD) and
-;; `lastmodified' are kept verbatim so the MAC verifies.
+;; (enc …))' — emitted as sops YAML grouped under `pgp:`/`age:`. Only `enc'
+;; plus the recipient id (`fp'/`recipient') are load-bearing; sops parses the
+;; block into a struct, so other field/indent choices are free. `mac'
+;; (encrypted with `lastmodified' as AAD) and `lastmodified' kept verbatim so
+;; the MAC verifies.
 
 (define (key->string k)
   (if (symbol? k) (symbol->string k) k))
 
-;; field accessors over a recipient entry's body, e.g. ((fp "…") (enc "a" "b")):
-;; `entry-scalar' → the single value; `entry-lines' → the list tail.
+;; accessors over a recipient body, e.g. ((fp "…") (enc "a" "b")):
+;; `entry-scalar' → single value; `entry-lines' → list tail.
 (define (entry-scalar body k) (let ((c (assq k body))) (and c (cadr c))))
 (define (entry-lines  body k) (let ((c (assq k body))) (and c (cdr c))))
 
-;; Emit one list item under a `pgp:` / `age:` group: FIELDS is an ordered list
-;; of (scalar KEY VALUE) / (block KEY CHOMP LINES), the first carrying the `- `.
+;; Emit one item under a `pgp:`/`age:` group: FIELDS an ordered list of
+;; (scalar KEY VALUE) / (block KEY CHOMP LINES), the first carrying `- `.
 (define (emit-key-entry p fields)
   (let ((first #t))
     (for-each
@@ -193,17 +183,15 @@ decryption.  Resets any cached plaintext."
 
 ;; ---------- decryption (lazy, memoized) ----------
 ;;
-;; `which-cmd` (the PATH resolver) is the shared helper from (hexol sh),
-;; re-exported above.
+;; `which-cmd` is the shared (hexol sh) PATH resolver, re-exported above.
 
 (define (secrets-warn fmt-str . args)
   (apply format (current-error-port)
          (string-append ";; secrets: " fmt-str "~%") args))
 
-;; Decrypt a sops YAML document (a string) and return its plaintext `data`
-;; map (a string-keyed alist), or #f — with a warning — when sops is missing
-;; or the decrypt fails (e.g. the deployer's key isn't present).  The
-;; ciphertext is written to a temp file (safe on disk) for sops to read.
+;; Decrypt a sops YAML string, returning its plaintext `data` map (string-
+;; keyed alist), or #f + warning when sops is missing or decrypt fails (e.g.
+;; deployer's key absent). Ciphertext goes to a temp file for sops to read.
 (define (decrypt-yaml yaml)
   (let ((sops (which-cmd "sops")))
     (cond

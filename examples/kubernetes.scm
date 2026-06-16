@@ -1,20 +1,16 @@
 ;;; examples/kubernetes.scm — first-party k8s apps, built on (hexol k8s).
 ;;;
-;;; Two applications, each deployed into its own same-named namespace via
-;;; `with-namespace`, each with a realistic ConfigMap (env) + Secret
-;;; (mounted). The cross-cutting ops run over the whole set: tls-all adds
-;;; TLS to the public app's Ingress, checksum-config annotates each
-;;; Deployment with a hash of the config it mounts (and self-reports any
-;;; dangling reference), and compliance-all audits everything.
+;;; Two apps, each in its own same-named namespace (`with-namespace`), with
+;;; a ConfigMap (env) + Secret (mounted). Cross-cutting ops run over the
+;;; whole set: tls-all adds TLS to the public Ingress, checksum-config
+;;; hashes each Deployment's mounted config (reports dangling refs),
+;;; compliance-all audits everything.
 ;;;
-;;; The surface is the unified record body: a positional name, then `(key
-;;; value)` entries (values are evaluated Scheme; the schema fills defaults
-;;; and rejects unknown keys). `(data …)` holds ConfigMap/Secret payloads;
-;;; `cm`/`sec`/`pvc` name a volume/env source and `mount` pairs one with a
-;;; path; a `(rule …)` is one RBAC policy rule.
-;;;
-;;; All the builders live in the shared `(hexol k8s)` library; this file
-;;; is just a consumer.
+;;; Surface: unified record body — positional name, then `(key value)`
+;;; entries (values are evaluated Scheme; schema fills defaults, rejects
+;;; unknown keys). `(data …)` is the ConfigMap/Secret payload; `cm`/`sec`/
+;;; `pvc` name a source, `mount` pairs one with a path; `(rule …)` is one
+;;; RBAC rule. All builders live in `(hexol k8s)`; this file consumes them.
 
 (use-modules (hexol k8s))
 
@@ -22,7 +18,7 @@
 
   ;; ---- tintin: public app in namespace "tintin" ----
   (with-namespace "tintin"
-    ;; ServiceAccount + ClusterRole + ClusterRoleBinding, merged into one op.
+    ;; ServiceAccount + ClusterRole + ClusterRoleBinding in one op.
     (cluster-rbac "tintin"
       (rule (api-groups "")     (resources "configmaps" "secrets") (verbs "get" "list" "watch"))
       (rule (api-groups "")     (resources "pods" "services")      (verbs "get" "list"))

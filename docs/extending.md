@@ -130,7 +130,7 @@ k8s))`. It is still just Scheme procedures returning ops:
 | Feature                           | How it's built                                                           |
 |-----------------------------------|--------------------------------------------------------------------------|
 | `(resource <alist>)`              | A procedure that returns `op:append` into `(kubernetes_resources)`.      |
-| `app` / `public-app` / `worker`   | Procedures that build N resource ops and bundle them via `compose-ops`.  |
+| `app` / `public-app`              | Procedures that build N resource ops and bundle them via `compose-ops`.  |
 | `configmap` / `secret`            | Same — methods returning resource ops.                                   |
 | `tls-all`                         | A `transform-resources` walking Ingresses and deep-merging TLS sections. |
 | `annotate-all` / `label-all`      | `transform-resources` over every resource.                              |

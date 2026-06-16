@@ -1,62 +1,30 @@
 ;;; examples/homelab.scm — a whole homelab from one inventory.
 ;;;
-;;; A single file that describes a self-hosted Kubernetes homelab end to end:
-;;; the infrastructure that runs it (a 3-node Talos cluster on OVH's public
-;;; cloud, an OpenStack region) and the cluster itself (the platform Helm
-;;; charts plus a handful of self-hosted apps). Because every op bottoms out
-;;; in the same state alist, the two concerns live in one `(hx-ops …)` and
-;;; are pulled apart at *render* time by picking a different accumulator —
-;;; this is hexol's "same inventory, different effects" property:
+;;; A self-hosted Kubernetes homelab end to end: infra (3-node Talos cluster on
+;;; OVH public cloud) + cluster (platform Helm charts + self-hosted apps). Both
+;;; live in one `(hx-ops …)` and split at *render* time by accumulator:
 ;;;
-;;;   ;; 1. the infrastructure  →  Terraform JSON (the (terraform_config) tree)
-;;;   ./bin/hexol render -o terraform examples/homelab.scm > infra.tf.json
-;;;   terraform init && terraform apply           # OpenStack creds via OS_* / clouds.yaml
-;;;   terraform output -raw talosconfig > ~/.talos/config
-;;;   terraform output -raw kubeconfig  > ~/.kube/config
+;;;   ./bin/hexol render -o terraform examples/homelab.scm > infra.tf.json  # infra
+;;;   ./bin/hexol render -o yaml examples/homelab.scm | kubectl apply -f -  # cluster
+;;;   ./bin/hexol tree / explain …                                          # introspection
 ;;;
-;;;   ;; 2. the cluster         →  multi-doc YAML (the (kubernetes_resources) list)
-;;;   ./bin/hexol render -o yaml examples/homelab.scm | kubectl apply -f -
+;;; Bootstrap is the `siderolabs/talos` provider: `talos_machine_secrets` makes
+;;; the PKI once, `data.talos_machine_configuration` renders per-node config from
+;;; those secrets + our patches, each node boots it as `user_data`, and
+;;; `talos_machine_bootstrap` inits etcd on node 1. Talos runs `cni: none` +
+;;; `proxy.disabled`, so Cilium (below) is the CNI + kube-proxy replacement.
 ;;;
-;;;   ;; and the usual introspection over the whole thing:
-;;;   ./bin/hexol tree examples/homelab.scm
-;;;   ./bin/hexol explain terraform_config.resource examples/homelab.scm
-;;;
-;;; Bootstrap. The hardest part of a Talos cluster is PKI + the one-time
-;;; `bootstrap` call, and we let the `siderolabs/talos` Terraform provider own
-;;; both: `talos_machine_secrets` generates the cluster CA/keys once,
-;;; `data.talos_machine_configuration` renders a per-node machine config from
-;;; those secrets plus our patches (built *here*, in Scheme, and serialized to
-;;; YAML), each node boots that config as its `user_data`, and
-;;; `talos_machine_bootstrap` initialises etcd on the first node. `terraform
-;;; apply` therefore takes bare VMs to a running, kubeconfig-yielding cluster.
-;;; Talos is configured with `cni: none` + `proxy.disabled`, so Cilium (below)
-;;; is the CNI and the kube-proxy replacement — apply it first, then the rest.
-;;;
-;;; Helm charts are rendered, not delegated. Rather than emit a Flux/Argo
-;;; release object and need a controller in-cluster to expand it, each chart is
-;;; expanded *at render time* by shelling out to `helm template` and splicing
-;;; the manifests it prints straight into `(kubernetes_resources)` — the same
-;;; "read a local input while folding" trick as the SSH key above. So
-;;; `-o yaml` is a complete, self-contained manifest stream (`kubectl apply`
-;;; needs nothing else), every chart object is a first-class resource the CLI
-;;; can label / explain, and the chart's `values` is a plain Scheme alist we
-;;; serialize to the `--values` file. This needs `helm` and `yq` on PATH at
-;;; render time; resolving the inventory runs them, so `-o terraform` on a host
-;;; without them just warns and skips the charts (the infra is unaffected).
-;;;
-;;; The OVH/OpenStack resource types, the Talos config knobs, the chart list
-;;; and the apps are all *content* and live here; (hexol terraform) only knows
-;;; the Terraform language and (hexol k8s) only knows Kubernetes.
+;;; Helm charts are expanded at render time via `helm template` and spliced into
+;;; (kubernetes_resources) — not delegated to a Flux/Argo controller. So `-o yaml`
+;;; is self-contained and every chart object is first-class/explainable. Needs
+;;; helm + yq on PATH; `-o terraform` without them warns and skips charts.
 
-(use-modules (hexol k8s)         ; Kubernetes vocabulary (+ surface: hx-ops, str, fmt, …;
-                                 ; namespace, role/role-binding, which-cmd/json-manifests,
-                                 ; remote-manifest — the external-manifest plumbing)
-             (hexol terraform)   ; Terraform language vocabulary
-             (hexol yaml)        ; emit-yaml-document — to build Talos user_data + helm values
-             (hexol apply)       ; appliers / terraform-applier / kubectl-applier + checks
-                                 ; (wait-for / check / report / cmd) — the `hexol apply` effects
-             (hexol secrets)     ; secrets-store / secret-ref / resolve-secret-refs — inline sops
-             (ice-9 textual-ports) ; get-string-all — read the SSH key / helm values file
+(use-modules (hexol k8s)         ; Kubernetes vocab + external-manifest plumbing
+             (hexol terraform)   ; Terraform language vocab
+             (hexol yaml)        ; emit-yaml-document — Talos user_data + helm values
+             (hexol apply)       ; appliers + checks for `hexol apply`
+             (hexol secrets)     ; inline sops: secrets-store / secret-ref / resolve-secret-refs
+             (ice-9 textual-ports) ; get-string-all — read SSH key / helm values file
              (srfi srfi-1)
              (srfi srfi-13))
 
@@ -64,29 +32,25 @@
 ;; deployment knobs (content)
 ;; ---------------------------------------------------------------------------
 
-;; Every knob in one place: the defaults, with a single `deep-merge` layering
-;; on any environment overrides (only keys whose var is actually set win).
-;; `(cfg 'key)` reads one; the two derived values are functions of it.
+;; Defaults, with `deep-merge` layering on env overrides. `(cfg 'key)` reads one.
 (define config
   (deep-merge
    '((cluster-name  . "homelab")
      (domain        . "homelab.example")
      (node-count    . 3)
      (talos-version . "v1.13.4")         ; docs.siderolabs.com/talos/v1.13
-     ;; Image Factory schematic; default is the vanilla (no-extensions) one.
-     (talos-schematic . "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba")
+     (talos-schematic . "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba") ; Image Factory; vanilla
      (os-region     . "GRA11")           ; an OVH public-cloud region
      (node-flavor   . "b2-7")            ; 2 vCPU / 7 GiB
      (ext-net       . "Ext-Net")         ; OVH's external (floating-IP) network
      (net-cidr      . "10.0.10.0/24")
      (dns-zone      . #f)                 ; OVH DNS zone owning `domain`; #f → `domain` itself
      (ovh-endpoint  . "ovh-eu")           ; OVH API region for the `ovh` provider
-     (ingress-http-hostport  . 30080)     ; PUBLIC Gateway host ports (host-network); the
-     (ingress-https-hostport . 30443)     ;   ingress LB forwards 80/443 here
-     (private-http-hostport  . 80)        ; PRIVATE Gateway host ports — VPN-only: not
-     (private-https-hostport . 443)       ;   LB-fronted and not opened in the secgroup, so
-                                          ;   reachable only over the VPN (node-to-node self-rule)
-     (wg-port                . 51820))    ; WireGuard UDP — the only publicly exposed VPN port
+     (ingress-http-hostport  . 30080)     ; PUBLIC Gateway host ports; LB forwards 80/443 here
+     (ingress-https-hostport . 30443)
+     (private-http-hostport  . 80)        ; PRIVATE Gateway host ports — not LB-fronted, not in
+     (private-https-hostport . 443)       ;   the secgroup, so VPN-only (node-to-node self-rule)
+     (wg-port                . 51820))    ; WireGuard UDP — the only public VPN port
    (filter-map (lambda (binding)
                  (and=> (getenv (car binding))
                         (lambda (v) (cons (cdr binding) v))))
@@ -96,32 +60,27 @@
 
 (define (cfg key) (assq-ref config key))
 
-;; The kube-API endpoint: a DNS A record pointing at the API load balancer.
+;; The kube-API endpoint: a DNS A record at the API load balancer.
 (define (api-endpoint) (fmt "https://api.~a:6443" (cfg 'domain)))
 
 ;; A node's private IP, as a Terraform interpolation into its Neutron port's
-;; allocated address. The IP is NOT pinned (see `talos-node`): each node gets a
-;; dynamic IP from the subnet, so nothing competes with auto-allocated ports
-;; (the LB VIP, its amphora) for a fixed address — the original cp-3 failure.
-;; Everything that needs the IP — certSANs, LB members, the `*.<domain>` DNS —
-;; references this, so the value is resolved at apply from the real allocation.
+;; allocated address. NOT pinned (see `talos-node`): each node draws a dynamic
+;; IP, so nothing competes with auto-allocated ports (LB VIP, amphora) for a
+;; fixed address. certSANs, LB members, `*.<domain>` DNS reference this.
 (define (node-ip i)
   (tf-ref "openstack_networking_port_v2" (str "cp-" i) "all_fixed_ips[0]"))
 
-;; The control-plane nodes, as (index . private-ip-ref) pairs: homelab-cp-1 …
-;; (these double as control plane + workers — a homelab runs its apps on the
-;; same three machines). The cdr is the `node-ip` interpolation, not a literal.
+;; Control-plane nodes as (index . private-ip-ref) pairs. These double as
+;; workers — a homelab runs its apps on the same machines.
 (define (nodes)
   (map (lambda (i) (cons i (node-ip i))) (iota (cfg 'node-count) 1)))
 
-;; The OVH DNS zone that owns `domain`. Defaults to `domain` itself; override
-;; (HOMELAB_DNS_ZONE) when `domain` is a subdomain of a larger zone you hold at
-;; OVH — e.g. zone "example.com", domain "homelab.example.com".
+;; The OVH DNS zone owning `domain`. Defaults to `domain`; override
+;; (HOMELAB_DNS_ZONE) when `domain` is a subdomain of a larger OVH zone.
 (define (dns-zone) (or (cfg 'dns-zone) (cfg 'domain)))
 
-;; OVH splits a record into (zone, subdomain); `subdomain-of` derives the
-;; subdomain from a full host: "api.homelab.example" in zone "homelab.example"
-;; → "api"; the bare zone → "" (the apex).
+;; OVH splits a record into (zone, subdomain); derive the subdomain from a full
+;; host: "api.homelab.example" in zone "homelab.example" → "api"; zone → "".
 (define (subdomain-of fqdn)
   (let ((z (dns-zone)))
     (cond ((string=? fqdn z) "")
@@ -133,12 +92,10 @@
 ;; Talos machine config (content) — built as Scheme data, rendered to YAML.
 ;; ---------------------------------------------------------------------------
 ;;
-;; A strategic-merge patch layered onto the config the talos provider renders
-;; from the cluster secrets. One per node so each gets its own hostname; the
-;; rest is shared. `cni: none` + `proxy.disabled` hand networking to Cilium,
-;; KubePrism gives every node a local API endpoint (localhost:7445) that
-;; Cilium's kube-proxy replacement targets, and control planes are made
-;; schedulable so the apps below have somewhere to run.
+;; A strategic-merge patch layered onto the provider's config, one per node.
+;; `cni: none` + `proxy.disabled` hand networking to Cilium, KubePrism gives a
+;; node-local API endpoint (localhost:7445) Cilium's kube-proxy replacement
+;; targets, and control planes are made schedulable to run the apps below.
 
 (define (yaml-string alist)
   "Serialize ALIST to a YAML document string (for a Terraform string field)."
@@ -150,21 +107,16 @@
     `((machine
         (type . "controlplane")
         (certSANs ,(str "api." (cfg 'domain)) ,ip ,node-fip "127.0.0.1" "localhost")
-        ;; No machine.network.hostname: as of Talos v1.12+ the provider auto-emits
-        ;; a `HostnameConfig{auto: stable}` document, and a v1alpha1 hostname
-        ;; alongside it fails validation ("static hostname is already set in
-        ;; v1alpha1 config"). `auto` is the lowest-priority hostname source, so
-        ;; the OpenStack platform's metadata hostname (the instance name) wins —
-        ;; nodes still come up as homelab-cp-N.
+        ;; No machine.network.hostname: Talos v1.12+ auto-emits HostnameConfig
+        ;; {auto: stable}, and a v1alpha1 hostname alongside it fails validation.
+        ;; `auto` is lowest-priority, so OpenStack's metadata hostname (the
+        ;; instance name) wins — nodes come up as homelab-cp-N.
         (install (disk . "/dev/vda") (wipe . #f))
         (features (kubePrism (enabled . #t) (port . 7445)))
         (kubelet (extraArgs (rotate-server-certificates . "true"))
-                 ;; A CSI driver (cinder-csi) stages a volume under
-                 ;; /var/lib/kubelet then bind-mounts it into the pod; that
-                 ;; bidirectional propagation needs the kubelet's own mount to
-                 ;; be rshared, which on Talos means declaring it explicitly.
-                 ;; (Harmless without a CSI driver; required once cinder-csi is
-                 ;; in. Rolled to live nodes by `hexol config-apply`.)
+                 ;; cinder-csi bind-mounts volumes via /var/lib/kubelet; that
+                 ;; bidirectional propagation needs the kubelet mount rshared,
+                 ;; declared explicitly on Talos. Rolled by `hexol config-apply`.
                  (extraMounts ((destination . "/var/lib/kubelet")
                                (type . "bind") (source . "/var/lib/kubelet")
                                (options "bind" "rshared" "rw")))))
@@ -177,10 +129,8 @@
 ;; Terraform helpers (content) — OVH OpenStack + the talos provider.
 ;; ---------------------------------------------------------------------------
 
-;; The deployer's SSH public key, read from ~/.ssh at render time (the one
-;; place the inventory touches the local machine — same trick as
-;; examples/terraform.scm). Talos itself has no SSH, but OpenStack requires a
-;; keypair on the instance.
+;; The deployer's SSH public key, read from ~/.ssh at render time. Talos has no
+;; SSH, but OpenStack requires a keypair on the instance.
 (define (read-ssh-public-key)
   (let* ((home (or (getenv "HOME") "."))
          (path (find file-exists?
@@ -193,9 +143,8 @@
 
 ;; --- OpenStack security groups (generic, not Talos-specific) ---
 
-;; One ingress rule: TCP ports FROM..TO reachable from CIDR (default anywhere).
-;; Returns a procedure of the group's resource label, which
-;; `openstack-security-group` supplies — so the call site states only the rule.
+;; One ingress rule: TCP ports FROM..TO from CIDR (default anywhere). Returns a
+;; procedure of the group label, so the call site states only the rule.
 (define* (os-ingress suffix from to #:key (cidr "0.0.0.0/0") (protocol "tcp"))
   (lambda (group)
     (terraform-resource "openstack_networking_secgroup_rule_v2" (str group "-" suffix)
@@ -204,9 +153,8 @@
       (remote_ip_prefix cidr)
       (security_group_id (tf-ref "openstack_networking_secgroup_v2" group "id")))))
 
-;; An allow-all ingress rule from members of the group itself (e.g. etcd,
-;; kubelet, Cilium between cluster nodes). Like `os-ingress`, returns a
-;; procedure of the group label.
+;; An allow-all ingress rule from the group's own members (etcd, kubelet,
+;; Cilium between nodes). Returns a procedure of the label.
 (define (os-ingress-self suffix)
   (lambda (group)
     (terraform-resource "openstack_networking_secgroup_rule_v2" (str group "-" suffix)
@@ -214,10 +162,8 @@
       (remote_group_id   (tf-ref "openstack_networking_secgroup_v2" group "id"))
       (security_group_id (tf-ref "openstack_networking_secgroup_v2" group "id")))))
 
-;; A security group plus its ingress rules, bundled. #:name is the Terraform
-;; resource label other resources reference; #:os-name the OpenStack-visible
-;; name (defaults to #:name). Each rule in #:rules is built by `os-ingress` /
-;; `os-ingress-self` and wired to this group here.
+;; A security group plus its ingress rules. #:name is the Terraform label;
+;; #:os-name the OpenStack-visible name (defaults to #:name).
 (define* (openstack-security-group #:key name os-name (description "") (rules '()))
   (compose-ops 'openstack-security-group `(openstack-security-group ,name)
     (cons
@@ -226,37 +172,29 @@
         (description description))
       (map (lambda (rule) (rule name)) rules))))
 
-;; The cluster's security group: the Talos / Kubernetes API + ingress ports
-;; from anywhere, plus an allow-all rule between cluster members.
+;; The cluster's security group: Talos/Kubernetes API + ingress ports from
+;; anywhere, plus an allow-all rule between members.
 (define (talos-security-group)
   (openstack-security-group
     #:name "talos" #:os-name (str (cfg 'cluster-name) "-talos")
     #:description "Talos + Kubernetes control plane"
     #:rules (list (os-ingress "kube-api" 6443 6443)         ; kube-apiserver
                   (os-ingress "talos"   50000 50001)        ; Talos apid + trustd
-                  ;; the PUBLIC Cilium Gateway's host-network ports — the ingress
-                  ;; LB forwards 80/443 here. The PRIVATE Gateway's ports
-                  ;; (31080/31443) are deliberately NOT opened: they're reachable
-                  ;; only between nodes (the rule below) and over the VPN.
+                  ;; PUBLIC Gateway host-network ports — LB forwards 80/443 here.
+                  ;; PRIVATE Gateway ports stay closed: VPN/node-internal only.
                   (os-ingress "ingress-http"  (cfg 'ingress-http-hostport)  (cfg 'ingress-http-hostport))
                   (os-ingress "ingress-https" (cfg 'ingress-https-hostport) (cfg 'ingress-https-hostport))
                   ;; WireGuard — the single public VPN entrypoint (UDP).
                   (os-ingress "wireguard" (cfg 'wg-port) (cfg 'wg-port) #:protocol "udp")
                   (os-ingress-self "internal"))))           ; etcd, kubelet, Cilium between nodes
 
-;; One control-plane node: an explicit Neutron port (with a DYNAMIC IP), the
-;; machine config Terraform renders for it (from the shared secrets + our
-;; patch), the VM that boots that config and attaches to the port, and a
-;; floating IP so `talosctl`/`kubectl` can reach it.
+;; One control-plane node: explicit Neutron port (dynamic IP), rendered machine
+;; config (secrets + patch), the VM that boots it, and a floating IP.
 ;;
-;; The port is created explicitly rather than left to Nova so its allocated IP
-;; is a referenceable attribute (`node-ip`) — used in certSANs, the LB members,
-;; and DNS — and so nothing is PINNED: each node draws a free IP from the
-;; subnet, which removes the cp-3 collision (an auto-allocated port — the LB
-;; VIP or its amphora — could grab a node's pinned IP before that node's port
-;; was created, failing the VM). Security groups live on the port (not the
-;; instance) since the VM attaches by `port`, and the FIP binds to it directly
-;; — no Nova-auto-port data-source lookup needed.
+;; The port is explicit (not Nova-auto) so its IP is referenceable (`node-ip`,
+;; used in certSANs/LB members/DNS) and nothing is pinned — removing the cp-3
+;; collision where an auto-allocated port could grab a node's pinned IP first.
+;; Security groups live on the port; the FIP binds to it directly.
 (define (talos-node node)
   (let* ((i (car node))
          (host      (str (cfg 'cluster-name) "-cp-" i))
@@ -264,24 +202,20 @@
          (port      (str "cp-" i)))
     (compose-ops 'talos-node `(talos-node ,i)
       (list
-        ;; the node's port — dynamic IP from the subnet pool, our secgroup.
         (terraform-resource "openstack_networking_port_v2" port
           (name           (str host "-port"))
           (network_id     (ref openstack_networking_network_v2 talos id))
           (admin_state_up #t)
           (security_group_ids (list (ref openstack_networking_secgroup_v2 talos id))))
-        ;; data "talos_machine_configuration" "<data-name>" — config = secrets + patch
         (terraform-data "talos_machine_configuration" data-name
           (cluster_name     (cfg 'cluster-name))
           (cluster_endpoint (api-endpoint))
           (machine_type     "controlplane")
-          ;; Pin to the booted image's Talos version — otherwise the provider
-          ;; generates config for its own (possibly newer) schema, adding keys
-          ;; the running apid may reject on config load.
+          ;; Pin to the booted image's version, else the provider emits keys
+          ;; for its own newer schema that the running apid may reject.
           (talos_version    (cfg 'talos-version))
           (machine_secrets  (ref talos_machine_secrets this machine_secrets))
           (config_patches   (list (yaml-string (talos-patch node)))))
-        ;; the VM, attached to that port, booting that machine config
         (terraform-resource "openstack_compute_instance_v2" host
           (name        host)
           (image_id    (ref openstack_images_image_v2 talos id))
@@ -290,15 +224,11 @@
           (user_data   (tf-ref "data.talos_machine_configuration" data-name "machine_configuration"))
           (block network
             (port (tf-ref "openstack_networking_port_v2" port "id")))
-          ;; `user_data' SEEDS first boot only. A later patch edit changes it,
-          ;; which OpenStack treats as ForceNew (it would replace the VM) — so
-          ;; ignore it here and let `hexol config-apply' roll config to the
-          ;; running node via the talos API instead. Day 1 = terraform; day 2 =
-          ;; the rolling, health-gated action. (Removing this pin and editing a
-          ;; patch would rebuild the node, the heavy-handed alternative.)
+          ;; `user_data' seeds first boot only. A later patch edit is ForceNew
+          ;; (would replace the VM), so ignore it and let `hexol config-apply'
+          ;; roll config via the talos API: day 1 = terraform, day 2 = the action.
           (block lifecycle
             (ignore_changes (list "user_data"))))
-        ;; a floating IP, associated to the node's port.
         (terraform-resource "openstack_networking_floatingip_v2" port
           (pool (cfg 'ext-net)))
         (terraform-resource "openstack_networking_floatingip_associate_v2" port
@@ -308,17 +238,12 @@
 
 ;; --- OpenStack load balancer (a generic Octavia LB builder) ---
 
-;; One listener on the LB: a listener + pool on PORT, one member per backend in
-;; #:backends (a list of (suffix . ip)) on #:member-port (default PORT), and a
-;; TCP health monitor when #:monitor. Returns a procedure of (lb-label subnet)
-;; that `openstack-lb` applies — so the call site states only the service.
-;; #:persistence (e.g. "SOURCE_IP") pins a client to one backend for the life of
-;; its session. Required for WireGuard: a UDP round-robin pool sprays a single
-;; client's packets across all backends, but each node runs an INDEPENDENT
-;; WireGuard instance — only the one that handshook holds the session, so the
-;; rest are dropped and the tunnel's data plane collapses (handshake succeeds,
-;; everything after times out). SOURCE_IP stickiness keeps a client on the node
-;; it handshook with.
+;; One listener on the LB: listener + pool on PORT, one member per #:backends
+;; entry ((suffix . ip)) on #:member-port (default PORT), and a TCP health
+;; monitor when #:monitor. Returns a procedure of (lb-label subnet).
+;; #:persistence (e.g. "SOURCE_IP") pins a client to one backend per session —
+;; required for WireGuard, where each node runs an independent wg instance so a
+;; round-robined client black-holes on the nodes it didn't handshake with.
 (define* (lb-listener name #:key port (member-port port) (protocol "TCP")
                       (monitor #f) (persistence #f) (backends '()))
   (lambda (lb subnet)
@@ -327,7 +252,7 @@
         (terraform-resource "openstack_lb_listener_v2" name
           (name name) (protocol protocol) (protocol_port port)
           (loadbalancer_id (tf-ref "openstack_lb_loadbalancer_v2" lb "id")))
-        ;; pool — with optional SOURCE_IP stickiness (a nested `persistence' block)
+        ;; pool — optional SOURCE_IP stickiness
         (if persistence
             (terraform-resource "openstack_lb_pool_v2" name
               (name name) (protocol protocol) (lb_method "ROUND_ROBIN")
@@ -349,12 +274,9 @@
                (subnet_id     (tf-ref "openstack_networking_subnet_v2" subnet "id"))))
            backends))))
 
-;; A complete Octavia load balancer fronting a set of TCP services on one VIP.
-;; Builds the loadbalancer, a floating IP bound to its VIP (from #:ext-net), and
-;; the listener/pool/members for each entry in #:listeners (built with
-;; `lb-listener`). #:name is the resource label of both the LB and the floating
-;; IP — so `(ref openstack_networking_floatingip_v2 <name> address)` is the VIP.
-;; #:subnet is the member subnet's resource label.
+;; A complete Octavia LB fronting TCP services on one VIP: loadbalancer, a
+;; floating IP bound to its VIP (from #:ext-net), and listeners. #:name labels
+;; both the LB and the floating IP (the VIP); #:subnet is the member subnet.
 (define* (openstack-lb #:key name os-name subnet ext-net (listeners '()))
   (compose-ops 'openstack-lb `(openstack-lb ,name)
     (append
@@ -375,10 +297,8 @@
 ;; OVH DNS (content) — records in an OVH-hosted zone, via the `ovh` provider.
 ;; ---------------------------------------------------------------------------
 
-;; One OVH A-record named RNAME (the Terraform resource label), pointing the
-;; full host HOST at TARGET (an IP or a `${…address}` interpolation). `zone`
-;; and `subdomain` are OVH's split of the FQDN, derived from HOST so the call
-;; site reads as the name it creates.
+;; One OVH A-record labelled RNAME, pointing HOST at TARGET (an IP or
+;; interpolation). `zone`/`subdomain` are OVH's split of the FQDN.
 (define* (dns-a rname host #:key target (ttl 60))
   (terraform-resource "ovh_domain_zone_record" rname
     (zone      (dns-zone))
@@ -391,45 +311,30 @@
 ;; Kubernetes helpers (content) — two layers of Helm + Gateway API + apps.
 ;; ---------------------------------------------------------------------------
 ;;
-;; The cluster bootstraps in two layers, and the two layers use Helm two
-;; different ways:
+;; The cluster bootstraps in two layers:
 ;;
-;;   • Bootstrap (Cilium + Flux). These must exist before anything else can:
-;;     Cilium is the CNI (Talos runs `cni: none`), and Flux is the controller
-;;     that reconciles everything below. There is no controller yet to expand
-;;     a release object, so they are expanded *here* by `helm-template` —
-;;     shelling out to `helm template`, converting the YAML to JSON with `yq`,
-;;     reading it back with guile-json, and appending each manifest as an
-;;     ordinary `resource`. So `-o yaml` carries their full manifests, ready
-;;     to `kubectl apply` before the cluster has any operators.
+;;   • Bootstrap (Cilium + Flux): must exist before anything else, and no
+;;     controller exists yet to expand a release object — so expanded *here* by
+;;     `helm-template`, each manifest appended as an ordinary `resource`.
 ;;
-;;   • Everything else is GitOps. Once Flux runs, the remaining charts are
-;;     declared as Flux resources — a `HelmRepository` (chart source) plus a
-;;     `HelmRelease` (chart ref + version + `values`) — and Flux reconciles
-;;     them in-cluster. We only emit the small CRs; the chart's own objects
-;;     are Flux's job.
+;;   • Everything else is GitOps: once Flux runs, the rest are declared as Flux
+;;     `HelmRepository` + `HelmRelease` CRs and reconciled in-cluster.
 ;;
-;; `helm-template` is a fold-time op (a `make-op`, like `expose`): `tree`/`ops`
-;; never shell out, only a real resolve does — and if `helm`/`yq` are missing
-;; it warns and skips, leaving the rest of the render intact.
+;; `helm-template` is a fold-time op: `tree`/`ops` never shell out, only a real
+;; resolve does — and if `helm`/`yq` are missing it warns and skips.
 
-;; `namespace`, `which-cmd`, `json-manifests`, and `remote-manifest` now live in
-;; (hexol k8s); `helm-template` and `sops-manifest` below build on the shared
-;; `which-cmd` / `json-manifests` plumbing.
-
-;; Cluster-scoped kinds carry no namespace; everything else defaults to the
-;; release namespace. (Not exhaustive — just the kinds these charts emit.)
+;; Cluster-scoped kinds carry no namespace; the rest default to the release
+;; namespace. (Not exhaustive — just the kinds these charts emit.)
 (define cluster-scoped-kinds
   '("Namespace" "Node" "PersistentVolume" "ClusterRole" "ClusterRoleBinding"
     "CustomResourceDefinition" "ClusterIssuer" "StorageClass" "IngressClass"
     "GatewayClass" "PriorityClass" "RuntimeClass" "CSIDriver" "APIService"
     "ValidatingWebhookConfiguration" "MutatingWebhookConfiguration"))
 
-;; Stamp metadata.namespace = NS onto R when it is a namespaced kind that
-;; lacks one. `helm template --namespace NS` only sets `.Release.Namespace`;
-;; charts that don't reference it in their templates (e.g. flux2) emit no
-;; namespace, so `kubectl apply` would drop them in `default`. This mirrors
-;; what `helm install -n NS` does, keeping the rendered stream self-contained.
+;; Stamp metadata.namespace = NS onto R when it is namespaced but lacks one.
+;; `helm template --namespace NS` only sets `.Release.Namespace`; charts that
+;; don't reference it (e.g. flux2) emit none, so `kubectl apply` would drop them
+;; in `default`. Mirrors `helm install -n NS`.
 (define (stamp-namespace ns r)
   (let ((kind (assq-ref r 'kind))
         (meta (or (assq-ref r 'metadata) '())))
@@ -469,10 +374,8 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                      state manifests)))))))
     (string-append "helm-template " name)))
 
-;; The upstream Gateway API CRDs. Cilium's Gateway API support requires these to
-;; pre-exist, and Cilium does not ship them; we use the *experimental* channel
-;; because Cilium watches TLSRoute. Pinned to a release.
-;; This could actually be hardcoded directly in the hx-ops. The function is very small
+;; Upstream Gateway API CRDs. Cilium requires these to pre-exist but doesn't
+;; ship them; the *experimental* channel because Cilium watches TLSRoute.
 (define gateway-api-version "v1.1.0")
 (define (gateway-api-crds)
   (remote-manifest "gateway-api-crds"
@@ -480,23 +383,15 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                         "/releases/download/~a/experimental-install.yaml")
          gateway-api-version)))
 
-;; cert-manager's CRDs, pulled from the chart's standalone CRD bundle and
-;; applied as a pre-step — so the ClusterIssuer / Certificate CRs below
-;; validate at apply time even though cert-manager *itself* is installed by
-;; Flux (asynchronously). The Flux HelmRelease runs with crds disabled, so the
-;; two never fight over CRD ownership. Same pattern as `gateway-api-crds`;
-;; pinned to the chart version below.
+;; cert-manager's CRDs as a pre-step, so the ClusterIssuer/Certificate CRs
+;; validate at apply time even though cert-manager is installed by Flux (async).
+;; The HelmRelease runs with crds disabled, so the two never fight over ownership.
 (define cert-manager-version "v1.15.1")
 (define (cert-manager-crds)
   (remote-manifest "cert-manager-crds"
     (fmt (string-append "https://github.com/cert-manager/cert-manager"
                         "/releases/download/~a/cert-manager.crds.yaml")
          cert-manager-version)))
-
-;; Secrets are no longer spliced from per-secret `*.sops.yaml` files; they live
-;; in one inline `(secrets-store …)` (below), referenced at each field with
-;; `(secret-ref 'key)` and decrypted once at render time by the terminal
-;; `(resolve-secret-refs)` op. See (hexol secrets).
 
 ;; --- GitOps layer: charts as Flux resources (reconciled in-cluster) ---
 
@@ -507,9 +402,8 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     (namespace namespace)
     (spec `((interval . ,interval) (url . ,url)))))
 
-;; A Flux HelmRelease: CHART from the REPO HelmRepository at VERSION, deployed
-;; into TARGET-NAMESPACE with VALUES. The CR itself lives in flux-system (where
-;; Flux watches); Flux expands the chart and creates the target namespace.
+;; A Flux HelmRelease: CHART from REPO at VERSION into TARGET-NAMESPACE with
+;; VALUES. The CR lives in flux-system; Flux expands the chart.
 (define* (helm-release #:key name chart repo version target-namespace
                        (release-name name) (timeout #f)
                        (namespace "flux-system") (values '()) (interval "1h"))
@@ -517,10 +411,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     (api "helm.toolkit.fluxcd.io/v2") (kind "HelmRelease")
     (namespace namespace)
     (spec `((interval . ,interval)
-             ;; Pin the Helm release name. Flux otherwise defaults it to
-             ;; `<targetNamespace>-<name>`, which doubles every chart resource
-             ;; name (e.g. `monitoring-kube-prometheus-stack-grafana`) and
-             ;; breaks Service references / RBAC that assume the chart default.
+             ;; Pin the release name; Flux otherwise defaults to
+             ;; `<targetNamespace>-<name>`, breaking Service refs / RBAC that
+             ;; assume the chart default.
              (releaseName . ,release-name)
              ,@(if target-namespace
                    `((targetNamespace  . ,target-namespace)
@@ -534,10 +427,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
              (upgrade (crds . "CreateReplace") (remediation (retries . 3)))
              (values ,@values)))))
 
-;; Rancher local-path-provisioner as a self-contained bundle: namespace (PSS
-;; `privileged` — its helper pods mount hostPath), RBAC, the config (data path
-;; under Talos's writable /var), the provisioner Deployment, and a default
-;; StorageClass. Translated from the upstream v0.0.30 deploy manifest.
+;; Rancher local-path-provisioner, self-contained: namespace (PSS `privileged`,
+;; helper pods mount hostPath), RBAC, config, Deployment, StorageClass.
+;; Translated from the upstream v0.0.30 deploy manifest.
 (define (local-path-provisioner)
   (let ((ns "local-path-storage")
         (sa "local-path-provisioner-service-account"))
@@ -545,9 +437,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
       (list
         (namespace ns (labels (pod-security.kubernetes.io/enforce "privileged")))
         (service-account sa (namespace ns))
-        ;; namespaced Role + RoleBinding: manage the helper pods in its own
-        ;; namespace (library `role`/`role-binding` — the namespaced counterparts
-        ;; of `cluster-role`/`cluster-role-binding`).
+        ;; namespaced Role + RoleBinding: manage helper pods in its own namespace.
         (role "local-path-provisioner-role" (namespace ns)
           (rule (api-groups "") (resources "pods")
                 (verbs "get" "list" "watch" "create" "patch" "update" "delete")))
@@ -565,109 +455,54 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                 (verbs "get" "list" "watch")))
         (cluster-role-binding "local-path-provisioner-bind"
           (role "local-path-provisioner-role") (service-account sa) (sa-namespace ns))
-        ;; config: data path under /var (Talos-writable), helper pod + scripts.
-        ;; Must be /var/local-path-provisioner, NOT /var/mnt/…: on Talos /var is
-        ;; the writable ephemeral partition, but /var/mnt is the read-only
-        ;; mountpoint reserved for user-attached disks (we attach none), so a
-        ;; helper pod hostPath-mounting under it fails with "mkdir … read-only
-        ;; file system" and every PVC hangs Pending.
+        ;; config: data path /var/local-path-provisioner, NOT /var/mnt/… — on
+        ;; Talos /var is writable but /var/mnt is read-only, so a hostPath mount
+        ;; under it fails and every PVC hangs Pending.
         (configmap "local-path-config" (namespace ns)
           (data
             (config.json "{\n  \"nodePathMap\":[\n    { \"node\":\"DEFAULT_PATH_FOR_NON_LISTED_NODES\", \"paths\":[\"/var/local-path-provisioner\"] }\n  ]\n}")
             (setup "#!/bin/sh\nset -eu\nmkdir -m 0777 -p \"$VOL_DIR\"")
             (teardown "#!/bin/sh\nset -eu\nrm -rf \"$VOL_DIR\"")
             (helperPod.yaml "apiVersion: v1\nkind: Pod\nmetadata:\n  name: helper-pod\nspec:\n  priorityClassName: system-node-critical\n  tolerations:\n    - key: node.kubernetes.io/disk-pressure\n      operator: Exists\n      effect: NoSchedule\n  containers:\n  - name: helper-pod\n    image: busybox\n    imagePullPolicy: IfNotPresent")))
-        ;; the provisioner itself (raw: needs a fieldRef env the generic
-        ;; `deployment` constructor doesn't model)
-        (resource
-          `((apiVersion . "apps/v1") (kind . "Deployment")
-            (metadata (namespace . ,ns) (name . "local-path-provisioner")
-                      (labels (app . "local-path-provisioner")))
-            (spec (replicas . 1)
-                  (selector (matchLabels (app . "local-path-provisioner")))
-                  (template
-                    (metadata (labels (app . "local-path-provisioner")))
-                    (spec (serviceAccountName . ,sa)
-                          (containers
-                            ((name . "local-path-provisioner")
-                             (image . "rancher/local-path-provisioner:v0.0.30")
-                             (command "local-path-provisioner" "--debug" "start"
-                                      "--config" "/etc/config/config.json")
-                             (volumeMounts ((name . "config-volume") (mountPath . "/etc/config/")))
-                             (env ((name . "POD_NAMESPACE")
-                                   (valueFrom (fieldRef (fieldPath . "metadata.namespace"))))
-                                  ((name . "CONFIG_MOUNT_PATH") (value . "/etc/config/")))))
-                          (volumes ((name . "config-volume")
-                                    (configMap (name . "local-path-config")))))))))
-        ;; A non-default StorageClass for node-local scratch (cinder-csi below
-        ;; is now the default). Explicitly is-default-class "false" so there is
-        ;; exactly one default in the cluster — two defaults is an error k8s
-        ;; resolves arbitrarily. Opt in per-PVC with storageClassName "local-path".
-        (resource
-          `((apiVersion . "storage.k8s.io/v1") (kind . "StorageClass")
-            (metadata (name . "local-path")
-                      (annotations (storageclass.kubernetes.io/is-default-class . "false")))
-            (provisioner . "rancher.io/local-path")
-            (volumeBindingMode . "WaitForFirstConsumer")
-            (reclaimPolicy . "Delete")))))))
+        ;; the provisioner itself; fieldRef env passed as raw EnvVar entries.
+        (deployment "local-path-provisioner" (namespace ns) (port 0)
+          (image "rancher/local-path-provisioner:v0.0.30")
+          (service-account sa)
+          (command "local-path-provisioner" "--debug" "start"
+                   "--config" "/etc/config/config.json")
+          (env '((name . "POD_NAMESPACE")
+                 (valueFrom (fieldRef (fieldPath . "metadata.namespace"))))
+               '((name . "CONFIG_MOUNT_PATH") (value . "/etc/config/")))
+          (volumes (mount (cm "local-path-config") "/etc/config/")))
+        ;; Node-local scratch StorageClass; non-default (no default annotation)
+        ;; since cinder-csi is the one default.
+        (storage-class "local-path" (provisioner "rancher.io/local-path")
+          (volume-binding-mode "WaitForFirstConsumer") (reclaim-policy "Delete"))))))
 
-;; A Gateway API Gateway (handled by Cilium's GatewayClass) terminating TLS
-;; for *.<domain> with the wildcard cert cert-manager issues below.
-;; In host-network mode the listener `port` is the host port Envoy binds on
-;; every node (must be unique per Gateway and >1023 — we use 30080/30443, so no
-;; privileged-port capability is needed). The Octavia ingress LB forwards
-;; 80→http-port and 443→https-port.
-(define* (gateway #:key name (class "cilium") (namespace (current-k8s-namespace))
-                  (http-port 80) (https-port 443))
-  (custom-resource name
-    (api "gateway.networking.k8s.io/v1") (kind "Gateway")
-    (namespace namespace)
-    (spec `((gatewayClassName . ,class)
-             (listeners
-               ((name . "http") (protocol . "HTTP") (port . ,http-port)
-                (allowedRoutes (namespaces (from . "All"))))
-               ((name . "https") (protocol . "HTTPS") (port . ,https-port)
-                (hostname . ,(str "*." (cfg 'domain)))
-                (allowedRoutes (namespaces (from . "All")))
-                (tls (mode . "Terminate")
-                     (certificateRefs ((kind . "Secret") (name . "wildcard-tls"))))))))))
+;; edge-gateway: the library `gateway` wrapped with this homelab's two-listener
+;; shape (plain HTTP + Terminate-TLS HTTPS on the wildcard cert). In host-network
+;; mode the listener `port` is the host port Envoy binds on every node (unique
+;; per Gateway); the Octavia LB forwards 80/443 to it.
+(define* (edge-gateway #:key name http-port https-port)
+  (gateway name (gateway-class-name "cilium") (namespace "gateway")
+    (listener "http"  (protocol "HTTP")  (port http-port))
+    (listener "https" (protocol "HTTPS") (port https-port)
+              (hostname (str "*." (cfg 'domain))) (tls-certificate "wildcard-tls"))))
 
-;; An HTTPRoute attaching one Service to that Gateway under host.<domain>.
-(define* (httproute #:key name (namespace (current-k8s-namespace)) host service port
-                    (gateway-name "homelab") (gateway-namespace "gateway"))
-  (custom-resource name
-    (api "gateway.networking.k8s.io/v1") (kind "HTTPRoute")
-    (namespace namespace)
-    (spec `((parentRefs ((name . ,gateway-name) (namespace . ,gateway-namespace)))
-             (hostnames ,(str host "." (cfg 'domain)))
-             (rules ((backendRefs ((name . ,service) (port . ,port)))))))))
-
-(define* (pvc #:key name size (namespace (current-k8s-namespace)) (mode "ReadWriteOnce"))
-  (resource `((apiVersion . "v1") (kind . "PersistentVolumeClaim")
-              (metadata (namespace . ,namespace) (name . ,name) (labels (app . ,name)))
-              (spec (accessModes ,mode)
-                    (resources (requests (storage . ,size)))))))
-
-;; A stateful self-hosted app: a PVC, a single-replica Deployment that mounts
-;; it, and a Service. The Deployment is built as a raw `resource` (like the
-;; local-path-provisioner / wireguard workloads above) rather than via the
-;; library `deployment`: its `env` is a runtime list, and the record-body
-;; `(env …)` field expects literal entries, not a spliced variable — the
-;; alist below mirrors exactly what `(deployment …)` would emit. The PVC and
-;; the matching Service round out the bundle.
+;; A stateful self-hosted app: PVC + single-replica Deployment that mounts it +
+;; Service. The Deployment is a raw `resource` (not the library `deployment`)
+;; because its `env` is a runtime list the record-body field can't splice.
 ;;
-;; `#:expose`, when non-empty, is a list of `httproute` keyword arguments
-;; (e.g. `'(#:host "vault" #:gateway-name "homelab-private")`) — the route is
-;; appended to the bundle with #:name / #:service / #:port / #:namespace
-;; defaulting to this app's (override any by listing it in #:expose, which wins).
+;; #:route-host, when set, appends an HTTPRoute on #:route-gateway exposing this
+;; app at <route-host>.<domain>.
 (define* (stateful-app #:key name image port (namespace (current-k8s-namespace))
                        (storage "5Gi") (mount "/data") (env '()) (resources "100m-*/256Mi")
-                       (expose '()))
+                       (route-host #f) (route-gateway #f))
   (let ((vol (string-append "pvc-" name)))
     (compose-ops 'stateful-app `(stateful-app ,name)
       (append
         (list
-          (pvc #:name name #:size storage #:namespace namespace)
+          (persistent-volume-claim name (size storage) (namespace namespace))
           (resource
             `((apiVersion . "apps/v1") (kind . "Deployment")
               (metadata (namespace . ,namespace) (name . ,name) (labels (app . ,name)))
@@ -685,35 +520,30 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                         (volumes ((name . ,vol)
                                   (persistentVolumeClaim (claimName . ,name)))))))))
           (service name (port port) (namespace namespace)))
-        (if (null? expose)
-            '()
-            (list (apply httproute #:name name #:service name #:port port
-                         #:namespace namespace expose)))))))
+        (if route-host
+            (list (http-route name (namespace namespace)
+                    (parent-name route-gateway) (parent-namespace "gateway")
+                    (hostnames (str route-host "." (cfg 'domain)))
+                    (backend-service name) (backend-port port)))
+            '())))))
 
 ;; ---------------------------------------------------------------------------
 ;; secrets store (content) — one inline, sops-encrypted document
 ;; ---------------------------------------------------------------------------
 ;;
-;; Every secret the cluster needs, in ONE sops document embedded right here:
-;; a single PGP-encrypted data key and MAC cover all of them (the same key
-;; the old `secrets/*.sops.yaml` files used). Values are referenced at their
-;; fields with `(secret-ref 'key)` and decrypted once at render time by the
-;; terminal `(resolve-secret-refs)` op. `data` keys are emitted sorted before
-;; `sops -d`, so the MAC verifies regardless of the order written here.
+;; Every secret in ONE embedded sops document, referenced via `(secret-ref 'key)`
+;; and decrypted once by `(resolve-secret-refs)`. `data` keys are emitted sorted
+;; before `sops -d`, so the MAC verifies regardless of order here.
 ;;
-;; The real, sops-sealed store lives in a sibling `homelab.secrets.scm` that is
-;; gitignored and never committed. We `load` it when present; on a fresh clone
-;; of the public repo it is absent, so we fall back to the dummy store below —
-;; the example still renders end to end, with secrets emitted as
-;; `<unresolved secret: …>` placeholders (the dummy ciphertext won't decrypt).
-;; To change a secret: decrypt the local file, edit, re-seal to the PGP key,
-;; and paste it back (a `hexol secret edit` helper will automate this).
+;; The real sealed store lives in a gitignored `homelab.secrets.scm`, loaded when
+;; present. On a fresh public-repo clone it's absent, so we fall back to the dummy
+;; store below — the example still renders, secrets as `<unresolved secret: …>`.
 (let* ((here  (current-filename))
        (dir   (if here (dirname here) "."))
        (local (string-append dir "/homelab.secrets.scm")))
   (if (file-exists? local)
-      (primitive-load local)                ; real store wins (last registration)
-      (secrets-store                        ; committed, self-contained dummy
+      (primitive-load local)                ; real store wins
+      (secrets-store                        ; committed dummy
         (version "3.12.2")
         (lastmodified "1970-01-01T00:00:00Z")
         (mac "ENC[AES256_GCM,data:DUMMY,iv:DUMMY,tag:DUMMY,type:str]")
@@ -737,36 +567,23 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; appliers (effects) — what `hexol apply` runs, in order, from the state
 ;; ---------------------------------------------------------------------------
 ;;
-;; `render` turns this inventory into artifacts; `apply` pushes them to the
-;; world. The `appliers` form names a sequence and runs it in order: each entry
-;; reads the resolved state directly — no intermediate file to render and
-;; manage — and shells out to its tool. The infra is built and its kubeconfig
-;; dumped to `deploy/kubeconfig` first, so the cluster applies against it:
+;; The `appliers` form names a sequence run in order: each reads resolved state
+;; directly and shells out to its tool. Infra builds first and dumps its
+;; kubeconfig to `deploy/kubeconfig`, so the cluster applies on it:
 ;;
-;;   hexol apply examples/homelab.scm                       # whole bootstrap
+;;   hexol apply examples/homelab.scm                              # whole bootstrap
 ;;   hexol apply --only check-api,kubernetes examples/homelab.scm  # re-apply cluster
-;;   hexol apply --only terraform --dry-run …               # tofu plan only
 ;;
-;; Between deploy steps sit checks (ordinary appliers whose effect is
-;; observation, not mutation): `check-vms` asserts the control-plane VMs are
-;; ACTIVE after terraform; `check-api` is a *gate* — the kubeconfig points at the
-;; LB VIP via DNS, so it blocks until the kube-API actually answers there (DNS
-;; propagation + Octavia health-check settling) before manifests apply.
-;; `check-nodes` is a *smoke test*, non-fatal, after the apply. As standalone
-;; entries both are `--only`-selectable; name `check-api` alongside `kubernetes`
-;; to keep the gate when re-applying just the cluster. (A gate that must *never*
-;; be skipped by `--only kubernetes` could instead ride along as the kubectl
-;; applier's #:pre.)
-;;
-;; No hexol-level prompt: `tofu apply` gates itself; kubectl applies directly.
+;; Between deploy steps sit checks (observe, don't mutate). `check-api` is a
+;; *gate*: the kubeconfig points at the LB VIP via DNS, so it blocks until
+;; kube-API answers there (DNS + Octavia settling) before manifests apply —
+;; name it alongside `kubernetes` to keep the gate on a cluster re-apply.
 (define (kubectl* . args)
   (apply cmd "kubectl" "--kubeconfig=deploy/kubeconfig" args))
 
-;; The public URLs the cluster serves, read straight from the resolved
-;; (kubernetes_resources) — no cluster round-trip. Every HTTPRoute's hostnames
-;; (this homelab routes via Gateway API, not Ingress objects) plus any Ingress
-;; rule host, as `https://…` (both Gateways terminate TLS). Sorted + de-duped so
-;; the post-apply summary is stable.
+;; The public URLs the cluster serves, read from resolved (kubernetes_resources)
+;; — no cluster round-trip. Every HTTPRoute hostname plus any Ingress rule host,
+;; as `https://…`, sorted + de-duped.
 (define (ingress-urls state)
   (let ((rs (or (state-get state '(kubernetes_resources)) '())))
     (sort
@@ -776,10 +593,8 @@ template` and appends every manifest it emits to (kubernetes_resources)."
             (let ((kind (assq-ref r 'kind))
                   (spec (or (assq-ref r 'spec) '())))
               (cond
-                ;; HTTPRoute: spec.hostnames is a list of bare hosts.
                 ((equal? kind "HTTPRoute")
                  (map (lambda (h) (str "https://" h)) (or (assq-ref spec 'hostnames) '())))
-                ;; Ingress: spec.rules[].host (none here today, but stay general).
                 ((equal? kind "Ingress")
                  (filter-map (lambda (rule)
                                (and=> (assq-ref rule 'host) (lambda (h) (str "https://" h))))
@@ -793,11 +608,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
    (terraform-applier #:workdir "deploy" #:binary "tofu"
                       #:output->file '(("kubeconfig" . "deploy/kubeconfig"))))
 
-  ;; Infra smoke test: every control-plane VM reached ACTIVE. `tofu apply` blocks
-  ;; on ACTIVE already, so this mostly guards re-applies and a partial/`-target`
-  ;; build. Uses the `openstack` CLI with the same OS_*/openrc creds tofu used;
-  ;; the one-liner is true iff the unique status of the `<cluster>-cp-*` servers
-  ;; is exactly ACTIVE (empty — none found — fails too).
+  ;; Infra smoke test: every control-plane VM ACTIVE (guards re-applies and
+  ;; `-target` builds). `openstack` CLI with tofu's creds; true iff the unique
+  ;; status of `<cluster>-cp-*` is exactly ACTIVE.
   ("check-vms"
    (check "OpenStack control-plane VMs ACTIVE"
           (cmd "sh" "-c"
@@ -819,10 +632,8 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                     "--for=condition=Ready" "--timeout=10s")
           #:fatal? #f))
 
-  ;; What did we just deploy, and where? A `report` (always runs, never fatal)
-  ;; that prints every service URL — derived from the rendered HTTPRoutes, so it
-  ;; needs no cluster query. The URLs go to stdout (pipeable); report's own
-  ;; framing line is on stderr with the rest of the apply log.
+  ;; A `report` (always runs, never fatal) printing every service URL from the
+  ;; rendered HTTPRoutes. URLs to stdout (pipeable); framing line to stderr.
   ("ingress-urls"
    (report "service URLs"
            (lambda (state)
@@ -835,36 +646,29 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; actions (custom CLI verbs) — what this inventory adds to `hexol`
 ;; ---------------------------------------------------------------------------
 ;;
-;; An applier is a *step* in the `hexol apply` pipeline; an action is its own
-;; *verb*, run only when named — never as part of a bare `hexol apply`. So
-;; teardown belongs here, not in the pipeline: it can't be reached by accident,
-;; and needs no HEXOL_DESTROY guard. `terraform-destroyer` returns the
-;; (state args -> effects) action; `defines-action` registers it as the verb
-;; `hexol` discovers when no built-in matches (built-ins always win).
+;; An applier is a *step* in `hexol apply`; an action is its own *verb*, run only
+;; when named. So teardown belongs here, not the pipeline — unreachable by
+;; accident, no HEXOL_DESTROY guard needed (tofu's own prompt still gates it).
 ;;
 ;;   hexol destroy            -i examples/homelab.scm   # tofu destroy (prompts)
 ;;   hexol destroy --dry-run  -i examples/homelab.scm   # tofu plan -destroy
-;;
-;; tofu's own "Enter a value: yes" prompt still gates the real destruction.
 (actions
   ("destroy" "destroy [--dry-run]   tear the stack down (tofu destroy)"
    (terraform-destroyer #:workdir "deploy" #:binary "tofu"))
 
-  ;; Re-fetch the cluster credentials from existing tofu state, without an
-  ;; apply: writes deploy/kubeconfig + deploy/talosconfig (the same outputs the
-  ;; terraform applier dumps after a real apply). Install them with:
+  ;; Re-fetch cluster credentials from existing tofu state, no apply: writes
+  ;; deploy/kubeconfig + deploy/talosconfig. Install with:
   ;;   hexol output -i examples/homelab.scm
-  ;;   cp deploy/kubeconfig  ~/.kube/config      # or KUBECONFIG=deploy/kubeconfig
-  ;;   cp deploy/talosconfig ~/.talos/config     # or talosctl --talosconfig …
+  ;;   cp deploy/kubeconfig  ~/.kube/config
+  ;;   cp deploy/talosconfig ~/.talos/config
   ("output" "output               write kubeconfig + talosconfig from tofu state"
    (terraform-outputter #:workdir "deploy" #:binary "tofu"
                         #:outputs '(("kubeconfig"  . "deploy/kubeconfig")
                                     ("talosconfig" . "deploy/talosconfig"))))
 
-  ;; Day-2 config rollout: push the inventory's current machine config to the
-  ;; running nodes, ONE at a time, waiting for cluster health between each (so a
-  ;; reboot never breaks etcd quorum). Edit the talos-patch, `hexol apply --only
-  ;; terraform` to refresh state, then:
+  ;; Day-2 config rollout: push machine config to nodes one at a time, waiting
+  ;; for cluster health between each (so a reboot never breaks etcd quorum). Edit
+  ;; the talos-patch, `hexol apply --only terraform` to refresh state, then:
   ;;   hexol config-apply --dry-run -i examples/homelab.scm   # show the diff
   ;;   hexol config-apply           -i examples/homelab.scm   # roll it live
   ("config-apply" "config-apply [--dry-run]   roll machine config to nodes (talosctl, health-gated)"
@@ -899,23 +703,21 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     (domain_name "Default")
     (region      (cfg 'os-region)))
 
-  ;; The talos provider needs no static config — it talks to the nodes.
+  ;; The talos provider needs no static config — it talks to nodes.
   (terraform-provider "talos")
 
-  ;; OVH DNS. Only the API endpoint (region) is pinned here; the API
-  ;; credentials come from the environment: OVH_APPLICATION_KEY,
-  ;; OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY (create at api.ovh.com/createToken
-  ;; with GET/POST/PUT/DELETE on /domain/zone/*).
+  ;; OVH DNS. Only the region is pinned; credentials come from the env
+  ;; (OVH_APPLICATION_KEY/_SECRET, OVH_CONSUMER_KEY — create at
+  ;; api.ovh.com/createToken with GET/POST/PUT/DELETE on /domain/zone/*).
   (terraform-provider "ovh"
     (endpoint (cfg 'ovh-endpoint)))
 
-  ;; Cluster PKI + secrets, generated once and reused by every node config.
+  ;; Cluster PKI + secrets, generated once, reused by every node config.
   (terraform-resource "talos_machine_secrets" "this"
     (talos_version (cfg 'talos-version)))
 
-  ;; The Talos image, uploaded to Glance from Image Factory (newer releases no
-  ;; longer ship an openstack asset on GitHub). A compressed raw disk the
-  ;; provider decompresses on upload.
+  ;; The Talos image, uploaded to Glance from Image Factory. A compressed raw
+  ;; disk decompressed on upload.
   (terraform-resource "openstack_images_image_v2" "talos"
     (name (str "talos-" (cfg 'talos-version)))
     (image_source_url
@@ -952,57 +754,42 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; The 3 control-plane nodes: config + VM + floating IP each.
   (map talos-node (nodes))
 
-  ;; One Octavia load balancer fronting everything on a single VIP / floating
-  ;; IP: the kube-apiserver (6443, health-monitored) and application ingress
-  ;; (80/443). The Cilium Gateway runs in host-network mode (Cilium 1.16+) —
-  ;; there is no cloud LoadBalancer Service on bare OpenStack — so its Envoy
-  ;; binds the `config` host ports (30080/30443) on every node and the LB
-  ;; forwards 80→30080, 443→30443 straight to them. TCP/passthrough: the Gateway
-  ;; terminates the wildcard TLS itself (see the `gateway`/cert-manager section).
-  ;; DNS `api.<domain>` and `*.<domain>` both point at this LB's floating IP.
-  ;; (#:name is required — it's the resource label both the LB and its floating
-  ;; IP take, which the DNS records and the `api_endpoint` output reference.)
+  ;; One Octavia LB fronting everything on a single VIP: kube-apiserver (6443,
+  ;; health-monitored) and ingress (80/443). The Cilium Gateway runs host-network
+  ;; (no cloud LB on bare OpenStack), so its Envoy binds host ports 30080/30443
+  ;; on every node and the LB TCP-forwards 80/443 there (the Gateway terminates
+  ;; the wildcard TLS itself). #:name labels both the LB and the floating IP.
   (openstack-lb #:name "api" #:os-name (str (cfg 'cluster-name) "-api")
     #:subnet "talos" #:ext-net (cfg 'ext-net)
     #:listeners
     (list (lb-listener "kube-api" #:port 6443 #:monitor #t #:backends (node-backends))
           (lb-listener "ingress-http"  #:port 80 #:member-port (cfg 'ingress-http-hostport)  #:backends (node-backends))
           (lb-listener "ingress-https" #:port 443 #:member-port (cfg 'ingress-https-hostport) #:backends (node-backends))
-          ;; SOURCE_IP stickiness: WireGuard sessions are per-node, so a client
-          ;; must keep hitting the one node it handshook with — round-robin
-          ;; across the 3 independent wg instances breaks the tunnel data plane.
+          ;; SOURCE_IP stickiness: wg sessions are per-node (see `lb-listener`).
           (lb-listener "wireguard" #:port (cfg 'wg-port) #:protocol "UDP"
                        #:persistence "SOURCE_IP" #:backends (node-backends))))
 
-  ;; DNS. PUBLIC names resolve to the LB's floating IP: `api.<domain>` (kube-API
-  ;; 6443), `vpn.<domain>` (the WireGuard UDP endpoint), and `jellyfin.<domain>`
-  ;; (the one app on the public Gateway). The `*.<domain>` wildcard instead
-  ;; resolves to the private node IPs — routable only over the VPN — so every
-  ;; other app is private by default (reached on the private Gateway via the
-  ;; node network). Explicit records beat the wildcard, so the public names win.
-  ;; TODO: Move this to a map too
-  (dns-a "api"      (str "api." (cfg 'domain))
-         #:target (ref openstack_networking_floatingip_v2 api address))
-  (dns-a "vpn"      (str "vpn." (cfg 'domain))
-         #:target (ref openstack_networking_floatingip_v2 api address))
-  (dns-a "jellyfin" (str "jellyfin." (cfg 'domain))
-         #:target (ref openstack_networking_floatingip_v2 api address))
+  ;; DNS. PUBLIC names resolve to the LB floating IP; the `*.<domain>` wildcard
+  ;; resolves to the private node IPs (VPN-only), so every other app is private.
+  ;; Explicit records beat the wildcard.
+  (map (lambda (name)
+         (dns-a name (str name "." (cfg 'domain))
+                #:target (ref openstack_networking_floatingip_v2 api address)))
+       '("api" "vpn" "jellyfin"))
   (map (lambda (n)
          (dns-a (str "wildcard-cp-" (car n)) (str "*." (cfg 'domain)) #:target (cdr n)))
        (nodes))
 
-  ;; The one-time bootstrap: initialise etcd on the first node, once its VM
-  ;; (and floating IP) exist.
+  ;; One-time bootstrap: init etcd on node 1, once its VM (and FIP) exist.
   (terraform-resource "talos_machine_bootstrap" "this"
     (node                 (tf-ref "openstack_networking_floatingip_v2" "cp-1" "address"))
     (endpoint             (tf-ref "openstack_networking_floatingip_v2" "cp-1" "address"))
     (client_configuration (ref talos_machine_secrets this client_configuration))
     (depends_on (list "openstack_networking_floatingip_associate_v2.cp-1")))
 
-  ;; Pull the kubeconfig + talosconfig back out as Terraform outputs.
-  ;; talos_cluster_kubeconfig is the *resource* (the data source of the same
-  ;; name is deprecated and slated for removal); it fetches the kubeconfig once
-  ;; the bootstrap has run and stores it in state.
+  ;; Pull kubeconfig + talosconfig back out as Terraform outputs. The
+  ;; talos_cluster_kubeconfig *resource* fetches it once bootstrap ran (the
+  ;; same-named data source is deprecated).
   (terraform-resource "talos_cluster_kubeconfig" "this"
     (client_configuration (ref talos_machine_secrets this client_configuration))
     (node       (tf-ref "openstack_networking_floatingip_v2" "cp-1" "address"))
@@ -1021,10 +808,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     (value (tf-ref "data.talos_client_configuration" "this" "talos_config"))
     (sensitive #t))
 
-  ;; Per-node endpoint + rendered machine config, so the `config-apply' action
-  ;; can pull each node's exact config out of state and roll it (the config is
-  ;; the provider's to render — secrets + PKI + our patch — not hexol's). One
-  ;; (address, config) pair per node: cp_<i>_address / cp_<i>_config.
+  ;; Per-node endpoint + rendered machine config, so `config-apply' can pull
+  ;; each node's exact config from state and roll it. One (address, config) pair
+  ;; per node: cp_<i>_address / cp_<i>_config.
   (append-map
     (lambda (n)
       (let ((i (car n)))
@@ -1040,17 +826,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; CLUSTER  — render with `-o yaml`
   ;; ====================================================================
 
-  ;; flux-system must exist before the flux2 bootstrap chart below (which the
-  ;; chart does not create itself), and that chart is applied before the
-  ;; HelmRepository CRs that need Flux's CRDs — so it is declared up front. The
-  ;; other namespaces (gateway / apps / cert-manager / monitoring) are created by
-  ;; their `with-namespace` blocks, which prepend the Namespace.
-  (namespace "flux-system")
-
   ;; ---- bootstrap layer: expanded inline (no controller exists yet) ----
 
-  ;; Gateway API CRDs — must exist before Cilium's operator starts its Gateway
-  ;; controller (and before the Gateway/HTTPRoutes below).
+  ;; Gateway API CRDs — before Cilium's Gateway controller and the routes.
   (gateway-api-crds)
 
   ;; --- Cilium: CNI + kube-proxy replacement + Gateway API ---
@@ -1058,21 +836,16 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   (helm-template #:name "cilium" #:namespace "kube-system"
     #:chart "cilium" #:repo "https://helm.cilium.io" #:version "1.16.19"
     #:values `((kubeProxyReplacement . #t)
-               ;; Talos KubePrism: a node-local apiserver endpoint.
+               ;; Talos KubePrism: node-local apiserver endpoint.
                (k8sServiceHost . "localhost") (k8sServicePort . 7445)
                (ipam (mode . "kubernetes"))
-               ;; Gateway API in host-network mode: there is no cloud LB on bare
-               ;; OpenStack, so instead of a (forever-pending) LoadBalancer
-               ;; Service, the Gateway's Envoy binds its listener ports directly
-               ;; on every node — the Octavia ingress LB forwards to those host
-               ;; ports (see the ingress LB + gateway sections).
+               ;; Gateway API host-network: no cloud LB on bare OpenStack, so
+               ;; the Gateway's Envoy binds listener ports on every node and the
+               ;; Octavia LB forwards to them (see ingress LB + gateway).
                (gatewayAPI (enabled . #t) (hostNetwork (enabled . #t)))
-               ;; The private Gateway binds privileged ports (80/443) directly on
-               ;; the host. cilium-envoy-starter drops every capability after fork
-               ;; except NET_BIND_SERVICE, and only when keepCapNetBindService is
-               ;; set *and* the cap is granted to the container — so grant both
-               ;; (the `envoy` list replaces the chart default, hence NET_ADMIN +
-               ;; SYS_ADMIN are repeated here).
+               ;; The private Gateway binds privileged ports (80/443), so grant
+               ;; NET_BIND_SERVICE + keepCapNetBindService (the `envoy` list
+               ;; replaces the chart default, hence NET_ADMIN + SYS_ADMIN here).
                (envoy (enabled . #t)
                       (securityContext
                         (capabilities
@@ -1081,176 +854,109 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                (hubble (relay (enabled . #t)) (ui (enabled . #t)))
                (securityContext
                  (capabilities
-                   ;; flat list of capability strings (the chart's values schema
-                   ;; wants a sequence here, not a nested list)
+                   ;; flat list of cap strings (schema wants a sequence)
                    (ciliumAgent "CHOWN" "KILL" "NET_ADMIN" "NET_RAW"
                                 "IPC_LOCK" "SYS_ADMIN" "SYS_RESOURCE"
                                 "DAC_OVERRIDE" "FOWNER" "SETGID" "SETUID")
                    (cleanCiliumState "NET_ADMIN" "SYS_ADMIN" "SYS_RESOURCE")))
-               ;; Talos mount points for the CNI install + cgroup.
+               ;; Talos mount points for CNI install + cgroup.
                (cgroup (autoMount (enabled . #f)) (hostRoot . "/sys/fs/cgroup"))))
 
-  ;; The GatewayClass our Gateway binds to. Cilium does NOT create it itself —
-  ;; it only acts as the controller for one with this controllerName — so the
-  ;; cluster must declare it, or every Gateway stays "Waiting for controller".
-  ;; (The Gateway API CRDs it depends on are spliced in by `gateway-api-crds`.)
-  (resource `((apiVersion . "gateway.networking.k8s.io/v1") (kind . "GatewayClass")
-              (metadata (name . "cilium"))
-              (spec (controllerName . "io.cilium/gateway-controller"))))
+  ;; The GatewayClass our Gateway binds to. Cilium controls one with this
+  ;; controllerName but doesn't create it, so we must — else Gateways stall
+  ;; "Waiting for controller".
+  (gateway-class "cilium" (controller-name "io.cilium/gateway-controller"))
 
   ;; --- kubelet-csr-approver: auto-approve kubelet serving-cert CSRs ---
-  ;; Talos sets `rotate-server-certificates: true`, so each kubelet requests a
-  ;; serving cert via CSR — but nothing approves them by default, so
-  ;; `kubectl logs/exec` and metrics scraping fail with "tls: internal error".
-  ;; This approves CSRs whose SANs match our nodes (hostname pattern + the
-  ;; private subnet); node names aren't in DNS, so resolution is bypassed.
+  ;; Talos sets `rotate-server-certificates: true`; nothing approves the
+  ;; resulting CSRs by default, so `kubectl logs/exec` and metrics fail with
+  ;; "tls: internal error". This approves CSRs whose SANs match our nodes
+  ;; (hostname pattern + private subnet); node names aren't in DNS, so bypass it.
   (helm-template #:name "kubelet-csr-approver" #:namespace "kube-system"
     #:chart "kubelet-csr-approver"
     #:repo "https://postfinance.github.io/kubelet-csr-approver" #:version "1.2.14"
-    ;; Tolerate an optional domain suffix in case the platform-provided
-    ;; hostname is FQDN-style (e.g. homelab-cp-1.novalocal).
+    ;; Tolerate an optional domain suffix (FQDN-style hostnames).
     #:values `((providerRegex . ,(str "^" (cfg 'cluster-name) "-cp-[0-9]+(\\..+)?$"))
                (bypassDnsResolution . #t)
                (providerIpPrefixes ,(cfg 'net-cidr))))
 
   ;; --- local-path-provisioner: node-local scratch StorageClass (non-default) ---
-  ;; Rancher's local-path-provisioner hands out node-local hostPath volumes. It
-  ;; is no longer the default (cinder-csi below is) — its volumes pin to a node
-  ;; for life, which strands a pod when that node is full or down; keep it for
-  ;; throwaway scratch (opt in with storageClassName "local-path"). Talos
-  ;; specifics: the data path must be /var/local-path-provisioner — directly
-  ;; under the writable ephemeral /var (the default /opt is read-only on Talos,
-  ;; and so is /var/mnt, which is reserved for attached disks; see the configmap
-  ;; for why /var/mnt fails) — and the namespace is labelled `privileged`
-  ;; because the helper pods mount hostPath (Talos's default `baseline` forbids).
+  ;; Node-local hostPath volumes, non-default (cinder-csi is) since they pin to a
+  ;; node for life. Keep for throwaway scratch (opt in with storageClassName
+  ;; "local-path"). See `local-path-provisioner` for the Talos path/PSS details.
   (local-path-provisioner)
 
   ;; --- cinder-csi: OVH Block Storage as the DEFAULT StorageClass ---
-  ;; Network-attached volumes that follow a pod to whatever node the scheduler
-  ;; picks (and reattach on reschedule) — unlike local-path's node-pinned PVs.
-  ;; The driver authenticates to OpenStack with a `cloud.conf' (the whole INI is
-  ;; one sealed secret — it carries the password — referenced whole, the same
-  ;; way wireguard/wg0.conf is). The driver itself is a Flux HelmRelease below;
-  ;; here we lay down the credential Secret and the default StorageClass it backs
-  ;; (cluster-scoped, so it needs no namespace). Volume type is left unset → the
-  ;; project's default OVH type (set parameters.type to "classic"/"high-speed"
-  ;; to pin one).
-  (resource
-    `((apiVersion . "v1") (kind . "Secret")
-      (metadata (namespace . "kube-system") (name . "cloud-config"))
-      (type . "Opaque")
-      (stringData (cloud.conf . ,(secret-ref 'openstack/cloud.conf)))))
-  (resource
-    `((apiVersion . "storage.k8s.io/v1") (kind . "StorageClass")
-      (metadata (name . "cinder")
-                (annotations (storageclass.kubernetes.io/is-default-class . "true")))
-      (provisioner . "cinder.csi.openstack.org")
-      (volumeBindingMode . "WaitForFirstConsumer")
-      (allowVolumeExpansion . #t)
-      (reclaimPolicy . "Delete")))
+  ;; Network-attached volumes that follow a pod across nodes (unlike local-path's
+  ;; node-pinned PVs). The driver authenticates with `cloud.conf' (the whole INI
+  ;; is one sealed secret). The driver is a Flux HelmRelease below; here we lay
+  ;; down the credential Secret and the default StorageClass it backs. Volume
+  ;; type unset → OVH project default.
+  (secret "cloud-config" (namespace "kube-system")
+    (string-data (cloud.conf (secret-ref 'openstack/cloud.conf))))
+  (storage-class "cinder" (provisioner "cinder.csi.openstack.org") (default)
+    (volume-binding-mode "WaitForFirstConsumer") (allow-volume-expansion)
+    (reclaim-policy "Delete"))
 
   ;; --- WireGuard: the VPN that gates the private services ---
-  ;; A host-networked WireGuard server (UDP 51820, exposed only via the LB's UDP
-  ;; listener). A DaemonSet, so it runs on *every* node — the LB's `wireguard`
-  ;; listener fans UDP out to all node-backends with no health monitor, so every
-  ;; backend must actually listen or a source-IP-pinned client black-holes. Its
-  ;; wg0.conf — server key + peers — comes from the inline secrets-store. PostUp
-  ;; masquerades VPN-client traffic out eth0, so connected clients route the
-  ;; cluster subnets (pushed via the client's AllowedIPs) and reach the PRIVATE
-  ;; Gateway on the node IPs. Runs privileged in its own PSS-privileged namespace
-  ;; (it manages the kernel WireGuard interface).
+  ;; A host-networked wg server (UDP 51820). A DaemonSet so it runs on every node
+  ;; — the LB's `wireguard` listener fans UDP to all backends with no monitor, so
+  ;; each must listen or a source-IP-pinned client black-holes. PostUp masquerades
+  ;; client traffic out eth0 so clients reach the PRIVATE Gateway on node IPs.
+  ;; Privileged in its own PSS-privileged namespace (manages the kernel wg iface).
   (namespace "vpn" (labels (pod-security.kubernetes.io/enforce "privileged")))
-  ;; wg0.conf (server key + peers) comes from the inline secrets-store,
-  ;; resolved into this Secret's stringData at render time.
-  ;; TODO: This should use the standard library of k8s.scm. Patch it if needed
-  (resource
-    `((apiVersion . "v1") (kind . "Secret")
-      (metadata (namespace . "vpn") (name . "wireguard-config"))
-      (type . "Opaque")
-      (stringData (wg0.conf . ,(secret-ref 'wireguard/wg0.conf)))))
-  ;; TODO: This should use the standard library of k8s.scm. Patch it if needed
-  (resource
-    `((apiVersion . "apps/v1") (kind . "DaemonSet")
-      (metadata (namespace . "vpn") (name . "wireguard") (labels (app . "wireguard")))
-      (spec (selector (matchLabels (app . "wireguard")))
-            (template
-              (metadata (labels (app . "wireguard")))
-              (spec
-                (hostNetwork . #t)
-                (containers
-                  ((name . "wireguard")
-                   ;; Talos has an nftables-only kernel (no legacy ip_tables
-                   ;; module), so wg-quick's PostUp must use `nft' — see the
-                   ;; nft-based PostUp/PostDown in the sealed wg0.conf. This image
-                   ;; must therefore ship `nft'; the old 2021 tag (…-ls75) had
-                   ;; only legacy iptables, so wg-quick aborted and the tunnel
-                   ;; never came up (every client handshake timed out).
-                   (image . "lscr.io/linuxserver/wireguard:1.0.20250521-r1-ls114")
-                   (securityContext (privileged . #t)
-                                    (capabilities (add "NET_ADMIN" "SYS_MODULE")))
-                   (ports ((containerPort . ,(cfg 'wg-port)) (hostPort . ,(cfg 'wg-port))
-                           (protocol . "UDP")))
-                   (volumeMounts ((name . "config") (mountPath . "/config/wg_confs"))
-                                 ((name . "modules") (mountPath . "/lib/modules") (readOnly . #t)))))
-                (volumes
-                  ((name . "config")
-                   (secret (secretName . "wireguard-config")
-                           (items ((key . "wg0.conf") (path . "wg0.conf")))))
-                  ((name . "modules") (hostPath (path . "/lib/modules")))))))))
+  ;; wg0.conf (server key + peers) from the inline secrets-store.
+  (secret "wireguard-config" (namespace "vpn")
+    (string-data (wg0.conf (secret-ref 'wireguard/wg0.conf))))
+  ;; nftables-only Talos kernel: the image must ship `nft' for wg-quick's PostUp
+  ;; (the old 2021 -ls75 tag had only legacy iptables and never came up).
+  (daemonset "wireguard" (namespace "vpn")
+    (image "lscr.io/linuxserver/wireguard:1.0.20250521-r1-ls114")
+    (port (cfg 'wg-port)) (host-port (cfg 'wg-port)) (protocol "UDP")
+    (host-network) (privileged) (capabilities "NET_ADMIN" "SYS_MODULE")
+    (volumes (mount (sec "wireguard-config") "/config/wg_confs")
+             (mount (host-path "/lib/modules") "/lib/modules" #:read-only #t)))
 
   ;; --- Flux: the GitOps controller that reconciles everything below ---
-  ;; TODO: Move with-namespace here
-  (helm-template #:name "flux2" #:namespace "flux-system"
-    #:chart "flux2" #:repo "https://fluxcd-community.github.io/helm-charts"
-    #:version "2.14.0")
+  ;; with-namespace creates flux-system (the flux2 chart doesn't), co-located
+  ;; with its consumer. Other namespaces come from their own with-namespace blocks.
+  (with-namespace "flux-system"
+    (helm-template #:name "flux2" #:namespace "flux-system"
+      #:chart "flux2" #:repo "https://fluxcd-community.github.io/helm-charts"
+      #:version "2.14.0"))
 
   ;; ---- GitOps layer: Flux resources, reconciled in-cluster by Flux ----
 
-  ;; chart sources (helm-repository defaults to the flux-system namespace,
-  ;; declared up front for the bootstrap above — no with-namespace needed).
+  ;; chart sources (helm-repository defaults to flux-system).
   (helm-repository #:name "jetstack" #:url "https://charts.jetstack.io")
   (helm-repository #:name "prometheus-community" #:url "https://prometheus-community.github.io/helm-charts")
   (helm-repository #:name "cert-manager-webhook-ovh" #:url "https://aureq.github.io/cert-manager-webhook-ovh/")
   (helm-repository #:name "cloud-provider-openstack" #:url "https://kubernetes.github.io/cloud-provider-openstack")
 
   ;; --- cinder-csi driver (Flux): controller + per-node DaemonSet ---
-  ;; Installed by Flux (not inline) so a render never has to fetch this chart.
   ;; Uses the pre-created `cloud-config' Secret (secret.create #f) and skips the
-  ;; chart's own StorageClass — we declared `cinder' (default) above so we own
-  ;; the volume type / reclaim policy. Talos: the node plugin bind-mounts under
-  ;; /var/lib/kubelet, which needs the rshared kubelet mount in the talos-patch
-  ;; (rolled out by `hexol config-apply`). NOTE: pin the chart version to one
-  ;; that matches the cluster's Kubernetes minor (this cluster is v1.36) — bump
-  ;; if Flux reports the version is unavailable.
+  ;; chart's StorageClass — we declared `cinder' (default) above. Talos: the node
+  ;; plugin needs the rshared kubelet mount in the talos-patch. NOTE: pin the
+  ;; chart version to the cluster's k8s minor — bump if Flux reports it unavailable.
   (helm-release #:name "openstack-cinder-csi" #:repo "cloud-provider-openstack"
     #:chart "openstack-cinder-csi" #:version "2.31.2" #:target-namespace "kube-system"
     #:values '((secret (enabled . #t) (create . #f) (name . "cloud-config"))
                (storageClass (enabled . #f))
-               ;; Drop the chart's default `cacert' hostPath (/etc/cacert): its
-               ;; create-if-missing mount fails on Talos's read-only /etc
-               ;; ("mkdir /etc/cacert: read-only file system" → CreateContainerError).
-               ;; We set no `ca-file' in cloud.conf (OVH keystone uses a public
-               ;; cert), so it's unused — keep only the cloud-config mount.
+               ;; Drop the chart's default `cacert' hostPath: its create-if-missing
+               ;; mount fails on Talos's read-only /etc. We set no `ca-file' (OVH
+               ;; keystone uses a public cert), so keep only the cloud-config mount.
                (csi (plugin
-                      (volumes)            ; render {}: drop the default cacert volume
+                      (volumes)            ; render {}: drop default cacert volume
                       (volumeMounts ((name . "cloud-config")
                                      (mountPath . "/etc/kubernetes")
                                      (readOnly . #t)))))))
 
   ;; --- cert-manager (Flux): ACME wildcard cert for *.<domain> ---
-  ;; The cert is a *wildcard* (`*.<domain>`), which Let's Encrypt only issues
-  ;; over DNS-01 — http-01 can't prove ownership of a wildcard. So we solve
-  ;; DNS-01 against the OVH zone via the cert-manager-webhook-ovh solver. Its
-  ;; OVH API credentials live in the `ovh-credentials` Secret, decrypted from
-  ;; sops at render time (inside the with-namespace block, so it lands after the
-  ;; namespace it belongs to) and spliced inline — encrypted at rest in the repo,
-  ;; yet `-o yaml` stays a complete, self-contained stream that carries no
-  ;; plaintext secret on disk. `groupName` must match the webhook chart + solver.
-  ;;
-  ;; CRDs are pre-applied by `(cert-manager-crds)` below, so this release runs
-  ;; with `crds.enabled #f` — Flux owns the controller, the pre-step owns the
-  ;; CRDs, and the ClusterIssuer/Certificate CRs validate without waiting for
-  ;; Flux to reconcile the chart.
+  ;; A wildcard cert, which Let's Encrypt only issues over DNS-01 — so we solve
+  ;; DNS-01 against the OVH zone via cert-manager-webhook-ovh. Its OVH API creds
+  ;; live in the `ovh-credentials` Secret, decrypted from sops at render time.
+  ;; `groupName` must match the webhook chart + solver. CRDs are pre-applied by
+  ;; `(cert-manager-crds)`, so this release runs with `crds.enabled #f`.
   (cert-manager-crds)
   (helm-release #:name "cert-manager" #:repo "jetstack"
     #:chart "cert-manager" #:version cert-manager-version #:target-namespace "cert-manager"
@@ -1259,18 +965,15 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     #:chart "cert-manager-webhook-ovh" #:version "0.9.10" #:target-namespace "cert-manager"
     #:values `((groupName . ,(str "acme." (cfg 'domain)))))
   (with-namespace "cert-manager"
-    ;; the ovh-credentials Secret — values resolved from the inline secrets-store
-    (resource
-      `((apiVersion . "v1") (kind . "Secret")
-        (metadata (namespace . "cert-manager") (name . "ovh-credentials"))
-        (type . "Opaque")
-        (stringData
-          (applicationConsumerKey . ,(secret-ref 'ovh/applicationConsumerKey))
-          (applicationSecret      . ,(secret-ref 'ovh/applicationSecret))
-          (applicationKey         . ,(secret-ref 'ovh/applicationKey)))))
-    ;; The webhook reads the OVH creds Secret, but the chart only wires that RBAC
-    ;; for issuers IT creates from values — our ClusterIssuer + Secret are managed
-    ;; here, so grant the webhook's ServiceAccount read access to the one Secret.
+    ;; the ovh-credentials Secret — values from the inline secrets-store
+    ;; (namespace defaults to the enclosing with-namespace, cert-manager)
+    (secret "ovh-credentials"
+      (string-data
+        (applicationConsumerKey (secret-ref 'ovh/applicationConsumerKey))
+        (applicationSecret      (secret-ref 'ovh/applicationSecret))
+        (applicationKey         (secret-ref 'ovh/applicationKey))))
+    ;; The chart only wires creds-Secret RBAC for issuers IT creates; ours are
+    ;; managed here, so grant the webhook's SA read access to the Secret.
     (role "ovh-credentials-reader"
       (rule (api-groups "") (resources "secrets") (verbs "get" "watch")
             (resource-names "ovh-credentials")))
@@ -1281,7 +984,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
       (spec `((acme (server . "https://acme-v02.api.letsencrypt.org/directory")
                      (email . ,(str "admin@" (cfg 'domain)))
                      (privateKeySecretRef (name . "letsencrypt-account"))
-                     ;; solve ACME dns-01 via the OVH webhook (wildcard-capable)
+                     ;; solve ACME dns-01 via OVH webhook (wildcard-capable)
                      (solvers ((dns01 (webhook
                                         (groupName  . ,(str "acme." (cfg 'domain)))
                                         (solverName . "ovh")
@@ -1297,52 +1000,49 @@ template` and appends every manifest it emits to (kubernetes_resources)."
       (spec `((secretName . "wildcard-tls")
                (issuerRef (name . "letsencrypt") (kind . "ClusterIssuer"))
                (dnsNames ,(str "*." (cfg 'domain)) ,(cfg 'domain)))))
-    ;; Two edge Gateways sharing the wildcard cert. The PUBLIC one binds the
-    ;; host ports the Octavia LB forwards 80/443 to (internet-reachable); the
-    ;; PRIVATE one binds ports the LB does not expose and the secgroup leaves
-    ;; closed — reachable only over the WireGuard VPN. A route's choice of
-    ;; parent Gateway is what makes a service public or private.
-    (gateway #:name "homelab-public"
-             #:http-port  (cfg 'ingress-http-hostport)
-             #:https-port (cfg 'ingress-https-hostport))
-    (gateway #:name "homelab-private"
-             #:http-port  (cfg 'private-http-hostport)
-             #:https-port (cfg 'private-https-hostport)))
+    ;; Two edge Gateways sharing the wildcard cert. The PUBLIC one binds the host
+    ;; ports the LB forwards 80/443 to; the PRIVATE one binds ports left closed —
+    ;; VPN-only. A route's choice of parent Gateway makes a service public/private.
+    (edge-gateway #:name "homelab-public"
+                  #:http-port  (cfg 'ingress-http-hostport)
+                  #:https-port (cfg 'ingress-https-hostport))
+    (edge-gateway #:name "homelab-private"
+                  #:http-port  (cfg 'private-http-hostport)
+                  #:https-port (cfg 'private-https-hostport)))
 
   ;; --- kube-prometheus-stack (Flux): metrics + Grafana (via the Gateway) ---
   (helm-release #:name "kube-prometheus-stack" #:repo "prometheus-community"
     #:chart "kube-prometheus-stack" #:version "61.3.0" #:target-namespace "monitoring"
-    #:timeout "15m"   ; big chart (operator + CRDs + Grafana) — exceeds Flux's 5m default
+    #:timeout "15m"   ; big chart (operator + CRDs + Grafana) — exceeds Flux's 5m
     #:values `((grafana (enabled . #t)
                         (adminPassword . "changeme"))
                (prometheus (prometheusSpec (retention . "30d")))))
   (with-namespace "monitoring"
-    (httproute #:name "grafana" #:host "grafana" #:gateway-name "homelab-private"
-               #:service "kube-prometheus-stack-grafana" #:port 80))
+    (http-route "grafana" (parent-name "homelab-private") (parent-namespace "gateway")
+      (hostnames (str "grafana." (cfg 'domain)))
+      (backend-service "kube-prometheus-stack-grafana") (backend-port 80)))
 
-  ;; --- a few standard self-hosted apps (in namespace "apps") ---
-  ;; Each app's `#:expose` appends its HTTPRoute to the bundle (host + which
-  ;; Gateway it attaches to — private by default, public for the one exception).
+  ;; --- a few standard self-hosted apps (namespace "apps") ---
+  ;; Each app's `#:expose` appends its HTTPRoute (host + which Gateway).
   (with-namespace "apps"
     (stateful-app #:name "vaultwarden" #:image "vaultwarden/server:1.30.5" #:port 80
                   #:storage "2Gi" #:mount "/data"
                   #:env `(((name . "DOMAIN") (value . ,(str "https://vault." (cfg 'domain)))))
-                  #:expose '(#:host "vault" #:gateway-name "homelab-private"))
+                  #:route-host "vault" #:route-gateway "homelab-private")
 
-    ;; jellyfin is the one PUBLIC app — attaches to the public Gateway (LB-fronted).
+    ;; jellyfin: the one PUBLIC app — public Gateway (LB-fronted).
     (stateful-app #:name "jellyfin" #:image "jellyfin/jellyfin:10.9.6" #:port 8096
                   #:storage "20Gi" #:mount "/config" #:resources "500m-*/1Gi"
-                  #:expose '(#:host "jellyfin" #:gateway-name "homelab-public"))
+                  #:route-host "jellyfin" #:route-gateway "homelab-public")
 
     (stateful-app #:name "gitea" #:image "gitea/gitea:1.22.1" #:port 3000
                   #:storage "10Gi" #:mount "/data"
-                  #:expose '(#:host "git" #:gateway-name "homelab-private")))
+                  #:route-host "git" #:route-gateway "homelab-private"))
 
   ;; One pass stamps every cluster resource with a common label.
   (label-all `((app.kubernetes.io/part-of . ,(cfg 'cluster-name))))
 
-  ;; Decrypt the inline secrets-store and substitute every (secret-ref …) with
-  ;; its plaintext.  Placed last so it sees every resource; runs only during
-  ;; render, never for `tree`/`ops`.
+  ;; Decrypt the inline secrets-store, substituting each (secret-ref …). Last so
+  ;; it sees every resource; render-only, never `tree`/`ops`.
   (resolve-secret-refs)
   (checksum-config))

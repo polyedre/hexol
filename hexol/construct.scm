@@ -1,19 +1,16 @@
 ;;; hexol/construct.scm — the schema-driven record-body constructor engine.
 ;;;
-;;; `define-construct` is the one mechanism every *typed* target-library
-;;; constructor is built on. It replaces the `#:`-keyword `define*` surface
-;;; (and the hand-quoted alists that used to be its argument *values*) with a
-;;; record body: a positional head plus a sequence of `(key value …)` entries,
-;;; recursively. Values are ordinary, evaluated Scheme (strings quoted, refs
-;;; and arithmetic natural) — the same rule the terraform/ansible `block`/
-;;; `body` surface already used — while the *schema* recovers everything the
-;;; keyword surface gave for free: defaults, required fields, coercions,
-;;; boolean flags, kebab→wire key mapping, and unknown-key errors that suggest
-;;; the closest valid key.
+;;; `define-construct` underlies every *typed* target-library constructor. It
+;;; replaces the `#:`-keyword `define*` surface (and its hand-quoted alist
+;;; values) with a record body: a positional head plus a recursive sequence of
+;;; `(key value …)` entries. Values are evaluated Scheme (strings quoted, refs
+;;; and arithmetic natural) — same rule as the terraform/ansible `block`/`body`
+;;; surface — while the *schema* recovers what the keyword surface gave free:
+;;; defaults, required fields, coercions, boolean flags, kebab→wire key mapping,
+;;; and unknown-key errors suggesting the closest valid key.
 ;;;
-;;; Because the schema names every field's kind, a typed constructor can tell a
-;;; nested block from a scalar attribute with NO syntactic marker — so these
-;;; forms drop the `block` keyword entirely:
+;;; Since the schema names each field's kind, a typed constructor distinguishes
+;;; nested block from scalar with NO syntactic marker — dropping `block`:
 ;;;
 ;;;   (deployment "api"
 ;;;     (image "ghcr.io/acme/api:1.4")        ; scalar field, evaluated
@@ -22,8 +19,8 @@
 ;;;     (resources "100m-500m/128Mi"))        ; #:coerce parses the string
 ;;;
 ;;; (Schema-LESS escapes — terraform-resource, task, custom-resource `spec` —
-;;; can't consult a per-field schema, so they keep an explicit nesting marker;
-;;; that surface lives in (hexol surface) as `body`/`block`, unchanged.)
+;;; have no per-field schema, so keep an explicit nesting marker; that surface
+;;; is `body`/`block` in (hexol surface), unchanged.)
 ;;;
 ;;; Grammar of one entry `(key . args)`, dispatched on the field's schema kind:
 ;;;   scalar : (key v)            -> v               (evaluated)
@@ -38,32 +35,24 @@
 ;;;                                  into a list.
 ;;;
 ;;; `#:build` is an expression evaluated with the head args and every field
-;;; bound as a local (the resolved value: default-filled, coerced, collected),
-;;; mirroring how a `define*` body sees its `#:key` args. It may return any
-;;; value — a plain alist (a sub-block like a column or a task) or an op (a
-;;; resource). The engine is agnostic; the library decides.
+;;; bound as a local (resolved: default-filled, coerced, collected), like a
+;;; `define*` body sees its `#:key` args. It may return any value — a plain
+;;; alist (a sub-block) or an op (a resource). The library decides.
 
 (define-module (hexol construct)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 match)
-  #:export (define-construct %expand-call construct-flag construct-map-entries
-            %field-default))
+  #:export (define-construct %expand-call construct-flag construct-map-entries))
 
-;; A distinct sentinel a #:flag field carries when written valueless: `(unique)`
-;; means `(unique #t)`. Exposed so generated code can reference it.
+;; Sentinel a valueless #:flag field carries: `(unique)` means `(unique #t)`.
+;; Exposed so generated code can reference it.
 (define construct-flag #t)
-
-;; A field with no #:default and no value provided resolves to this sentinel,
-;; so #:build can tell "unset" from an explicit #f. Most builders treat it as
-;; "omit"; helpers below map it to '() / #f as needed.
-(define %field-default '%unset)
 
 ;; ---------- expand-time helpers ----------
 ;;
-;; Guile evaluates a module's top level in order, so these ordinary procedures
-;; are in scope for the `define-construct` transformer below (which calls them
-;; during expansion). They operate on raw S-expression *data* — the macro
-;; hands them stripped datums and splices the results back as syntax.
+;; Top level evaluates in order, so these are in scope for the `define-construct`
+;; transformer below, which calls them during expansion. They work on raw
+;; S-expression *data* — the macro hands stripped datums, splices results as syntax.
 
 (define (field-name f)        (if (pair? f) (car f) f))
 (define (field-opts f)        (if (pair? f) (cdr f) '()))
@@ -99,10 +88,10 @@
 ;; ---------- free-form map block reader ----------
 ;;
 ;; `(construct-map-entries (k v) …)` builds a nested alist for a #:map field:
-;; keys auto-quote to symbols (or stay strings — file-shaped keys like
-;; "nginx.conf"), values are evaluated; a nested `(block k …)` recurses.
-;; This is the one place a typed constructor admits free-form data, so it
-;; reuses the schema-less rule (explicit `block` for depth) deliberately.
+;; keys auto-quote to symbols (or stay strings, e.g. "nginx.conf"), values
+;; evaluated; `(block k …)` recurses. The one place a typed constructor admits
+;; free-form data, so it deliberately reuses the schema-less rule (explicit
+;; `block` for depth).
 (define-syntax construct-map-entries
   (syntax-rules (block)
     ((_) '())
@@ -114,31 +103,30 @@
 
 ;; ---------- the define-construct macro ----------
 ;;
-;; Generates `(define-syntax NAME …)` whose transformer is fully
-;; self-contained — it consults only the field schema (spliced in as a
-;; literal) and standard-library procedures, so there is no cross-module
-;; expand-time dependency. Field kinds and their entry → value forms:
+;; Generates `(define-syntax NAME …)` whose transformer is self-contained —
+;; consulting only the field schema (spliced in as a literal) and stdlib procs,
+;; so no cross-module expand-time dependency. Field kinds and entry → value forms:
 ;;
 ;;   (plain)            scalar; one value, evaluated
 ;;   #:flag             boolean; `(k)` → #t, `(k v)` → v, absent → #f
 ;;   #:list             `(k a b …)` → (list a b …); a lone `(k)` → '()
 ;;   #:map              `(k (sub v) …)` → free-form alist via construct-map-entries
 ;;   #:construct C      `(k . args)` → (C . args); with #:repeated, collect a list
-;;   #:default E        value when the field is absent (else %field-default)
+;;   #:default E        value when the field is absent (else #f, or '() for list/map)
 ;;   #:coerce P         wrap the resolved value in (P …)
 ;;   #:wire W           (advisory; the builder decides output keys)
 ;;
-;; #:head is one symbol or a list of positional params; #:open? #t lets
-;; unknown keys through as evaluated `(k v)`/`(k a …)` attributes collected
-;; into the `extra` local (an alist); #:build is the result expression with
-;; head params, every field, and `extra` bound.
+;; #:head is one symbol or a list of positional params; #:open? #t passes
+;; unknown keys through as evaluated `(k v)`/`(k a …)` attributes into the
+;; `extra` local (an alist); #:build is the result expression with head params,
+;; every field, and `extra` bound.
 
 (define (stx->list s)
   (syntax-case s ()
     (() '())
     ((a . b) (cons #'a (stx->list #'b)))))
 
-;; Find the syntax that follows value-keyword K in an opts syntax list (or #f).
+;; Syntax following value-keyword K in an opts syntax list (or #f).
 (define (opt-syntax-after opts-stx k)
   (let loop ((o opts-stx))
     (cond ((null? o) #f)
@@ -160,8 +148,8 @@
        (let* ((open?    (kw-get (syntax->datum #'(kw ...)) #:open? #f))
               (build    (kw-syntax #'(kw ...) #:build #'(error "construct: no #:build")))
               (fields-stx (stx->list (kw-syntax #'(kw ...) #:fields #'())))
-              ;; head identifiers, kept as their original syntax (with marks) so
-              ;; they are the *same* bindings #:build references.
+              ;; head identifiers kept as original syntax (with marks) so they
+              ;; are the *same* bindings #:build references.
               (head-stx (kw-syntax #'(kw ...) #:head #'()))
               (head-ids (syntax-case head-stx ()
                           ((a ...) (stx->list head-stx))
@@ -169,10 +157,10 @@
               (head     (map syntax->datum head-ids))
               (name-sym (syntax->datum #'name))
               (impl     (datum->syntax #'name (symbol-append '% name-sym '-impl))))
-         ;; Per field: derive name, kind, repeated?, required?, the construct
-         ;; name (datum), and the default / coerce *syntax* (kept as syntax so
-         ;; they evaluate in this module's lexical scope — `current-k8s-namespace`,
-         ;; `normalize-resources`, etc.). Kinds: flag list map construct plain.
+         ;; Per field: derive name, kind, repeated?, required?, construct name
+         ;; (datum), and default/coerce *syntax* (kept as syntax so they evaluate
+         ;; in this module's lexical scope — `current-k8s-namespace`,
+         ;; `normalize-resources`, …). Kinds: flag list map construct plain.
          (define (field-info fstx)
            (let* ((parts (if (identifier? fstx) (list fstx) (stx->list fstx)))
                   (fname (syntax->datum (car parts)))
@@ -192,10 +180,10 @@
                                ((construct) (if rep? #''() #'#f))
                                (else #'#f))))
                   (coerce (opt-syntax-after opts #:coerce)))
-             ;; The field-id is the ORIGINAL name identifier (car parts), kept
-             ;; with its marks intact, so it is the very binding #:build
-             ;; references — correct even when define-construct is itself
-             ;; produced by another macro (e.g. SQL's type sugar).
+             ;; field-id is the ORIGINAL name identifier (car parts), marks
+             ;; intact, so it is the very binding #:build references — correct
+             ;; even when define-construct is itself produced by another macro
+             ;; (e.g. SQL's type sugar).
              (list fname (car parts) kind cname rep? req? deflt coerce)))
          (let* ((infos    (map field-info fields-stx))
                 (fnames   (map car infos))
@@ -205,7 +193,7 @@
                 (descs    (map (lambda (i) (list (list-ref i 0) (list-ref i 2)
                                                  (list-ref i 4) (list-ref i 5) (list-ref i 3)))
                                infos))
-                ;; impl prologue: fill defaults for unset fields, then coerce.
+                ;; impl prologue: default unset fields, then coerce.
                 (prologue
                   (append-map
                     (lambda (i)
@@ -225,11 +213,10 @@
                                    '#,(datum->syntax #'name fnames)
                                    #'#,impl))))))))))
 
-;; The runtime expander every generated `name` transformer calls. Splits the
-;; call into positional head args + `(key …)` entries, computes each field's
-;; value form by kind, checks required/unknown, and emits one positional call
-;; to the construct's `%impl` procedure (which fills defaults and coerces).
-;; Absent fields are passed the sentinel '%hx-unset so `%impl` can default them.
+;; Runtime expander every generated `name` transformer calls. Splits the call
+;; into positional head args + `(key …)` entries, computes each field's value
+;; form by kind, checks required/unknown, emits one positional call to `%impl`
+;; (which defaults and coerces). Absent fields pass sentinel '%hx-unset.
 (define (%expand-call s name head descs open? fnames impl)
   (syntax-case s ()
     ((_ . rest)

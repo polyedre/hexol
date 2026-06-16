@@ -1,52 +1,43 @@
 ;;; examples/ansible.scm — provision a small fleet, in Scheme.
 ;;;
-;;; A single self-contained consumer of (hexol ansible): it carries its own
-;;; inventory (inlined as Scheme data), defines one role, fans it over the
-;;; fleet (one play per host in group `all`), and appends the plays into the
-;;; `(ansible_plays)` sink. The CLI renders that sink:
+;;; One self-contained consumer of (hexol ansible): inlined inventory, one
+;;; role, fanned over the fleet (one play per host in `all`) into the
+;;; `(ansible_plays)` sink. Render it:
 ;;;
 ;;;   hexol render -o ansible examples/ansible.scm   # the playbook (JSON)
 ;;;   hexol tree              examples/ansible.scm   # plays -> their tasks
 ;;;
-;;; The fleet (web / db / cache nodes) and the role are invented from
-;;; scratch; the point is to show what an inventory-as-a-program buys you
-;;; over hand-written role YAML. Each item below is ordinary Scheme here;
-;;; in a role it needs a dedicated Ansible feature, or has no clean
-;;; equivalent at all:
+;;; The point: what inventory-as-a-program buys over role YAML. Each item is
+;;; plain Scheme here, but a dedicated Ansible feature (or no equivalent) there:
 ;;;
-;;;   • Loops become explicit, named tasks. `loop:`/`with_items:` hides
-;;;     each iteration behind `item.*`; here `(map …)` emits one task per
-;;;     package / user / port / peer, each with a unique greppable name.
-;;;   • Decisions move to render time. A user past its `expires` is emitted
-;;;     as state=absent by Scheme `cond`, not a `when:` string; a missing IP
-;;;     aborts *rendering*, not the run.
-;;;   • Templates are Scheme. /etc/hosts and pg_hba.conf are built by string
-;;;     functions over cross-host inventory data — no Jinja, no `.j2` files.
-;;;   • Cross-host facts are just data. The DB's firewall opens 5432 to each
-;;;     web node's IP by mapping over `(group-hosts 'web …)` — no
-;;;     `hostvars[item]` gymnastics.
-;;;   • Sub-roles are functions; `include_tasks:` becomes a function call.
-;;;     `become:` scoping is `(as 'user …)`, which nests.
-;;;   • And it stays honest: where a step needs a value only known on the
-;;;     host (does a binary already exist?), we keep `register:` + `when:`.
+;;;   • Loops -> explicit named tasks. `(map …)` emits one greppable task per
+;;;     package / user / port / peer; `loop:` hides them behind `item.*`.
+;;;   • Decisions at render time. Expired user -> state=absent via `cond`, not
+;;;     a `when:` string; a missing IP aborts *rendering*, not the run.
+;;;   • Templates are Scheme. /etc/hosts, pg_hba.conf built by string fns over
+;;;     cross-host data — no Jinja, no `.j2`.
+;;;   • Cross-host facts are data. DB firewall opens 5432 per web IP via
+;;;     `(group-hosts 'web …)` — no `hostvars[item]`.
+;;;   • Sub-roles are functions; `include_tasks:` -> a call. `become:` scope
+;;;     is `(as 'user …)`, which nests.
+;;;   • Honest: host-only facts (binary already there?) keep `register:`+`when:`.
 ;;;
-;;; Modules exercised: apt, copy, file, lineinfile, cron, systemd, command,
-;;; stat, get_url, unarchive, wait_for, assert, git, hostname,
+;;; Modules: apt, copy, file, lineinfile, cron, systemd, command, stat,
+;;; get_url, unarchive, wait_for, assert, git, hostname,
 ;;; ansible.posix.{sysctl,authorized_key}, community.general.{timezone,
 ;;; locale_gen,ufw}.
 
 (use-modules (hexol ansible)
              (srfi srfi-1))
 
-;; A short alias for joining task lists. (Guile's `append` is available —
-;; the surface ops are hx-prefixed and no longer shadow it — but `cat` keeps
-;; these list joins terse.)
+;; Alias for joining task lists. (`append` works — surface ops are hx-prefixed
+;; and don't shadow it — but `cat` keeps these joins terse.)
 (define (cat . lists) (concatenate lists))
 
 ;; ---------- the fleet (inlined inventory) ----------
 ;;
-;; The shape (hexol ansible)'s helpers read: hosts carry their vars, groups
-;; carry membership + group vars, and `all` lists every host.
+;; Shape the helpers read: hosts carry vars, groups carry membership + group
+;; vars, `all` lists every host.
 
 (define inv
   '((hosts
@@ -79,7 +70,7 @@
      (cache (hosts cache1.acme.example)
             (vars (service . "redis") (open_ports 6379))))))
 
-;; ---------- thin task sugar (where it reads better) ----------
+;; ---------- thin task sugar ----------
 
 (define* (apt-install pkg #:key (state "present"))
   (task
@@ -112,15 +103,15 @@
     ("vm.swappiness"           . "10")))
 
 (define (etc-hosts-content state)
-  ;; One map over every host's inventory IPs — the Jinja original is a
-  ;; {% for h in groups['all'] %} with nested {% if hostvars[h]... %}.
+  ;; One map over every host's IPs — Jinja's {% for h in groups['all'] %}
+  ;; with nested {% if hostvars[h]... %}.
   (string-append
    "# Managed by hexol — do not edit.\n127.0.0.1 localhost\n\n"
    (string-concatenate
     (map (lambda (h)
            (let ((v4 (host-attr h '(ip v4) state))
                  (v6 (host-attr h '(ip v6) state)))
-             ;; ~a coerces the host symbol — no symbol->string binding needed.
+             ;; ~a coerces the host symbol — no symbol->string needed.
              (string-append
               (if v4 (fmt "~16a ~a ~a\n" v4 h (short-name h)) "")
               (if v6 (fmt "~16a ~a ~a\n" v6 h (short-name h)) ""))))
@@ -161,9 +152,9 @@
       ;; sshd hardening: one lineinfile per directive
       (map (lambda (d) (sshd-directive (car d) (cdr d))) sshd)))))
 
-;; ---------- users: the loop + render-time-state win ----------
+;; ---------- users: loop + render-time-state win ----------
 
-(define epoch-2025 1735689600)  ; 2025-01-01; a user expiring before this is removed
+(define epoch-2025 1735689600)  ; 2025-01-01; expiring before this -> removed
 
 (define (user-state u)
   (let ((exp (assq-ref u 'expires)))
@@ -201,14 +192,14 @@
       (lambda (u)
         (let ((name   (assq-ref u 'name))
               (target (user-state u)))
-          ;; present users also get an .ssh dir + authorized_key
+          ;; present users get .ssh dir + authorized_key
           (cons (user-account-task host-name u)
                 (if (string=? target "present")
                     (list (ssh-dir-task name) (authkey-task name))
                     '()))))
       users))))
 
-;; ---------- role-specific tasks (dispatch on the group's service) ----------
+;; ---------- role-specific tasks (dispatch on service) ----------
 
 (define (nginx-vhost host-name)
   (fmt (string-append "server {\n    listen 80;\n    server_name ~a;\n"
@@ -217,8 +208,8 @@
        host-name (short-name host-name)))
 
 (define (pg-hba-content state)
-  ;; Allow each web node's IPv4 to reach Postgres — cross-host data, one
-  ;; line per peer, computed at render time.
+  ;; Each web node's IPv4 reaches Postgres — cross-host data, one line per
+  ;; peer, at render time.
   (string-append
    "# Managed by hexol.\nlocal   all   all                      peer\n"
    (string-concatenate
@@ -236,8 +227,8 @@
            (block ansible.builtin.file
              (path (fmt "/var/www/~a" (short-name host-name)))
              (state "directory") (owner "www-data") (group "www-data"))))
-    ;; deploy the app as the unprivileged deploy user — nested become scope
-    ;; (the inner `as` stamps become_user; the outer `as 'root` leaves it).
+    ;; deploy as the unprivileged deploy user — nested become scope (inner
+    ;; `as` stamps become_user; outer `as 'root` restores it).
     (as 'deploy
      (list (task (name "Deploy app (git)")
                  (block ansible.builtin.git
@@ -259,7 +250,7 @@
                    #:owner "postgres" #:group "postgres"
                    #:notify "Restart postgresql")
      (svc "postgresql"))
-    ;; nightly backup cron only on hosts flagged backup: true
+    ;; nightly backup cron only where backup: true
     (if (host-attr host-name 'backup state)
         (list (task (name "cron: nightly pg_dump")
                     (block ansible.builtin.cron
@@ -300,7 +291,7 @@
       (append-map
        (lambda (p)
          (if (and (equal? service "postgresql") (eqv? p 5432))
-             ;; cross-host: one rule per web node's IP
+             ;; cross-host: one rule per web IP
              (map (lambda (ip)
                     (task (name (fmt "ufw: allow postgres from ~a" ip))
                           (block community.general.ufw
@@ -315,7 +306,7 @@
        (task (name "ufw: enable")
              (block community.general.ufw (state "enabled"))))))))
 
-;; ---------- node_exporter: kept as apply-time logic (honest) ----------
+;; ---------- node_exporter: honest apply-time logic ----------
 
 (define (metrics-tasks)
   (as 'root
@@ -373,8 +364,7 @@
 ;; ---------- role entrypoint ----------
 
 (define (role-impl host-name state)
-  ;; Render-time guard: a missing IP is a config error we catch *here*,
-  ;; before emitting a playbook — not three hosts into the run.
+  ;; Render-time guard: catch a missing IP *here*, not three hosts into the run.
   (unless (host-attr host-name '(ip v4) state)
     (error "ansible-fleet: host has no ip.v4:" host-name))
   (cons
@@ -387,12 +377,11 @@
     (check-tasks    host-name state))
    handlers))
 
-;; ---------- assemble: one play per host in group `all` ----------
+;; ---------- assemble: one play per host in `all` ----------
 ;;
-;; Fanning the role over a group is *this example's* organizing structure
-;; (no isolation needed — each `play` keys itself by host), so it's just
-;; `compose-ops` + `map`, not a library primitive. We emit one `play` op
-;; per host; `hexol render -o ansible` renders the sink.
+;; Fanning the role over a group is this example's structure, not a library
+;; primitive — each `play` keys itself by host, so no isolation needed: just
+;; `compose-ops` + `map`, one `play` op per host.
 
 (define (fleet group)
   (compose-ops 'fleet `(fleet ,group)

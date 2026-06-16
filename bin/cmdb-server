@@ -10,10 +10,9 @@
 ;;;   log             = cmdb.log
 ;;;   port            = 8080
 ;;;
-;;; The initial-library only matters for an empty log. If the log
-;;; contains `(bump-lib "<sha>")` facts, replay switches libraries at
-;;; those points; the initial-library is the one used for facts before
-;;; the first bump-lib.
+;;; initial-library only matters for an empty log: `(bump-lib "<sha>")`
+;;; facts switch libraries at their points on replay, and initial-library
+;;; covers facts before the first bump-lib.
 
 (add-to-load-path (dirname (dirname (current-filename))))
 

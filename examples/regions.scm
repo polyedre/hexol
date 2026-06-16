@@ -1,16 +1,14 @@
 ;;; examples/regions.scm — the region table as an importable module.
 ;;;
-;;; The same three regions as examples/inventory.scm, but exported as a
-;;; module so the CMDB driver `bin/sync-inventory` can load them and POST
-;;; one `(region <name> <attrs>)` fact per entry. The CMDB library then
-;;; expands each fact into the full per-region subtree via
-;;; `cmdb/region-render.scm` (which shares its body with the inventory
-;;; example). See docs/cmdb.md.
+;;; Same three regions as examples/inventory.scm, exported as a module so the
+;;; CMDB driver `bin/sync-inventory` can load them and POST one
+;;; `(region <name> <attrs>)` fact per entry. The CMDB library expands each
+;;; fact into the full per-region subtree via `cmdb/region-render.scm` (which
+;;; shares its body with the inventory example). See docs/cmdb.md.
 ;;;
-;;; Dispatch axes pre-derived as data: dc, geo, hw-profile,
-;;; network-profile, tier, sovereignty. Each entry's cdr is the attribute
-;;; seed for the per-region body. The three entries exercise the body's
-;;; branches (gpu/advanced/prod, sovereign/strict, standard/basic/dev).
+;;; Dispatch axes as data: dc, geo, hw-profile, network-profile, tier,
+;;; sovereignty. Each cdr is the attribute seed. The three entries exercise
+;;; the body's branches (gpu/advanced/prod, sovereign/strict, standard/basic/dev).
 
 (define-module (examples regions)
   #:export (regions))

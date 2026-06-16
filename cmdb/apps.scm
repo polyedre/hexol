@@ -1,13 +1,13 @@
 ;;; cmdb/apps.scm — Helm releases per region (loaded by cmdb/region-body).
 ;;;
-;;; Output shape per app:
+;;; Per-app shape:
 ;;;   (apps (<name> (chart (url <str>) (version <str>) (values <tree>))))
 ;;;
-;;; Conditional stacks (gpu, sovereign-audit, backup) are gated inline.
+;;; Conditional stacks (gpu, sovereign-audit, backup) gated inline.
 
 (hx-ops
 
-  ;; ---------- Base: ingress, cert-manager, external-dns (every region) ----------
+  ;; ---------- Base: ingress, cert-manager, external-dns (all regions) ----------
   (hx-merge
     (apps
       (ingress-nginx
@@ -47,7 +47,7 @@
   (hx-append packages cert-manager)
   (hx-append packages external-dns)
 
-  ;; ---------- Monitoring (every region) ----------
+  ;; ---------- Monitoring (all regions) ----------
   (hx-merge
     (apps
       (kube-prometheus-stack
@@ -97,7 +97,7 @@
   (hx-append packages loki)
   (hx-append packages promtail)
 
-  ;; ---------- OpenStack-specific add-ons (every region) ----------
+  ;; ---------- OpenStack add-ons (all regions) ----------
   (hx-merge
     (apps
       (openstack-exporter

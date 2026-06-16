@@ -6,13 +6,12 @@
 ;;;   ./bin/sync-inventory [regions=examples/regions.scm] \
 ;;;                        [url=http://127.0.0.1:8080]
 ;;;
-;;; Posts one `(region <name> <attrs>)` fact per entry in the region
-;;; table. The CMDB library expands each into the full per-region
-;;; subtree using `cmdb/region-render.scm` (which shares its body with
-;;; `examples/inventory.scm`). Facts stay small (~100 bytes each).
+;;; Posts one `(region <name> <attrs>)` fact per table entry; the CMDB
+;;; expands each into the full subtree via region-render.scm (body shared
+;;; with examples/inventory.scm). Facts stay small (~100 bytes).
 ;;;
-;;; The regions table file is expected to define-module
-;;; `(examples regions)` and export `regions`.
+;;; The regions file must define-module `(examples regions)` and export
+;;; `regions`.
 
 (add-to-load-path (dirname (dirname (current-filename))))
 
@@ -48,9 +47,8 @@
           (exit 2))))))
 
 (define (load-regions-table regions-path)
-  ;; The file is expected to (define-module (examples regions)) and
-  ;; export `regions`. Use primitive-load + module-ref so we tolerate
-  ;; arbitrary module names like (examples regions-prod).
+  ;; primitive-load + module-ref so arbitrary module names like
+  ;; (examples regions-prod) work, not just (examples regions).
   (let* ((port (open-input-file regions-path))
          (head (read port)))
     (close-port port)

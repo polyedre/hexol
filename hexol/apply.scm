@@ -1,17 +1,14 @@
 ;;; hexol/apply.scm — appliers: push the resolved state to the world.
 ;;;
-;;; `render` turns an inventory into artifacts and stops; this module is the
-;;; other half — the procedures that take a *resolved state* and actually
-;;; apply it. They are deliberately the only place hexol shells out to act on
-;;; the world (`tofu`, `kubectl`); the `(hexol terraform)` / `(hexol k8s)`
-;;; libraries stay pure language-to-data translators.
+;;; `render` stops at artifacts; this module's procedures take a *resolved
+;;; state* and apply it. The only place hexol shells out (`tofu`, `kubectl`);
+;;; `(hexol terraform)` / `(hexol k8s)` stay pure data translators.
 ;;;
-;;; An *applier* is a `(state dry? -> effects)` procedure: it reads its slice of
-;;; the resolved state and acts (or, under DRY?, delegates to its tool's native
-;;; plan). Every constructor here — `terraform-applier', `kubectl-applier', and
-;;; the check builders `wait-for'/`check'/`report' — simply *returns* such a
-;;; procedure; none of them register. Registration is one explicit step, the
-;;; `appliers' form, which names a sequence and runs it in textual order:
+;;; An *applier* is a `(state dry? -> effects)`: reads its slice of state and
+;;; acts (under DRY?, delegates to the tool's native plan). The constructors
+;;; here — `terraform-applier', `kubectl-applier', and the checks
+;;; `wait-for'/`check'/`report' — only *return* one; none register.
+;;; Registration is the `appliers' form, naming a sequence run in textual order:
 ;;;
 ;;;   (appliers
 ;;;     ("terraform"  (terraform-applier #:workdir "deploy"
@@ -22,34 +19,29 @@
 ;;;     ("kubernetes" (kubectl-applier #:kubeconfig "deploy/kubeconfig"))
 ;;;     ("check-apps" (check "apps Ready" my-predicate #:fatal? #f)))
 ;;;
-;;; The CLI's `hexol apply` resolves the inventory once, then runs the named
-;;; appliers in order (optionally filtered to `--only NAME'), passing the shared
-;;; state and the `--dry-run' flag. So they run *from the state*, in order, and
-;;; only under `apply' — never during render/tree/ops, where the collector is
-;;; unbound and `appliers' is a harmless no-op.
+;;; `hexol apply` resolves once, then runs the named appliers in order
+;;; (optionally `--only NAME'), passing the shared state and `--dry-run'. Only
+;;; under `apply' — elsewhere the collector is unbound and `appliers' no-ops.
 ;;;
 ;;; Two ways to place a check:
-;;;   * a standalone `appliers' entry — a visible, independently `--only'-able
-;;;     step (e.g. "check-api" above);
-;;;   * a deploy applier's `#:pre'/`#:post' — a gate *bound to its owner*, so it
-;;;     travels with `--only kubernetes' instead of being skipped. Use this for
-;;;     a precondition the deploy can't run without. `#:pre'/`#:post' each take
-;;;     one check proc or a list of them.
+;;;   * an `appliers' entry — a visible, independently `--only'-able step;
+;;;   * a deploy applier's `#:pre'/`#:post' — a gate bound to its owner, so it
+;;;     travels with `--only kubernetes'. Use for a precondition the deploy
+;;;     can't run without. Each takes one check or a list.
 ;;;
-;;; Order is what makes this a one-command bootstrap: terraform first, so the
-;;; infra is built and its kubeconfig dumped to a known path before the cluster
-;;; applier reads (kubernetes_resources) and `kubectl apply`s it against that
-;;; file. The hand-off is an explicit conventional path, so each applier stays
-;;; an independent (state -> effects) with no hidden state threading.
+;;; Order makes this a one-command bootstrap: terraform first, so the infra is
+;;; built and its kubeconfig dumped to a known path before the cluster applier
+;;; reads (kubernetes_resources) and `kubectl apply`s against it. The hand-off
+;;; is an explicit conventional path, so each applier stays an independent
+;;; (state -> effects) with no hidden state threading.
 ;;;
-;;; (`applies-with' is still the primitive underneath `appliers'; use it
-;;; directly to register a single one-off applier.)
+;;; (`applies-with' is the primitive under `appliers'; use it to register a
+;;; single one-off applier.)
 ;;;
-;;; This module also offers `terraform-destroyer', which returns not an applier
-;;; but a CLI *action* — a (state args -> effects) procedure an inventory
-;;; registers with `defines-action'/`actions' to contribute its own `hexol'
-;;; verb (e.g. `hexol destroy'). An action is a standalone verb, not a pipeline
-;;; step: it never runs during `hexol apply', only when its verb is named.
+;;; Also `terraform-destroyer': returns not an applier but a CLI *action* — a
+;;; (state args -> effects) registered with `defines-action'/`actions' for its
+;;; own `hexol' verb (e.g. `hexol destroy'). A standalone verb, not a pipeline
+;;; step: never runs during `hexol apply', only when named.
 
 (define-module (hexol apply)
   #:use-module (hexol kernel)
@@ -60,9 +52,9 @@
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 format)
   #:use-module (srfi srfi-1)
-  ;; `report'/`check' predicates read the resolved state directly; re-export the
-  ;; accessor so an inventory's own report lambdas (e.g. derive URLs from the
-  ;; rendered resources) can reach into it without importing (hexol kernel).
+  ;; `report'/`check' predicates read the state directly; re-export the
+  ;; accessor so an inventory's report lambdas can reach in without importing
+  ;; (hexol kernel).
   #:re-export (state-get)
   #:export (terraform-applier kubectl-applier terraform-destroyer
             terraform-outputter talos-config-applier
@@ -73,25 +65,23 @@
 (define (find-binary name)
   (or (which-cmd name) (error "apply: command not found on PATH:" name)))
 
-;; Log a progress line to stderr and flush immediately. Without the flush,
-;; Guile block-buffers stderr when it is a pipe and emits these lines only at
-;; exit — *after* any subprocess (tofu/kubectl) output, which writes to the
-;; same fd directly. Flushing keeps the phase markers interleaved with the
-;; tool's own output, so a failure reads as belonging to the right phase.
+;; Log a progress line to stderr, flushing now. Guile block-buffers a piped
+;; stderr and would emit these only at exit — *after* subprocess output on the
+;; same fd. Flushing interleaves phase markers with tool output, so a failure
+;; reads as belonging to the right phase.
 (define (log fmt . args)
   (apply format (current-error-port) fmt args)
   (force-output (current-error-port)))
 
-;; Run PROG with ARGS inheriting this process's stdio, so an interactive
-;; prompt (`tofu apply`'s y/N) reaches the user's terminal. Errors on a
-;; non-zero / signalled exit.
+;; Run PROG ARGS inheriting stdio, so an interactive prompt (`tofu apply`'s
+;; y/N) reaches the terminal. Errors on non-zero / signalled exit.
 (define (run* prog . args)
-  (force-output (current-error-port))      ; flush our logs before the child writes
+  (force-output (current-error-port))      ; flush logs before the child writes
   (let ((code (status:exit-val (apply system* prog args))))
     (unless (eqv? code 0)
       (error "apply: command failed" (cons prog args)))))
 
-;; Run PROG ARGS, return stdout as a string (trailing newline trimmed).
+;; Run PROG ARGS, return stdout (trailing newline trimmed).
 (define (capture prog . args)
   (force-output (current-error-port))
   (let* ((port   (apply open-pipe* OPEN_READ prog args))
@@ -104,10 +94,10 @@
 (define (write-file path content)
   (call-with-output-file path (lambda (p) (display content p))))
 
-;; Run PROG with ARGS, discard stdout, return #t iff it exited 0. The building
-;; block for shell-based checks: a readiness probe or smoke test is just "does
-;; this command succeed?". (PROG is found on PATH; stderr is left to flow
-;; through, so a failing probe's reason shows up while a `wait-for' polls.)
+;; Run PROG ARGS, discard stdout, return #t iff it exited 0 — the building
+;; block for shell-based checks (a readiness probe is just "did it succeed?").
+;; PROG found on PATH; stderr flows through, so a failing probe's reason shows
+;; while a `wait-for' polls.
 (define (sh-ok? prog . args)
   (let* ((port (apply open-pipe* OPEN_READ prog args))
          (_    (get-string-all port)))
@@ -115,14 +105,13 @@
 
 ;; ---------- checks: intermediate appliers ----------
 ;;
-;; A check is an ordinary applier — a `(state dry? -> effects)' — whose effect
-;; is *observation* (poll, assert, report) rather than mutation. These builders
-;; return one; drop it into an `appliers' entry or a deploy applier's
-;; #:pre/#:post. PRED is a `(state -> boolean)'; `cmd' lifts a shell command
-;; into one. They differ only in dry-run and failure policy:
+;; A check is an applier whose effect is *observation* (poll, assert, report),
+;; not mutation. These builders return one; drop it into an `appliers' entry or
+;; a #:pre/#:post. PRED is a `(state -> boolean)'; `cmd' lifts a shell command.
+;; They differ only in dry-run and failure policy:
 ;;   wait-for  block until PRED holds (or time out → fatal); skipped on DRY?.
 ;;   check     assert PRED once; #:fatal? (default #t) → error, else warn;
-;;             skipped on DRY? (there is nothing yet to check during a plan).
+;;             skipped on DRY? (nothing to check during a plan).
 ;;   report    run THUNK for its side output; always, never fatal.
 
 ;; Lift a shell command into a state predicate: ignores state, true iff the
@@ -130,9 +119,9 @@
 (define (cmd prog . args)
   (lambda (state) (apply sh-ok? prog args)))
 
-;; True unless #:needs names a binary that is absent; logs a skip note when so.
-;; Lets a check that shells out to an optional tool no-op (rather than fail the
-;; run) when that tool isn't installed — the same posture as `helm-template`.
+;; True unless #:needs names an absent binary (then logs a skip). Lets a check
+;; that shells out to an optional tool no-op rather than fail when it isn't
+;; installed — same posture as `helm-template`.
 (define (needs-ok? phase desc needs)
   (or (not needs) (which-cmd needs)
       (begin (log ";; apply[~a]: ~a — `~a' not on PATH, skipped~%" phase desc needs)
@@ -176,26 +165,24 @@ never fails.  Runs even under DRY?."
     (log ";; apply[report]: ~a~%" desc)
     (thunk state)))
 
-;; #:pre/#:post accept a single check or a list of them; normalise to a list.
+;; #:pre/#:post accept a single check or a list; normalise to a list.
 (define (as-checks x) (if (procedure? x) (list x) x))
 (define (run-checks cs state dry?) (for-each (lambda (c) (c state dry?)) cs))
 
 ;; ---------- registration ----------
 
-;; The sugar over a sequence of appliers: name each and register it, in textual
-;; order.  Each PROC is an expression evaluating to a `(state dry? -> effects)'
-;; — a deploy applier or a check.  Expands to plain `applies-with' calls, so it
-;; is a no-op outside `hexol apply' just like the primitive.
+;; Name and register a sequence of appliers in textual order. Each PROC
+;; evaluates to a `(state dry? -> effects)' — a deploy applier or a check.
+;; Expands to `applies-with' calls, so a no-op outside `hexol apply'.
 (define-syntax appliers
   (syntax-rules ()
     ((_ (name proc) ...)
      (begin (applies-with name proc) ...))))
 
-;; The sugar over a set of CLI actions (custom `hexol' verbs the inventory
-;; contributes), paralleling `appliers'.  Each entry is (NAME SYNOPSIS PROC):
-;; PROC evaluates to a `(state args -> effects)' action, SYNOPSIS the one-line
-;; usage `hexol --help' shows.  Expands to plain `defines-action' calls, so it
-;; is a no-op outside the CLI's action discovery just like the primitive.
+;; Register a set of CLI actions (custom `hexol' verbs), paralleling
+;; `appliers'. Each entry (NAME SYNOPSIS PROC): PROC evaluates to a
+;; `(state args -> effects)', SYNOPSIS the one-line `hexol --help' usage.
+;; Expands to `defines-action' calls, so a no-op outside action discovery.
 (define-syntax actions
   (syntax-rules ()
     ((_ (name synopsis proc) ...)
@@ -228,7 +215,7 @@ init and after the outputs are written; name the result in an `appliers' form."
       (cond
         (dry? (run* tf chdir "plan"))
         (else
-         (run* tf chdir "apply")            ; tofu's own y/N prompt gates this
+         (run* tf chdir "apply")            ; tofu's y/N prompt gates this
          (for-each
            (lambda (pair)
              (let ((val (capture tf chdir "output" "-raw" (car pair))))
@@ -276,22 +263,21 @@ it with `defines-action'/`actions' to make it its own `hexol' verb."
 
 ;; ---------- talos day-2 lifecycle (CLI actions, not pipeline steps) ----------
 ;;
-;; Provisioning is terraform's job (day 1).  Changing a *running* cluster is
-;; not something terraform expresses safely: a control-plane machine-config
-;; edit that reboots a node must roll ONE node at a time, waiting for the
-;; cluster to come back healthy before touching the next, or etcd loses quorum
-;; — a gate that is awkward in HCL but natural here.  So day-2 lifecycle lives
-;; as hexol *actions* (talosctl-backed verbs), parallel to `terraform-destroyer'.
+;; Provisioning is terraform's job (day 1). Terraform can't safely express
+;; changing a *running* cluster: a control-plane machine-config edit that
+;; reboots a node must roll ONE node at a time, waiting for health before the
+;; next, or etcd loses quorum — awkward in HCL, natural here. So day-2 lives as
+;; hexol *actions* (talosctl verbs), parallel to `terraform-destroyer'.
 ;;
-;; The config is NOT re-derived here — hexol only holds the patch, while the
-;; full machine config (secrets, PKI) is rendered by the talos provider.  So
-;; the rolling action reads each node's config straight out of terraform state
-;; via `tofu output' (expose it as a per-node `terraform-output'); the inventory
-;; stays the one source of truth, and `apply-config' pushes exactly what a fresh
-;; boot would.  (Pin `user_data' with a lifecycle ignore so a config edit does
-;; not force-replace the instance — first boot seeds it, this rolls it after.)
+;; The config is NOT re-derived — hexol holds only the patch; the full machine
+;; config (secrets, PKI) is rendered by the talos provider. The rolling action
+;; reads each node's config from terraform state via `tofu output' (expose it
+;; per-node); the inventory stays the source of truth, and `apply-config'
+;; pushes exactly what a fresh boot would. (Pin `user_data' with a lifecycle
+;; ignore so a config edit doesn't force-replace the instance — first boot
+;; seeds it, this rolls it after.)
 
-;; Capture `BINARY -chdir=WORKDIR output -raw NAME' (a single terraform output).
+;; Capture a single terraform output: `BINARY -chdir=WORKDIR output -raw NAME'.
 (define (tf-output-raw binary workdir name)
   (capture binary (string-append "-chdir=" workdir) "output" "-raw" name))
 
@@ -315,9 +301,9 @@ Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
            (tf-bin (find-binary tofu))
            (dry?   (and (member "--dry-run" args) #t))
            ;; one tofu round-trip per value; addresses up front (for the
-           ;; "observe from another node" health gate), configs lazily per node.
+           ;; observe-from-another-node health gate), configs lazily per node.
            (addrs  (map (lambda (n) (tf-output-raw tf-bin workdir (cadr n))) nodes)))
-      ;; refresh the client config so apply/health use current certs
+      ;; refresh client config so apply/health use current certs
       (write-file talosconfig (tf-output-raw tf-bin workdir "talosconfig"))
       (log ";; talos: wrote ~a~%" talosconfig)
       (let loop ((ns nodes) (i 0))
@@ -325,9 +311,9 @@ Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
           (let* ((n     (car ns))
                  (label (car n))
                  (ep    (list-ref addrs i))
-                 ;; a stable observer: the first node that isn't this one (so a
-                 ;; reboot of EP does not blind the health probe). Falls back to
-                 ;; EP itself for a single-node cluster.
+                 ;; stable observer: first node that isn't this one, so a
+                 ;; reboot of EP doesn't blind the probe. Falls back to EP for
+                 ;; a single-node cluster.
                  (obs   (or (find (lambda (a) (not (equal? a ep))) addrs) ep))
                  (cfg   (tf-output-raw tf-bin workdir (caddr n)))
                  (file  (string-append "/tmp/hexol-talos-" label ".yaml")))
@@ -349,10 +335,9 @@ Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
 
 ;; ---------- kubectl applier ----------
 
-;; Float Namespaces then CustomResourceDefinitions to the front so a kind's
-;; CRD is applied before any custom resource of that kind, and a namespace
-;; before resources scoped into it. (`filter` is stable, so order within each
-;; group is preserved.)
+;; Float Namespaces then CRDs to the front, so a kind's CRD lands before any
+;; custom resource of it, and a namespace before resources scoped into it.
+;; (`filter` is stable; order within each group is preserved.)
 (define (order-resources rs)
   (let ((kind-is (lambda (k) (lambda (r) (equal? (assq-ref r 'kind) k)))))
     (append (filter (kind-is "Namespace") rs)
@@ -362,8 +347,8 @@ Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
                                    '("Namespace" "CustomResourceDefinition"))))
                     rs))))
 
-;; Pipe YAML to `kubectl ARGS` (which include `apply … -f -`) and return the
-;; exit code, letting the caller decide whether a non-zero pass is fatal.
+;; Pipe YAML to `kubectl ARGS` (which include `apply … -f -`); return the exit
+;; code, letting the caller decide whether a non-zero pass is fatal.
 (define (kubectl-pipe kubectl args yaml)
   (force-output (current-error-port))
   (let ((port (apply open-pipe* OPEN_WRITE kubectl args)))

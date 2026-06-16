@@ -1,10 +1,9 @@
 ;;; cmdb/region-body.scm — per-region rendering body for the CMDB.
 ;;;
-;;; `region-body-ops` returns the list of ops that build one region's
-;;; subtree from its attribute alist; cmdb/region-render.scm calls
-;;; (resolve (region-body-ops) attrs) to render a single region from a
-;;; `(region <name> <attrs>)` fact. It lives in the CMDB, not the examples
-;;; — the examples are deliberately independent of this subsystem.
+;;; `region-body-ops` returns the ops that build one region's subtree
+;;; from its attr alist; region-render.scm runs (resolve (region-body-ops)
+;;; attrs) per `(region <name> <attrs>)` fact. Lives in the CMDB, not the
+;;; examples — examples stay independent of this subsystem.
 
 (define-module (cmdb region-body)
   #:use-module (hexol kernel)
@@ -154,13 +153,13 @@
        (hx-append features sovereign-networking)))
 
     ;; ---------- Apps (only on Kubernetes > 1.32.4) ----------
-    ;; `load-inventory-file` returns the fragment's ops; hx-when flattens and
-    ;; folds them when the predicate holds.
+    ;; load-inventory-file returns the fragment's ops; hx-when folds them
+    ;; when the predicate holds.
     (hx-when (lambda (s) (semver> (get '(kubernetes version)) "1.32.4"))
       (load-inventory-file "cmdb/apps.scm"))
 
-    ;; ---------- Cross-cutting: in sovereign regions, every k8s resource
-    ;; gets a compliance label + audit annotation, regardless of source.
+    ;; ---------- Cross-cutting: sovereign regions label + annotate every
+    ;; k8s resource for compliance/audit, regardless of source.
     (hx-when (attrs (sovereignty strict))
       (annotate-all '((audit.example.com/required . "true")))
       (label-all    '((compliance . "strict"))))
