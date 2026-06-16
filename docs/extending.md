@@ -97,7 +97,7 @@ gave, minus the hand-quoted alists its argument values used to collapse into.
             (port      #:default 8080)          ; default value (library scope)
             (replicas  #:default 1)
             (env       #:map)                   ; free-form nested alist
-            (env-from  #:list)                  ; (k a b …) → (list a b …)
+            (env-from  #:list)                  ; (k a b …) → (list a b …); ,@xs splices
             (resources #:coerce normalize-resources)  ; wrap the value in (P …)
             (privileged #:flag))                ; (privileged) → #t, absent → #f
   #:build (%deployment #:name name #:image image #:port port …))   ; any value/op
@@ -112,6 +112,43 @@ value (a column, a task) or an op (a resource) — the engine is agnostic.
 
 `#:open? #t` lets unknown `(key value)` entries through into an `extra` local
 (an alist) instead of erroring — for generic forms whose key set isn't fixed.
+
+A `#:list` field accepts both literal entries and a spliced runtime list, via
+the `,@` (unquote-splicing) marker — so a computed list of entries needs no
+raw-alist escape:
+
+```scheme
+(deployment "api" (image "x:1")
+  (env ,@base-env (FOO "1")))      ; base-env (a runtime list) ++ one literal entry
+```
+
+**This is not just for library authors.** `define-construct` (and
+`construct-map-entries`) are re-exported from every target library, so an
+inventory that already does `(use-modules (hexol k8s))` can define its *own*
+typed constructors that read exactly like the built-in ones — no extra import.
+This is how a homelab composes app bundles (`examples/homelab.scm`):
+
+```scheme
+(define-construct stateful-app                 ; PVC + Deployment + Service (+ route)
+  #:head name
+  #:fields ((image #:required) (port #:required)
+            (storage #:default "5Gi") (mount-path #:default "/data")
+            (env #:list) (route-host #:default #f))
+  #:build
+  (compose-ops 'stateful-app `(stateful-app ,name)
+    (list (persistent-volume-claim name (size storage))
+          (deployment name (image image) (port port) (replicas 1)
+            (env ,@env)                        ; splice the caller's runtime env list
+            (volumes (mount (pvc name) mount-path)))
+          (service name (port port)))))
+
+(stateful-app "gitea" (image "gitea/gitea:1.22") (port 3000) (storage "10Gi"))
+```
+
+Reach for it whenever a `define*`/`#:keyword` helper would otherwise make your
+own abstractions read differently from the library's. Genuine procedures and
+macros (appliers, `split-with`-style rule builders) stay `#:keyword` — that's
+idiomatic Scheme, not a constructor surface.
 
 Because the schema names each field's kind, a typed constructor needs **no**
 nesting marker: `(deployment "api" (env (LOG_LEVEL "info")))` is unambiguous.

@@ -27,9 +27,11 @@
 (define-module (hexol ansible)
   #:use-module (hexol kernel)
   #:use-module ((hexol surface) #:select (block body))
+  #:use-module (hexol construct)
   #:use-module (yaml)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
+  #:re-export (define-construct construct-map-entries construct-flag)
   #:export (load-inventory
             ;; helpers for role authors
             host-attr host-attrs host-groups in-group?

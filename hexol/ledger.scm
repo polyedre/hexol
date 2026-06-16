@@ -36,8 +36,10 @@
 
 (define-module (hexol ledger)
   #:use-module (hexol kernel)
+  #:use-module (hexol construct)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
+  #:re-export (define-construct construct-map-entries construct-flag)
   #:export (;; scope wrappers
             in-year in-month on-day
             in-currency with-default-account

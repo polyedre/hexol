@@ -51,6 +51,8 @@
   #:re-export (resource transform-resources annotate-all label-all
                compose-ops
                which-cmd
+               ;; author your own typed body-form constructors (see docs/extending.md)
+               define-construct construct-map-entries construct-flag
                ;; render cache (for inventory shell-out ops)
                current-render-cache)
   #:export (;; namespace scope

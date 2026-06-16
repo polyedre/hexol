@@ -299,7 +299,10 @@
 
 ;; One OVH A-record labelled RNAME, pointing HOST at TARGET (an IP or
 ;; interpolation). `zone`/`subdomain` are OVH's split of the FQDN.
-(define* (dns-a rname host #:key target (ttl 60))
+(define-construct dns-a
+  #:head (rname host)
+  #:fields ((target #:required) (ttl #:default 60))
+  #:build
   (terraform-resource "ovh_domain_zone_record" rname
     (zone      (dns-zone))
     (subdomain (subdomain-of host))
@@ -346,9 +349,14 @@
                    kv))
              r))))
 
-(define* (helm-template #:key name chart repo version namespace (values '()) (include-crds #t))
-  "Return a fold-time op that renders CHART (from REPO, at VERSION) with `helm
-template` and appends every manifest it emits to (kubernetes_resources)."
+;; A fold-time op that renders CHART (from REPO, at VERSION) with `helm
+;; template` and appends every manifest it emits to (kubernetes_resources).
+;; `values` is a raw values.yaml alist (free-form, like a custom-resource spec).
+(define-construct helm-template
+  #:head name
+  #:fields ((chart #:required) (repo #:required) (version #:required)
+            (namespace #:required) (values #:default '()) (include-crds #:flag #:default #t))
+  #:build
   (make-op 'helm-template `(helm-template ,name)
     (lambda (state)
       (let ((helm (which-cmd "helm")) (yq (which-cmd "yq")))
@@ -396,7 +404,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; --- GitOps layer: charts as Flux resources (reconciled in-cluster) ---
 
 ;; A Flux HelmRepository: where a chart comes from. Lives in flux-system.
-(define* (helm-repository #:key name url (namespace "flux-system") (interval "1h"))
+(define-construct helm-repository
+  #:head name
+  #:fields ((url #:required) (namespace #:default "flux-system") (interval #:default "1h"))
+  #:build
   (custom-resource name
     (api "source.toolkit.fluxcd.io/v1") (kind "HelmRepository")
     (namespace namespace)
@@ -404,9 +415,13 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 
 ;; A Flux HelmRelease: CHART from REPO at VERSION into TARGET-NAMESPACE with
 ;; VALUES. The CR lives in flux-system; Flux expands the chart.
-(define* (helm-release #:key name chart repo version target-namespace
-                       (release-name name) (timeout #f)
-                       (namespace "flux-system") (values '()) (interval "1h"))
+(define-construct helm-release
+  #:head name
+  #:fields ((chart #:required) (repo #:required) (version #:required)
+            (target-namespace #:default #f) (release-name #:default name)
+            (timeout #:default #f) (namespace #:default "flux-system")
+            (values #:default '()) (interval #:default "1h"))
+  #:build
   (custom-resource name
     (api "helm.toolkit.fluxcd.io/v2") (kind "HelmRelease")
     (namespace namespace)
@@ -483,49 +498,44 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 ;; shape (plain HTTP + Terminate-TLS HTTPS on the wildcard cert). In host-network
 ;; mode the listener `port` is the host port Envoy binds on every node (unique
 ;; per Gateway); the Octavia LB forwards 80/443 to it.
-(define* (edge-gateway #:key name http-port https-port)
+(define-construct edge-gateway
+  #:head name
+  #:fields ((http-port #:required) (https-port #:required))
+  #:build
   (gateway name (gateway-class-name "cilium") (namespace "gateway")
     (listener "http"  (protocol "HTTP")  (port http-port))
     (listener "https" (protocol "HTTPS") (port https-port)
               (hostname (str "*." (cfg 'domain))) (tls-certificate "wildcard-tls"))))
 
 ;; A stateful self-hosted app: PVC + single-replica Deployment that mounts it +
-;; Service. The Deployment is a raw `resource` (not the library `deployment`)
-;; because its `env` is a runtime list the record-body field can't splice.
+;; Service, built on the library `deployment` — the caller's `env` (a runtime
+;; list of EnvVar entries) is spliced into the #:list `env` field with `,@env`.
 ;;
-;; #:route-host, when set, appends an HTTPRoute on #:route-gateway exposing this
-;; app at <route-host>.<domain>.
-(define* (stateful-app #:key name image port (namespace (current-k8s-namespace))
-                       (storage "5Gi") (mount "/data") (env '()) (resources "100m-*/256Mi")
-                       (route-host #f) (route-gateway #f))
-  (let ((vol (string-append "pvc-" name)))
-    (compose-ops 'stateful-app `(stateful-app ,name)
-      (append
-        (list
-          (persistent-volume-claim name (size storage) (namespace namespace))
-          (resource
-            `((apiVersion . "apps/v1") (kind . "Deployment")
-              (metadata (namespace . ,namespace) (name . ,name) (labels (app . ,name)))
-              (spec (replicas . 1)
-                    (selector (matchLabels (app . ,name)))
-                    (template
-                      (metadata (labels (app . ,name)))
-                      (spec
-                        (containers
-                          ((name . ,name) (image . ,image)
-                           (ports ((containerPort . ,port)))
-                           ,@(if (null? env) '() `((env ,@env)))
-                           (volumeMounts ((name . ,vol) (mountPath . ,mount)))
-                           (resources ,@(res resources))))
-                        (volumes ((name . ,vol)
-                                  (persistentVolumeClaim (claimName . ,name)))))))))
-          (service name (port port) (namespace namespace)))
-        (if route-host
-            (list (http-route name (namespace namespace)
-                    (parent-name route-gateway) (parent-namespace "gateway")
-                    (hostnames (str route-host "." (cfg 'domain)))
-                    (backend-service name) (backend-port port)))
-            '())))))
+;; (route-host …), when set, appends an HTTPRoute on (route-gateway …) exposing
+;; this app at <route-host>.<domain>.
+(define-construct stateful-app
+  #:head name
+  #:fields ((image #:required) (port #:required)
+            (namespace #:default (current-k8s-namespace))
+            (storage #:default "5Gi") (mount-path #:default "/data")
+            (env #:list) (resources #:default "100m-*/256Mi")
+            (route-host #:default #f) (route-gateway #:default #f))
+  #:build
+  (compose-ops 'stateful-app `(stateful-app ,name)
+    (append
+      (list
+        (persistent-volume-claim name (size storage) (namespace namespace))
+        (deployment name (image image) (port port) (namespace namespace) (replicas 1)
+          (env ,@env)
+          (volumes (mount (pvc name) mount-path))
+          (resources resources))
+        (service name (port port) (namespace namespace)))
+      (if route-host
+          (list (http-route name (namespace namespace)
+                  (parent-name route-gateway) (parent-namespace "gateway")
+                  (hostnames (str route-host "." (cfg 'domain)))
+                  (backend-service name) (backend-port port)))
+          '()))))
 
 ;; ---------------------------------------------------------------------------
 ;; secrets store (content) — one inline, sops-encrypted document
@@ -774,10 +784,10 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; Explicit records beat the wildcard.
   (map (lambda (name)
          (dns-a name (str name "." (cfg 'domain))
-                #:target (ref openstack_networking_floatingip_v2 api address)))
+                (target (ref openstack_networking_floatingip_v2 api address))))
        '("api" "vpn" "jellyfin"))
   (map (lambda (n)
-         (dns-a (str "wildcard-cp-" (car n)) (str "*." (cfg 'domain)) #:target (cdr n)))
+         (dns-a (str "wildcard-cp-" (car n)) (str "*." (cfg 'domain)) (target (cdr n))))
        (nodes))
 
   ;; One-time bootstrap: init etcd on node 1, once its VM (and FIP) exist.
@@ -833,9 +843,9 @@ template` and appends every manifest it emits to (kubernetes_resources)."
 
   ;; --- Cilium: CNI + kube-proxy replacement + Gateway API ---
   ;; (cni:none in Talos means this is the cluster network; apply it first.)
-  (helm-template #:name "cilium" #:namespace "kube-system"
-    #:chart "cilium" #:repo "https://helm.cilium.io" #:version "1.16.19"
-    #:values `((kubeProxyReplacement . #t)
+  (helm-template "cilium" (namespace "kube-system")
+    (chart "cilium") (repo "https://helm.cilium.io") (version "1.16.19")
+    (values `((kubeProxyReplacement . #t)
                ;; Talos KubePrism: node-local apiserver endpoint.
                (k8sServiceHost . "localhost") (k8sServicePort . 7445)
                (ipam (mode . "kubernetes"))
@@ -860,7 +870,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                                 "DAC_OVERRIDE" "FOWNER" "SETGID" "SETUID")
                    (cleanCiliumState "NET_ADMIN" "SYS_ADMIN" "SYS_RESOURCE")))
                ;; Talos mount points for CNI install + cgroup.
-               (cgroup (autoMount (enabled . #f)) (hostRoot . "/sys/fs/cgroup"))))
+               (cgroup (autoMount (enabled . #f)) (hostRoot . "/sys/fs/cgroup")))))
 
   ;; The GatewayClass our Gateway binds to. Cilium controls one with this
   ;; controllerName but doesn't create it, so we must — else Gateways stall
@@ -872,13 +882,13 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; resulting CSRs by default, so `kubectl logs/exec` and metrics fail with
   ;; "tls: internal error". This approves CSRs whose SANs match our nodes
   ;; (hostname pattern + private subnet); node names aren't in DNS, so bypass it.
-  (helm-template #:name "kubelet-csr-approver" #:namespace "kube-system"
-    #:chart "kubelet-csr-approver"
-    #:repo "https://postfinance.github.io/kubelet-csr-approver" #:version "1.2.14"
+  (helm-template "kubelet-csr-approver" (namespace "kube-system")
+    (chart "kubelet-csr-approver")
+    (repo "https://postfinance.github.io/kubelet-csr-approver") (version "1.2.14")
     ;; Tolerate an optional domain suffix (FQDN-style hostnames).
-    #:values `((providerRegex . ,(str "^" (cfg 'cluster-name) "-cp-[0-9]+(\\..+)?$"))
-               (bypassDnsResolution . #t)
-               (providerIpPrefixes ,(cfg 'net-cidr))))
+    (values `((providerRegex . ,(str "^" (cfg 'cluster-name) "-cp-[0-9]+(\\..+)?$"))
+              (bypassDnsResolution . #t)
+              (providerIpPrefixes ,(cfg 'net-cidr)))))
 
   ;; --- local-path-provisioner: node-local scratch StorageClass (non-default) ---
   ;; Node-local hostPath volumes, non-default (cinder-csi is) since they pin to a
@@ -921,26 +931,26 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; with-namespace creates flux-system (the flux2 chart doesn't), co-located
   ;; with its consumer. Other namespaces come from their own with-namespace blocks.
   (with-namespace "flux-system"
-    (helm-template #:name "flux2" #:namespace "flux-system"
-      #:chart "flux2" #:repo "https://fluxcd-community.github.io/helm-charts"
-      #:version "2.14.0"))
+    (helm-template "flux2" (namespace "flux-system")
+      (chart "flux2") (repo "https://fluxcd-community.github.io/helm-charts")
+      (version "2.14.0")))
 
   ;; ---- GitOps layer: Flux resources, reconciled in-cluster by Flux ----
 
   ;; chart sources (helm-repository defaults to flux-system).
-  (helm-repository #:name "jetstack" #:url "https://charts.jetstack.io")
-  (helm-repository #:name "prometheus-community" #:url "https://prometheus-community.github.io/helm-charts")
-  (helm-repository #:name "cert-manager-webhook-ovh" #:url "https://aureq.github.io/cert-manager-webhook-ovh/")
-  (helm-repository #:name "cloud-provider-openstack" #:url "https://kubernetes.github.io/cloud-provider-openstack")
+  (helm-repository "jetstack" (url "https://charts.jetstack.io"))
+  (helm-repository "prometheus-community" (url "https://prometheus-community.github.io/helm-charts"))
+  (helm-repository "cert-manager-webhook-ovh" (url "https://aureq.github.io/cert-manager-webhook-ovh/"))
+  (helm-repository "cloud-provider-openstack" (url "https://kubernetes.github.io/cloud-provider-openstack"))
 
   ;; --- cinder-csi driver (Flux): controller + per-node DaemonSet ---
   ;; Uses the pre-created `cloud-config' Secret (secret.create #f) and skips the
   ;; chart's StorageClass — we declared `cinder' (default) above. Talos: the node
   ;; plugin needs the rshared kubelet mount in the talos-patch. NOTE: pin the
   ;; chart version to the cluster's k8s minor — bump if Flux reports it unavailable.
-  (helm-release #:name "openstack-cinder-csi" #:repo "cloud-provider-openstack"
-    #:chart "openstack-cinder-csi" #:version "2.31.2" #:target-namespace "kube-system"
-    #:values '((secret (enabled . #t) (create . #f) (name . "cloud-config"))
+  (helm-release "openstack-cinder-csi" (repo "cloud-provider-openstack")
+    (chart "openstack-cinder-csi") (version "2.31.2") (target-namespace "kube-system")
+    (values '((secret (enabled . #t) (create . #f) (name . "cloud-config"))
                (storageClass (enabled . #f))
                ;; Drop the chart's default `cacert' hostPath: its create-if-missing
                ;; mount fails on Talos's read-only /etc. We set no `ca-file' (OVH
@@ -949,7 +959,7 @@ template` and appends every manifest it emits to (kubernetes_resources)."
                       (volumes)            ; render {}: drop default cacert volume
                       (volumeMounts ((name . "cloud-config")
                                      (mountPath . "/etc/kubernetes")
-                                     (readOnly . #t)))))))
+                                     (readOnly . #t))))))))
 
   ;; --- cert-manager (Flux): ACME wildcard cert for *.<domain> ---
   ;; A wildcard cert, which Let's Encrypt only issues over DNS-01 — so we solve
@@ -958,12 +968,12 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; `groupName` must match the webhook chart + solver. CRDs are pre-applied by
   ;; `(cert-manager-crds)`, so this release runs with `crds.enabled #f`.
   (cert-manager-crds)
-  (helm-release #:name "cert-manager" #:repo "jetstack"
-    #:chart "cert-manager" #:version cert-manager-version #:target-namespace "cert-manager"
-    #:values '((crds (enabled . #f))))
-  (helm-release #:name "cert-manager-webhook-ovh" #:repo "cert-manager-webhook-ovh"
-    #:chart "cert-manager-webhook-ovh" #:version "0.9.10" #:target-namespace "cert-manager"
-    #:values `((groupName . ,(str "acme." (cfg 'domain)))))
+  (helm-release "cert-manager" (repo "jetstack")
+    (chart "cert-manager") (version cert-manager-version) (target-namespace "cert-manager")
+    (values '((crds (enabled . #f)))))
+  (helm-release "cert-manager-webhook-ovh" (repo "cert-manager-webhook-ovh")
+    (chart "cert-manager-webhook-ovh") (version "0.9.10") (target-namespace "cert-manager")
+    (values `((groupName . ,(str "acme." (cfg 'domain))))))
   (with-namespace "cert-manager"
     ;; the ovh-credentials Secret — values from the inline secrets-store
     ;; (namespace defaults to the enclosing with-namespace, cert-manager)
@@ -1003,20 +1013,20 @@ template` and appends every manifest it emits to (kubernetes_resources)."
     ;; Two edge Gateways sharing the wildcard cert. The PUBLIC one binds the host
     ;; ports the LB forwards 80/443 to; the PRIVATE one binds ports left closed —
     ;; VPN-only. A route's choice of parent Gateway makes a service public/private.
-    (edge-gateway #:name "homelab-public"
-                  #:http-port  (cfg 'ingress-http-hostport)
-                  #:https-port (cfg 'ingress-https-hostport))
-    (edge-gateway #:name "homelab-private"
-                  #:http-port  (cfg 'private-http-hostport)
-                  #:https-port (cfg 'private-https-hostport)))
+    (edge-gateway "homelab-public"
+                  (http-port  (cfg 'ingress-http-hostport))
+                  (https-port (cfg 'ingress-https-hostport)))
+    (edge-gateway "homelab-private"
+                  (http-port  (cfg 'private-http-hostport))
+                  (https-port (cfg 'private-https-hostport))))
 
   ;; --- kube-prometheus-stack (Flux): metrics + Grafana (via the Gateway) ---
-  (helm-release #:name "kube-prometheus-stack" #:repo "prometheus-community"
-    #:chart "kube-prometheus-stack" #:version "61.3.0" #:target-namespace "monitoring"
-    #:timeout "15m"   ; big chart (operator + CRDs + Grafana) — exceeds Flux's 5m
-    #:values `((grafana (enabled . #t)
-                        (adminPassword . "changeme"))
-               (prometheus (prometheusSpec (retention . "30d")))))
+  (helm-release "kube-prometheus-stack" (repo "prometheus-community")
+    (chart "kube-prometheus-stack") (version "61.3.0") (target-namespace "monitoring")
+    (timeout "15m")   ; big chart (operator + CRDs + Grafana) — exceeds Flux's 5m
+    (values `((grafana (enabled . #t)
+                       (adminPassword . "changeme"))
+              (prometheus (prometheusSpec (retention . "30d"))))))
   (with-namespace "monitoring"
     (http-route "grafana" (parent-name "homelab-private") (parent-namespace "gateway")
       (hostnames (str "grafana." (cfg 'domain)))
@@ -1025,19 +1035,19 @@ template` and appends every manifest it emits to (kubernetes_resources)."
   ;; --- a few standard self-hosted apps (namespace "apps") ---
   ;; Each app's `#:expose` appends its HTTPRoute (host + which Gateway).
   (with-namespace "apps"
-    (stateful-app #:name "vaultwarden" #:image "vaultwarden/server:1.30.5" #:port 80
-                  #:storage "2Gi" #:mount "/data"
-                  #:env `(((name . "DOMAIN") (value . ,(str "https://vault." (cfg 'domain)))))
-                  #:route-host "vault" #:route-gateway "homelab-private")
+    (stateful-app "vaultwarden" (image "vaultwarden/server:1.30.5") (port 80)
+                  (storage "2Gi") (mount-path "/data")
+                  (env `((name . "DOMAIN") (value . ,(str "https://vault." (cfg 'domain)))))
+                  (route-host "vault") (route-gateway "homelab-private"))
 
     ;; jellyfin: the one PUBLIC app — public Gateway (LB-fronted).
-    (stateful-app #:name "jellyfin" #:image "jellyfin/jellyfin:10.9.6" #:port 8096
-                  #:storage "20Gi" #:mount "/config" #:resources "500m-*/1Gi"
-                  #:route-host "jellyfin" #:route-gateway "homelab-public")
+    (stateful-app "jellyfin" (image "jellyfin/jellyfin:10.9.6") (port 8096)
+                  (storage "20Gi") (mount-path "/config") (resources "500m-*/1Gi")
+                  (route-host "jellyfin") (route-gateway "homelab-public"))
 
-    (stateful-app #:name "gitea" #:image "gitea/gitea:1.22.1" #:port 3000
-                  #:storage "10Gi" #:mount "/data"
-                  #:route-host "git" #:route-gateway "homelab-private"))
+    (stateful-app "gitea" (image "gitea/gitea:1.22.1") (port 3000)
+                  (storage "10Gi") (mount-path "/data")
+                  (route-host "git") (route-gateway "homelab-private")))
 
   ;; One pass stamps every cluster resource with a common label.
   (label-all `((app.kubernetes.io/part-of . ,(cfg 'cluster-name))))

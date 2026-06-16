@@ -64,9 +64,13 @@
 ;; Each builder bundles `terraform-resource` ops plus the `tf-output`s
 ;; downstream tooling reads back.
 
-(define* (aws-rds #:key name engine (engine-version "15")
-                  (instance-class "db.t3.medium")
-                  (allocated-storage 20) (username "app") (multi-az #f))
+(define-construct aws-rds
+  #:head name
+  #:fields ((engine #:required) (engine-version #:default "15")
+            (instance-class #:default "db.t3.medium")
+            (allocated-storage #:default 20) (username #:default "app")
+            (multi-az #:flag))
+  #:build
   (compose-ops 'aws-rds `(aws-rds ,name)
     (list
       (terraform-resource "aws_security_group" (str name "-sg")
@@ -89,7 +93,11 @@
       (tf-output "aws_db_instance" name "endpoint")
       (tf-output "aws_db_instance" name "port"))))
 
-(define* (aws-lb #:key name (scheme "internet-facing") (port 443) (protocol "TCP"))
+(define-construct aws-lb
+  #:head name
+  #:fields ((scheme #:default "internet-facing") (port #:default 443)
+            (protocol #:default "TCP"))
+  #:build
   (compose-ops 'aws-lb `(aws-lb ,name)
     (list
       (terraform-resource "aws_lb" name
@@ -198,8 +206,8 @@
     (region      os-region))
 
   ;; --- AWS ---
-  (aws-rds #:name "api-db" #:engine "postgres" #:multi-az prod?)
-  (aws-lb  #:name "frontend-lb" #:port 443)
+  (aws-rds "api-db" (engine "postgres") (multi-az prod?))
+  (aws-lb  "frontend-lb" (port 443))
 
   ;; --- OpenStack: keypair, network, the web fleet ---
   (os-keypair "deployer")

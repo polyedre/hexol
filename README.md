@@ -32,18 +32,20 @@ DevOps tools propose hacky solutions to make configuration dynamic:
 
 (hx-ops
   (with-namespace "loulou"
-    ;; A Deployment. Its ConfigMap and Secret are pulled in by name —
-    ;; one becomes `envFrom`, the other a mounted volume.
-    (app #:name "loulou" #:image "secure.io/loulou:2.1" #:port 9000 #:replicas 2
-         #:env-from '((configMap "loulou-config"))
-         #:volumes  '((secret "loulou-secret" "/etc/loulou/secret"))
-         #:resources "200m-*/256Mi")
+    ;; A Deployment (+ its Service). Its ConfigMap and Secret are pulled in by
+    ;; name — one becomes `envFrom`, the other a mounted volume. Positional
+    ;; name, then `(key value)` entries; values are evaluated Scheme.
+    (app "loulou"
+         (image "secure.io/loulou:2.1") (port 9000) (replicas 2)
+         (env-from (cm "loulou-config"))
+         (volumes  (mount (sec "loulou-secret") "/etc/loulou/secret"))
+         (resources "200m-*/256Mi"))
 
     ;; The config the Deployment above consumes — ordinary Scheme data.
-    (configmap #:name "loulou-config"
-               #:data '((LOG_LEVEL . "debug") (CACHE_SIZE . "256")))
-    (secret    #:name "loulou-secret"
-               #:data '((DB_PASSWORD . "bG91bG91LXNlY3JldA=="))))
+    (configmap "loulou-config"
+               (data (LOG_LEVEL "debug") (CACHE_SIZE "256")))
+    (secret    "loulou-secret"
+               (data (DB_PASSWORD "bG91bG91LXNlY3JldA=="))))
 
   ;; Cross-cutting pass: hash every Deployment's referenced ConfigMaps and
   ;; Secrets, and stamp the result onto the pod template as an annotation —
@@ -113,12 +115,13 @@ which decrypts, edits the plaintext, re-seals with sops, and rewrites *only*
 the `(secrets-store …)` form in place:
 
 ```sh
-./bin/hexol secret ls               inventory.scm   # list keys (no decrypt)
-./bin/hexol secret set   db/password inventory.scm   # add/replace (value arg or stdin)
-./bin/hexol secret edit  db/password inventory.scm   # $EDITOR round-trip
-./bin/hexol secret get   db/password inventory.scm   # decrypt one to stdout
-./bin/hexol secret rm    db/password inventory.scm
-./bin/hexol secret rekey             inventory.scm   # re-seal to current recipients
+./bin/hexol secret init             -i inventory.scm   # add an empty (secrets-store …)
+./bin/hexol secret ls               -i inventory.scm   # list keys (no decrypt)
+./bin/hexol secret set   db/password -i inventory.scm   # add/replace (value arg or stdin)
+./bin/hexol secret edit  db/password -i inventory.scm   # $EDITOR round-trip
+./bin/hexol secret get   db/password -i inventory.scm   # decrypt one to stdout
+./bin/hexol secret rm    db/password -i inventory.scm
+./bin/hexol secret rekey             -i inventory.scm   # re-seal to current recipients
 ```
 
 See [`docs/authoring.md`](docs/authoring.md#secrets-inline-sops-backed) for the
@@ -126,22 +129,29 @@ load-time-vs-render-time model and the full CLI.
 
 ## Quick start
 
+The inventory is never positional — pass it with `-i/--inventory FILE` (or set
+`$HEXOL_INVENTORY` once for the session, then drop the flag):
+
 ```sh
-./bin/hexol render examples/inventory.scm                          # whole state (sexp)
-./bin/hexol render --path regions.alpha5 examples/inventory.scm    # one region's subtree
+./bin/hexol render -i examples/inventory.scm                          # whole state (sexp)
+./bin/hexol render --path regions.alpha5 -i examples/inventory.scm    # one region's subtree
 
 # the same CLI handles any inventory and any output format
-./bin/hexol render -o yaml      examples/helm-kube-prometheus-stack.scm   # k8s manifest stream
-./bin/hexol render -o terraform examples/terraform.scm                    # Terraform JSON
-./bin/hexol render -o ansible   examples/ansible.scm                      # Ansible playbook JSON
-./bin/hexol render -o sql       examples/database-schema.scm              # SQL DDL statements
-./bin/hexol render -o ledger    examples/ledger.scm                       # ledger-cli journal text
+./bin/hexol render -o yaml      -i examples/helm-kube-prometheus-stack.scm  # k8s manifest stream
+./bin/hexol render -o terraform -i examples/terraform.scm                   # Terraform JSON
+./bin/hexol render -o ansible   -i examples/ansible.scm                     # Ansible playbook JSON
+./bin/hexol render -o sql       -i examples/database-schema.scm             # SQL DDL statements
+./bin/hexol render -o ledger    -i examples/ledger.scm                      # ledger-cli journal text
 
 # introspect: rendering is not opaque
-./bin/hexol tree    examples/kubernetes.scm                            # op tree
-./bin/hexol ops     examples/inventory.scm                             # top-level ops + source
-./bin/hexol explain regions.alpha5.network.cni examples/inventory.scm  # what touched a path
+./bin/hexol tree    -i examples/kubernetes.scm                            # op tree (with hashes)
+./bin/hexol show    HASH -i examples/kubernetes.scm                       # one op: source + delta
+./bin/hexol explain regions.alpha5.network.cni -i examples/inventory.scm  # what touched a path
 ```
+
+`-o sql` and `-o ledger` are not built in: those two example files register
+them with `renders-with` (database-schema.scm:26, ledger.scm:21). `-o
+sexp|json|yaml|terraform|ansible` work on any inventory.
 
 ## Documentation
 

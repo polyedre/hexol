@@ -36,6 +36,7 @@
   #:use-module (hexol construct)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
+  #:re-export (define-construct construct-map-entries construct-flag)
   #:export (;; scope
             with-schema current-sql-schema
             ;; tables + indexes

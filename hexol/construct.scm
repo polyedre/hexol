@@ -26,6 +26,10 @@
 ;;;   scalar : (key v)            -> v               (evaluated)
 ;;;            (key)              -> #t              (only for a #:flag field)
 ;;;   list   : (key a b …)        -> (list a b …)    (#:list field; also (key (x)))
+;;;            (key a ,@xs b)     -> (append (list a) xs (list b))  — `,@e`
+;;;                                  splices a runtime list into a #:list field,
+;;;                                  so a computed list of entries needs no
+;;;                                  raw-alist escape: (env ,@extra-env (FOO "1"))
 ;;;   map    : (key (k v) …)      -> a free-form nested alist (#:map field):
 ;;;                                  keys auto-quoted to symbols, values
 ;;;                                  evaluated; string keys allowed ("nginx.conf").
@@ -109,7 +113,8 @@
 ;;
 ;;   (plain)            scalar; one value, evaluated
 ;;   #:flag             boolean; `(k)` → #t, `(k v)` → v, absent → #f
-;;   #:list             `(k a b …)` → (list a b …); a lone `(k)` → '()
+;;   #:list             `(k a b …)` → (list a b …); a lone `(k)` → '();
+;;                      `,@e` in arg position splices a runtime list
 ;;   #:map              `(k (sub v) …)` → free-form alist via construct-map-entries
 ;;   #:construct C      `(k . args)` → (C . args); with #:repeated, collect a list
 ;;   #:default E        value when the field is absent (else #f, or '() for list/map)
@@ -242,7 +247,15 @@
            (cond
              ((not es) unset)
              ((eq? kind 'flag) (let ((a (eargs (car es)))) (if (null? a) #'#t (car a))))
-             ((eq? kind 'list) #`(list #,@(eargs (car es))))
+             ((eq? kind 'list)
+              ;; each arg is one element, except `,@e` (unquote-splicing) which
+              ;; splices a runtime list — so a #:list field takes both literal
+              ;; entries and a computed list. `(append)` keeps a lone `(k)` => '().
+              #`(append #,@(map (lambda (a)
+                                  (syntax-case a (unquote-splicing)
+                                    ((unquote-splicing e) #'e)
+                                    (_ #`(list #,a))))
+                                (eargs (car es)))))
              ((eq? kind 'map)  #`(construct-map-entries #,@(eargs (car es))))
              ((eq? kind 'construct)
               (let ((mk (lambda (e) #`(#,(ehead e) #,@(eargs e)))))

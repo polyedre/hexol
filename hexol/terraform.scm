@@ -39,9 +39,11 @@
   #:use-module (hexol kernel)
   #:use-module ((hexol yaml) #:select (object-shape?))
   #:use-module ((hexol surface) #:select (block body))
+  #:use-module (hexol construct)
   #:use-module (json)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
+  #:re-export (define-construct construct-map-entries construct-flag)
   #:export (terraform-block terraform-resource terraform-data terraform-provider
             terraform-settings terraform-output
             ref tf-ref tf-interp tf-output
