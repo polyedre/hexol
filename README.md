@@ -1,31 +1,20 @@
-# hexol
+# Hexol
 
-*Configuration as code: build your config using a real programming language.*
+*Write your config in a real programming language.*
 
-YAML, JSON, and HCL hit their limits once configuration spans many
-environments and stacks: no real abstraction, no logic, endless copy-paste.
-hexol is a configuration engine built on Guile Scheme, so you get the full
-power of a mature language where you need it.
+An inventory is a program. You run it, and it builds one big JSON-compatible data structure — your whole config,
+assembled dynamically. From there hexol renders it to whatever you need: Kubernetes manifests, Terraform JSON, Ansible
+playbooks, SQL, plain YAML.
 
-The core is deliberately minimal: the engine builds configuration by
-chaining *Operations* — functions that read the current state and return the
-updated state. Yet the model is expressive enough that the same engine drives
-full Kubernetes, Terraform, and Ansible alternatives — each just a small library
-on top of the kernel.
+Hexol is both:
+- a **library** — the Scheme you write inventories with, plus target libraries (Kubernetes, Terraform, …) layered on
+  top, and
+- a **CLI** — to act on an inventory: `render` it, `apply` it, `inspect` what it produced.
 
-And because every change is a labeled record rather than a string
-substitution, **rendering is not opaque**: you can always ask which op
-produced any value in the output.
+## Example
 
-## Why
-
-DevOps tools propose hacky solutions to make configuration dynamic:
- - templating structured YAML files using templating engines (Helm, Ansible)
- - using hardcoded for loops (`for_each` in Terraform, `loop` in Ansible)
- - relying on "count" as the only way to conditionally execute a resource in Terraform
- 
- This is not satisfying. We need to embrace using real programming languages.
- Here's what's possible:
+An inventory is a program that builds your config. Here's a Kubernetes one
+([`examples/kubernetes.scm`](examples/kubernetes.scm)):
 
 ```scheme
 (use-modules (hexol k8s))
@@ -53,110 +42,96 @@ DevOps tools propose hacky solutions to make configuration dynamic:
   (checksum-config))
 ```
 
-Did you notice?
+A few things this buys you over plain manifests:
 
-The Secret "loulou-secret" was attached to the Deployment without having to
-write to the Volumes and VolumeMounts sections.
+- The Secret is attached to the Deployment without hand-writing the `volumes`
+  and `volumeMounts` sections — `(mount …)` wires both ends.
+- `"200m-*/256Mi"` expands to the full `resources` block (CPU request `200m`,
+  memory request + limit `256Mi`).
+- `checksum-config` runs *after* every resource is built, finds each
+  Deployment's ConfigMaps and Secrets, hashes them, and stamps a
+  `config/checksum` annotation onto the pod template — so a config change
+  forces a rollout, for *every* workload, for free. In Helm you'd hand-write a
+  `sha256sum` per Deployment.
 
-The resource block, which is often boring to type has been condensed into a
-custom string. Here, "200m-*/256Mi" would expand to:
+## Install
 
-```json
-{
-    "cpu": {
-        "requests": "200m"
-    },
-    "memory": {
-        "requests": "256Mi",
-        "limits": "256Mi"
-    }
-}
-```
-
-And the cherry on top: `checksum-config` runs *after* every resource is built,
-reads the resource list back out of the state, finds each Deployment's
-referenced ConfigMaps and Secrets, hashes their contents, and rewrites the pod
-template with a `config/checksum` annotation. Checksums for all the workloads
-comes for free!
-
-In Helm you'd hand-write a `sha256sum` over a rendered template for each
-Deployment; here it's one small library function that does it for *every*
-Deployment automatically.
-
-## Secrets
-
-Secrets live **inline in the inventory**, encrypted at rest with
-[sops](https://github.com/getsops/sops) — no separate `*.sops.yaml` files to
-keep in sync. One `(secrets-store …)` form holds a single sops envelope (one
-data key, one MAC) for every secret; `(secret-ref 'key)` references one at a
-field, and a final `(resolve-secret-refs)` op decrypts the store *once*, at
-render time, and substitutes the plaintext:
-
-```scheme
-(use-modules (hexol k8s) (hexol secrets))
-
-(secrets-store
-  (version "3.12.2") (lastmodified "…") (mac "ENC[…]")
-  (keys (pgp (fp "…") (enc "-----BEGIN PGP MESSAGE-----" …)))
-  (data (db/password . "ENC[AES256_GCM,data:…,type:str]")))
-
-(hx-ops
-  (resource
-    `((apiVersion . "v1") (kind . "Secret")
-      (metadata (name . "db"))
-      (stringData (password . ,(secret-ref 'db/password)))))
-  (resolve-secret-refs))   ; decrypts once, at render time only
-```
-
-`secret-ref` returns a cheap marker, so `tree`/`ops` never shell out to sops —
-only `render` does (and if no key is available it degrades to a clearly-marked
-placeholder rather than failing). Manage the store with the `hexol secret` CLI,
-which decrypts, edits the plaintext, re-seals with sops, and rewrites *only*
-the `(secrets-store …)` form in place:
+Hexol runs on [Guile](https://www.gnu.org/software/guile/) 3.x — install that,
+clone the repo, and run `./bin/hexol` (it auto-compiles on first use):
 
 ```sh
-./bin/hexol secret init             -i inventory.scm   # add an empty (secrets-store …)
-./bin/hexol secret ls               -i inventory.scm   # list keys (no decrypt)
-./bin/hexol secret set   db/password -i inventory.scm   # add/replace (value arg or stdin)
-./bin/hexol secret edit  db/password -i inventory.scm   # $EDITOR round-trip
-./bin/hexol secret get   db/password -i inventory.scm   # decrypt one to stdout
-./bin/hexol secret rm    db/password -i inventory.scm
-./bin/hexol secret rekey             -i inventory.scm   # re-seal to current recipients
+git clone https://github.com/Polyedre/hexol && cd hexol
+./bin/hexol render -i examples/kubernetes.scm
 ```
 
-See [`docs/authoring.md`](docs/authoring.md#secrets-inline-sops-backed) for the
-load-time-vs-render-time model and the full CLI.
+The CLI itself shells out to nothing. Individual features do, and only when you
+use them: `helm`/`yq` to expand charts, `sops` for inline secrets, and
+`tofu`/`kubectl`/`talosctl` for `apply`. Install whichever you need.
 
-## Quick start
-
-The inventory is never positional — pass it with `-i/--inventory FILE` (or set
-`$HEXOL_INVENTORY` once for the session, then drop the flag):
+## CLI Usage
 
 ```sh
-./bin/hexol render -i examples/inventory.scm                          # whole state (sexp)
-./bin/hexol render --path regions.alpha5 -i examples/inventory.scm    # one region's subtree
+./bin/hexol render -o json -i examples/kubernetes.scm
 
-# the same CLI handles any inventory and any output format
-./bin/hexol render -o yaml      -i examples/helm-kube-prometheus-stack.scm  # k8s manifest stream
-./bin/hexol render -o terraform -i examples/terraform.scm                   # Terraform JSON
-./bin/hexol render -o ansible   -i examples/ansible.scm                     # Ansible playbook JSON
-./bin/hexol render -o sql       -i examples/database-schema.scm             # SQL DDL statements
-./bin/hexol render -o ledger    -i examples/ledger.scm                      # ledger-cli journal text
+# act on it (appliers an inventory registers via `applies-with`)
+./bin/hexol apply --list -i examples/kubernetes.scm                       # show the applier pipeline
+./bin/hexol apply --dry-run -i examples/kubernetes.scm                    # delegate to each tool's dry-run
 
 # introspect: rendering is not opaque
-./bin/hexol tree    -i examples/kubernetes.scm                            # op tree (with hashes)
-./bin/hexol show    HASH -i examples/kubernetes.scm                       # one op: source + delta
+./bin/hexol tree -i examples/kubernetes.scm                               # op tree (with hashes)
+./bin/hexol show OP_HASH -i examples/kubernetes.scm                       # one op: source + delta
 ./bin/hexol explain regions.alpha5.network.cni -i examples/inventory.scm  # what touched a path
 ```
 
-`-o sql` and `-o ledger` are not built in: those two example files register
-them with `renders-with` (database-schema.scm:26, ledger.scm:21). `-o
-sexp|json|yaml|terraform|ansible` work on any inventory.
+## The Library
+
+While the kernel is target-agnostic, the library provide a few syntaxic sugar helpers:
+
+- **Kubernetes** — Deployments, Services, ConfigMaps, Secrets, and
+  cross-cutting passes like `checksum-config`. Render to a manifest stream with
+  `-o yaml`.
+- **Terraform** — providers, resources, and data sources as Scheme, rendered to
+  `terraform init`-ready JSON with `-o terraform`. See
+  [`examples/terraform.scm`](examples/terraform.scm).
+- **Ansible** — plays and tasks accumulated into a playbook, rendered with
+  `-o ansible`. See [`examples/ansible.scm`](examples/ansible.scm).
+- **Secrets (SOPS)** — secrets live inline in the inventory, encrypted at rest
+  with [sops](https://github.com/getsops/sops): no separate `*.sops.yaml` files
+  to keep in sync. `(secret-ref 'key)` is a cheap marker, so only `render`
+  shells out to sops; manage the store with the `hexol secret` subcommands. See
+  [`examples/homelab.scm`](examples/homelab.scm) and
+  [`docs/authoring.md`](docs/authoring.md#secrets-inline-sops-backed).
+
+Inventories can also register their own renderers via `renders-with` — the
+[`database-schema.scm`](examples/database-schema.scm) and
+[`ledger.scm`](examples/ledger.scm) examples add `-o sql` and `-o ledger` that
+way.
+
+## FAQ
+
+**How is this different from Pulumi, CDK, jsonnet, or Dhall?**
+Those build your config in memory and hand it off. Hexol keeps the *build
+itself* around: resolving an inventory is a chain of small labeled steps over a
+growing data structure, and every value remembers the step that set it — its
+source, its file and line, the exact change it made. So you can point at any
+value in the output and ask "what set this, and to what?" — `tree`, `show`, and
+`explain` answer it. No other config tool does that.
+
+**Is this a serious Kubernetes/Terraform tool, or a Scheme demo?**
+The Kubernetes and Terraform libraries are the real ones —
+[`examples/homelab.scm`](examples/homelab.scm) deploys a 3-node Talos cluster to
+OVH for real, end to end. The SQL and Ledger renderers are tiny example-file
+extensions, there to show the kernel doesn't care what it's building. Take them
+as proof the engine is general, not as products.
+
+**Is it production-ready?**
+It's young: one author, no CI yet, no outside production users. It has a test
+suite (`make test`) and it does run a live homelab. Kick the tires before you
+bet a cluster on it.
 
 ## Documentation
 
-- [`docs/model.md`](docs/model.md) — the fold-of-ops engine model and its
-  rationale.
+- [`docs/model.md`](docs/model.md) — the engine model and its rationale.
 - [`docs/authoring.md`](docs/authoring.md) — writing inventories: surface
   forms, helpers, file splitting, ordering, and the repository layout.
 - [`docs/extending.md`](docs/extending.md) — building target libraries,

@@ -12,7 +12,20 @@
 ;;; `pvc` name a source, `mount` pairs one with a path; `(rule …)` is one
 ;;; RBAC rule. All builders live in `(hexol k8s)`; this file consumes them.
 
-(use-modules (hexol k8s))
+(use-modules (hexol k8s)
+             (hexol apply))   ; appliers for `hexol apply`
+
+;; ---- apply: push these manifests to a cluster ----
+;;
+;; `hexol apply` renders (kubernetes_resources) and `kubectl apply`s it against
+;; your current kubeconfig (~/.kube/config); `--dry-run` delegates to kubectl's
+;; own `--dry-run=server`. The `wait-for` #:pre gates on the API answering first.
+(appliers
+  ("kubernetes"
+   (kubectl-applier
+     #:pre (wait-for "kube-API reachable"
+                     (cmd "kubectl" "get" "--raw=/readyz")
+                     #:timeout 30))))
 
 (hx-ops
 
