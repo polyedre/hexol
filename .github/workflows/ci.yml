@@ -17,20 +17,40 @@ jobs:
       # the same environment in CI rather than re-deriving it from apt — among
       # other things, the (yaml) module comes from guile-libyaml, which isn't
       # packaged for Ubuntu.
-      - name: Install Guix
+      #
+      # We install Guix from the official binary tarball (the interactive
+      # guix-install.sh hangs in CI), start the daemon, authorize the official
+      # substitute key so dependencies download instead of building, then run
+      # the suite inside `guix shell -m manifest.scm`. It's one step so the
+      # backgrounded daemon stays alive for the build.
+      - name: Provision Guix and run the suite
         run: |
-          wget -qO /tmp/guix-install.sh \
-            https://git.savannah.gnu.org/cgit/guix.git/plain/etc/guix-install.sh
-          yes | sudo bash /tmp/guix-install.sh
-          # Make `guix` available to later steps.
-          echo "/var/guix/profiles/per-user/root/current-guix/bin" >> "$GITHUB_PATH"
+          set -eux
+          GUIX_VERSION=1.4.0
+          GUIX_PROFILE=/var/guix/profiles/per-user/root/current-guix
+          GUIX_BIN="$GUIX_PROFILE/bin"
 
-      - name: Show Guix version
-        run: guix --version
+          cd /tmp
+          wget -q "https://ftp.gnu.org/gnu/guix/guix-binary-${GUIX_VERSION}.x86_64-linux.tar.xz"
+          sudo tar --warning=no-timestamp -xf "guix-binary-${GUIX_VERSION}.x86_64-linux.tar.xz" -C /
 
-      # Single step so the substitutes are fetched once. `guix shell -m
-      # manifest.scm --` runs the command with exactly the manifest's packages
-      # on PATH and GUILE_LOAD_PATH; `make` then uses the Guix `guile`.
-      - name: Build, test, and smoke-test examples
-        run: |
-          guix shell -m manifest.scm -- make build test test-examples
+          # Build users + daemon, per the Guix manual's binary-install steps.
+          sudo groupadd --system guixbuild || true
+          for i in $(seq -w 1 10); do
+            sudo useradd -g guixbuild -G guixbuild -d /var/empty \
+              -s "$(command -v nologin)" -c "Guix build user $i" --system "guixbuilder$i" || true
+          done
+          sudo mkdir -p /root/.config/guix
+          sudo ln -sf "$GUIX_PROFILE" /root/.config/guix/current
+
+          sudo "$GUIX_BIN/guix-daemon" --build-users-group=guixbuild &
+          sleep 5
+
+          # Download prebuilt binaries instead of compiling from source.
+          sudo "$GUIX_BIN/guix" archive --authorize \
+            < "$GUIX_PROFILE/share/guix/ci.guix.gnu.org.pub"
+
+          "$GUIX_BIN/guix" --version
+          # Run as root (daemon owner) to avoid socket-permission friction.
+          cd "$GITHUB_WORKSPACE"
+          sudo "$GUIX_BIN/guix" shell -m manifest.scm -- make build test test-examples
