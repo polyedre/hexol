@@ -125,9 +125,9 @@ extensions, there to show the kernel doesn't care what it's building. Take them
 as proof the engine is general, not as products.
 
 **Is it production-ready?**
-It's young: one author, no CI yet, no outside production users. It has a test
-suite (`make test`) and it does run a live homelab. Kick the tires before you
-bet a cluster on it.
+It's young: one author, no outside production users. It has a test suite
+(`make test`, run on every push and PR via GitHub Actions) and it does run a
+live homelab. Kick the tires before you bet a cluster on it.
 
 ## Documentation
 

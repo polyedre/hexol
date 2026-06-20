@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Ubuntu ships the Guile 3 binary as `guile-3.0`; the Makefile takes
+      # GUILE ?= guile, so we point it at that. (manifest.scm lists guile + jq.)
+      GUILE: guile-3.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Guile 3 and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends guile-3.0 jq
+          ${GUILE} --version | head -1
+
+      - name: Build (compile every module — surfaces load/compile errors)
+        run: make build
+
+      - name: Test (kernel, surface, construct, k8s, cmdb)
+        run: make test
+
+      - name: Test examples (render each standalone example, check it exits 0)
+        run: make test-examples

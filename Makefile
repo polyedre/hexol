@@ -1,11 +1,12 @@
-.PHONY: help test build clean
+.PHONY: help test test-examples build clean
 
 GUILE ?= guile
 
 help:
 	@echo "targets:"
-	@echo "  make test    run the smoke tests (kernel, surface, res, cmdb)"
-	@echo "  make build   compile all modules (surfaces any load/compile error)"
+	@echo "  make test          run the smoke tests (kernel, surface, res, cmdb)"
+	@echo "  make test-examples render the standalone examples, check they exit 0"
+	@echo "  make build         compile all modules (surfaces any load/compile error)"
 	@echo "  make clean   remove this project's Guile compile cache"
 	@echo
 	@echo "everything else is the CLI — ./bin/hexol --help:"
@@ -20,6 +21,9 @@ test:
 	$(GUILE) -L . test/k8s-res.scm
 	$(GUILE) -L . test/cmdb-store.scm
 	$(GUILE) -L . test/cmdb-server.scm
+
+test-examples:
+	GUILE=$(GUILE) ./test/examples.sh
 
 build:
 	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (cmdb json)) (display "build ok\n"))'
