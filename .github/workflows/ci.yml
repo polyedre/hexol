@@ -8,24 +8,29 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      # Ubuntu ships the Guile 3 binary as `guile-3.0`; the Makefile takes
-      # GUILE ?= guile, so we point it at that. (manifest.scm lists guile + jq.)
-      GUILE: guile-3.0
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Guile 3, guile-json and jq
+      # hexol is a Guix project: manifest.scm is the source of truth for
+      # dependencies (guile + guile-json + guile-libyaml + jq). We provision
+      # the same environment in CI rather than re-deriving it from apt — among
+      # other things, the (yaml) module comes from guile-libyaml, which isn't
+      # packaged for Ubuntu.
+      - name: Install Guix
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends guile-3.0 guile-json jq
-          ${GUILE} --version | head -1
+          wget -qO /tmp/guix-install.sh \
+            https://git.savannah.gnu.org/cgit/guix.git/plain/etc/guix-install.sh
+          yes | sudo bash /tmp/guix-install.sh
+          # Make `guix` available to later steps.
+          echo "/var/guix/profiles/per-user/root/current-guix/bin" >> "$GITHUB_PATH"
 
-      - name: Build (compile every module — surfaces load/compile errors)
-        run: make build
+      - name: Show Guix version
+        run: guix --version
 
-      - name: Test (kernel, surface, construct, k8s, cmdb)
-        run: make test
-
-      - name: Test examples (render each standalone example, check it exits 0)
-        run: make test-examples
+      # Single step so the substitutes are fetched once. `guix shell -m
+      # manifest.scm --` runs the command with exactly the manifest's packages
+      # on PATH and GUILE_LOAD_PATH; `make` then uses the Guix `guile`.
+      - name: Build, test, and smoke-test examples
+        run: |
+          guix shell -m manifest.scm -- make build test test-examples
