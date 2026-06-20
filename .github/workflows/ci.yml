@@ -51,6 +51,13 @@ jobs:
             < "$GUIX_PROFILE/share/guix/ci.guix.gnu.org.pub"
 
           "$GUIX_BIN/guix" --version
+
+          # examples/terraform.scm reads an SSH public key from ~/.ssh at render
+          # time. The suite runs as root below, so give root a throwaway key —
+          # it's read as data for the rendered config, never used to connect.
+          sudo mkdir -p /root/.ssh
+          sudo ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 -q
+
           # Run as root (daemon owner) to avoid socket-permission friction.
           cd "$GITHUB_WORKSPACE"
           sudo "$GUIX_BIN/guix" shell -m manifest.scm -- make build test test-examples
