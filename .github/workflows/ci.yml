@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Guile 3 and jq
+      - name: Install Guile 3, guile-json and jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends guile-3.0 jq
+          sudo apt-get install -y --no-install-recommends guile-3.0 guile-json jq
           ${GUILE} --version | head -1
 
       - name: Build (compile every module — surfaces load/compile errors)
