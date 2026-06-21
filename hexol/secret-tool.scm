@@ -19,9 +19,9 @@
 
 (define-module (hexol secret-tool)
   #:use-module (hexol secrets)
+  #:use-module (hexol kernel)            ; resolve + load-inventory-file (path keys)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
-  #:use-module (ice-9 match)
   #:use-module (ice-9 format)
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
@@ -38,7 +38,6 @@
 (define (clause-val clauses tag)
   (let ((c (assq tag clauses))) (and c (pair? (cdr c)) (cadr c))))
 (define (store-data clauses) (or (clause-tail clauses 'data) '()))
-(define (store-keys clauses) (map (lambda (kv) (car kv)) (store-data clauses)))
 
 ;; Raise in the (scm-error) shape bin/hexol's reporter formats cleanly:
 ;; ~a/~p holes in FMT filled with ARGS.
@@ -108,22 +107,86 @@
            (values (cdr form) (scan-to-open bv before) (ftell port) bv))
           (else (loop)))))))
 
-(define (require-store path)
-  (call-with-values (lambda () (find-store-form path))
-    (lambda (clauses start end bv)
-      (unless clauses
-        (fail "no (secrets-store …) form in ~a — run `hexol secret init` first" path))
-      (values clauses start end bv))))
+;; ---------- inline secrets: (hx-secret "ENC[…]") / (hx-secret 'id "ENC") ----
+;;
+;; Inline ciphertexts live at their point of use; the store form is the shared
+;; *envelope* (one age key, one MAC). Each secret is keyed by an explicit id or
+;; by its PATH in the resolved state (see (hexol secrets)). To manage these we
+;; need each secret's (keystr . ciphertext) — for decrypt + re-seal — and the
+;; *byte span* of each ciphertext literal — to splice a fresh one back.
+;;
+;; The keystrings come from resolving the inventory with decryption disabled
+;; and running the SAME path-walk (`marker-doc') the renderer uses, so seal and
+;; decrypt agree on the keys. The spans come from byte-searching the raw file
+;; for the quoted literal: sops `ENC[…]' strings are ASCII and globally unique
+;; (random iv/tag), so the search is exact and dodges the char-vs-byte hazard.
+
+;; Fold the inventory to the marker-bearing state (no sops), then gather the
+;; inline secrets as (keystr . ciphertext).
+(define (resolve-inline path)
+  (parameterize ((secret-resolution-disabled #t))
+    (marker-doc (resolve (load-inventory-file path) '()))))
+
+;; Byte search: all non-overlapping start offsets of PAT in BV.
+(define (bv-match-at? bv i pat)
+  (let ((m (bytevector-length pat)))
+    (let lp ((j 0))
+      (cond ((= j m) #t)
+            ((= (bytevector-u8-ref bv (+ i j)) (bytevector-u8-ref pat j)) (lp (+ j 1)))
+            (else #f)))))
+
+(define (bv-find-all bv pat)
+  (let ((n (bytevector-length bv)) (m (bytevector-length pat)))
+    (let loop ((i 0) (acc '()))
+      (cond ((> (+ i m) n) (reverse acc))
+            ((bv-match-at? bv i pat) (loop (+ i m) (cons i acc)))
+            (else (loop (+ i 1) acc))))))
+
+;; ((idstr start end) …): the byte span of every inline ciphertext literal
+;; (quotes included), so a re-seal can splice fresh ciphertext over each.
+(define (inline-cipher-spans bv inline)
+  (append-map
+   (lambda (kv)
+     (let* ((pat   (string->utf8 (string-append "\"" (cdr kv) "\"")))
+            (m     (bytevector-length pat))
+            (starts (bv-find-all bv pat)))
+       (when (null? starts)
+         (fail "inline ciphertext for ~a is not a plain string literal — can't rewrite it"
+               (car kv)))
+       (map (lambda (s) (list (car kv) s (+ s m))) starts)))
+   inline))
 
 ;; ---------- decrypt / plaintext ----------
 
-;; Plaintext map ((kstr . value) …). Empty `data' means never sealed (e.g.
-;; just `init'd) — no sops call, just '().
-(define (load-plaintext clauses)
-  (if (null? (store-data clauses))
-      '()
-      (or (decrypt-yaml (clauses->sops-yaml clauses))
-          (fail "could not decrypt the store (is your key available?)"))))
+;; Return CLAUSES with their `data' clause replaced by DATA ((k . cipher) …).
+(define (set-data clauses data)
+  (append (filter (lambda (c) (not (eq? (car c) 'data))) clauses)
+          (list (cons 'data data))))
+
+;; Merge the store's `data' block with the inline (idstr . cipher) pairs into
+;; one (idstr . cipher) alist — the full sealed map. A key in both must carry
+;; identical ciphertext (they seal as one document).
+(define (merge-data clauses inline)
+  (let ((out (map (lambda (kv) (cons (symbol->string (car kv)) (cdr kv)))
+                  (store-data clauses))))
+    (for-each
+     (lambda (kv)
+       (let ((cur (assoc (car kv) out)))
+         (cond
+           ((not cur) (set! out (append out (list kv))))
+           ((not (string=? (cdr cur) (cdr kv)))
+            (fail "inline secret ~a conflicts with the store `data' block" (car kv))))))
+     inline)
+    out))
+
+;; Plaintext map ((kstr . value) …) from the merged block+inline ciphertexts.
+;; Empty means never sealed (e.g. just `init'd) — no sops call, just '().
+(define (load-plaintext clauses inline)
+  (let ((merged (merge-data clauses inline)))
+    (if (null? merged)
+        '()
+        (or (decrypt-yaml (clauses->sops-yaml (set-data clauses merged)))
+            (fail "could not decrypt the store (is your key available?)")))))
 
 ;; ---------- sealing (mutate → fresh sops doc → structured clauses) ----------
 
@@ -140,32 +203,57 @@
 
 (define (mk-seal-dir) (mkdtemp "/tmp/hexol-seal-XXXXXX"))
 
-;; Encrypt PLAIN ((kstr . val) …) into fresh structured store clauses via the
-;; creation rule in SOPS-CONFIG. An empty map seals to `((data))'.
-(define (seal-data plain sops-config)
+;; Encrypt PLAIN ((kstr . val) …) into fresh structured store clauses, passing
+;; EXTRA-ARGS verbatim to `sops -e' (either `--config <file>' to use a creation
+;; rule, or `--age …`/`--pgp …` to seal to explicit recipients). An empty map
+;; seals to `((data))'. Keys are sorted in the same order `clauses->sops-yaml'
+;; feeds sops at decrypt, so the MAC (over data values in tree order) verifies.
+(define (sops-encrypt plain extra-args)
   (if (null? plain)
       '((data))
       (let* ((sops (or (which-cmd "sops") (fail "sops not on PATH")))
              (dir  (mk-seal-dir))
              (file (string-append dir "/store.sops.yaml"))
-             ;; Sort in the same order `clauses->sops-yaml' feeds sops at
-             ;; decrypt: the MAC covers data values in tree order, so the two
-             ;; orders must agree or decrypt fails with a MAC mismatch.
              (sorted (sort plain (lambda (a b) (string<? (car a) (car b)))))
              (json (scm->json-string (list (cons "data" sorted)))))
         (call-with-output-file file (lambda (p) (display json p)))
-        (let* ((cmd (format #f "~a -e --config ~a --input-type json --output-type json ~a"
-                            sops sops-config file))
+        (let* ((cmd (format #f "~a -e ~a --input-type json --output-type json ~a"
+                            sops extra-args file))
                (in     (open-input-pipe cmd))
                (output (get-string-all in))
                (status (close-pipe in)))
           (delete-file file)
           (rmdir dir)
           (unless (zero? (status:exit-val status))
-            (fail "sops -e failed (check the .sops.yaml creation rule)"))
+            (fail "sops -e failed (~a)" extra-args))
           (json->clauses (json-string->scm output))))))
 
-(define (lines-of s) (if (string? s) (string-split s #\newline) '()))
+;; Seal via the .sops.yaml creation rule (used by `rekey' to rotate recipients,
+;; and as a fallback when the store has no recipients yet).
+(define (seal-data plain sops-config)
+  (sops-encrypt plain (string-append "--config " sops-config)))
+
+;; `sops -e' flags that seal to the recipients ALREADY in the store envelope —
+;; so set/edit preserve them instead of re-reading .sops.yaml. KEYS is the
+;; envelope's `keys' clause: (age (recipient "…") …) / (pgp (fp "…") …). "" if
+;; there are none (then the caller falls back to the creation rule).
+(define (recipient-flags keys)
+  (let ((ages (filter-map (lambda (e) (and (eq? (car e) 'age) (clause-val (cdr e) 'recipient))) keys))
+        (pgps (filter-map (lambda (e) (and (eq? (car e) 'pgp) (clause-val (cdr e) 'fp))) keys)))
+    (string-append
+     (if (pair? ages) (string-append " --age " (string-join ages ",")) "")
+     (if (pair? pgps) (string-append " --pgp " (string-join pgps ",")) ""))))
+
+;; Split a sops `enc' value into lines for the `(enc …)' clause. sops' value
+;; ends in a newline, so drop trailing empties — but keep interior blanks (PGP
+;; armor has a meaningful blank line after its header).
+(define (lines-of s)
+  (if (string? s)
+      (let loop ((ls (reverse (string-split s #\newline))))
+        (if (and (pair? ls) (string=? (car ls) ""))
+            (loop (cdr ls))
+            (reverse ls)))
+      '()))
 
 ;; sops emits the recipient id under varying field names; keep only the
 ;; load-bearing ones, dropping any the encrypt left empty.
@@ -248,11 +336,10 @@
              (if (null? (cdr ks))
                  (format p ")~%")        ; close keys
                  (begin (newline p) (loop (cdr ks)))))))
-       (format p "  (data")
-       (if (null? data)
-           (format p ")"))
+       ;; A `data' block only when there are block (non-inline) keys; an
+       ;; all-inline store stays pure envelope.
        (unless (null? data)
-         (newline p)
+         (format p "  (data~%")
          (let loop ((ds data))
            (let ((kv (car ds)))
              (format p "    (~a . ~s)" (sym->text (car kv)) (cdr kv))
@@ -263,42 +350,101 @@
 
 ;; ---------- splice ----------
 
-;; Replace bytes [START,END) with NEW-FORM (a string), leaving the rest of
-;; the file untouched.
-(define (splice-store! path start end new-form)
-  (let ((bv (slurp-bytes path)))
+;; Apply several non-overlapping replacements in one pass. REGIONS is a list of
+;; (START END BYTES); each [START,END) becomes BYTES, the rest is byte-identical.
+(define (splice-regions! path regions)
+  (let* ((bv     (slurp-bytes path))
+         (sorted (sort regions (lambda (a b) (< (car a) (car b))))))
+    ;; Guard against overlap — a bug here would corrupt the file.
+    (let chk ((rs sorted))
+      (when (and (pair? rs) (pair? (cdr rs)))
+        (when (> (cadr (car rs)) (car (cadr rs)))
+          (fail "internal: overlapping splice regions"))
+        (chk (cdr rs))))
     (call-with-output-file path
       (lambda (p)
-        (put-bytevector p (subbv bv 0 start))
-        (put-bytevector p (string->utf8 new-form))
-        (put-bytevector p (subbv bv end (bytevector-length bv))))
+        (let loop ((pos 0) (rs sorted))
+          (if (null? rs)
+              (put-bytevector p (subbv bv pos (bytevector-length bv)))
+              (let ((s (car (car rs))) (e (cadr (car rs))) (nw (caddr (car rs))))
+                (put-bytevector p (subbv bv pos s))
+                (put-bytevector p nw)
+                (loop e (cdr rs))))))
       #:binary #t)))
 
-;; Re-seal PLAIN and write the regenerated form over [START,END).
-(define (reseal! path start end plain)
-  (let* ((cfg     (find-sops-config path))
-         (clauses (seal-data plain cfg)))
-    (splice-store! path start end (emit-store-form clauses))
-    clauses))
+;; Re-seal PLAIN. Normally seal to the recipients ALREADY in the envelope
+;; (CLAUSES' `keys'), so set/edit preserve them; REKEY? (or a store with no
+;; recipients yet) falls back to the .sops.yaml creation rule — that's how
+;; `rekey' rotates.
+(define (reseal-clauses path clauses plain rekey?)
+  (let ((flags (recipient-flags (or (clause-tail clauses 'keys) '()))))
+    (if (or rekey? (string-null? flags))
+        (seal-data plain (find-sops-config path))
+        (sops-encrypt plain flags))))
+
+;; Re-seal PLAIN (the whole map) and write it back across the inline layout:
+;; the envelope form over [ENV-START,ENV-END) carrying only the keys that have
+;; no inline site, plus fresh ciphertext spliced over each inline ciphertext in
+;; INLINE-SPANS ((keystr start end) …). Re-sealing regenerates the data key, so
+;; *every* ciphertext changes — hence all spans are rewritten in one pass.
+(define (reseal-inline! path env-start env-end inline-spans clauses plain rekey?)
+  (let* ((sealed   (reseal-clauses path clauses plain rekey?))  ; full clauses, all data
+         (dmap     (map (lambda (kv) (cons (symbol->string (car kv)) (cdr kv)))
+                        (store-data sealed)))         ; (keystr . new-cipher)
+         (inline-ids (delete-duplicates (map car inline-spans) string=?))
+         (block    (filter (lambda (kv) (not (member (car kv) inline-ids))) dmap))
+         (env-form (emit-store-form
+                    (set-data sealed
+                              (map (lambda (kv) (cons (string->symbol (car kv)) (cdr kv)))
+                                   block))))
+         (regions  (cons (list env-start env-end (string->utf8 env-form))
+                         (map (lambda (sp)
+                                (let* ((id (car sp)) (s (cadr sp)) (e (caddr sp))
+                                       (nc (assoc-ref dmap id)))
+                                  (unless nc
+                                    (fail "cannot remove inline secret ~a — delete its (hx-secret …) form first" id))
+                                  (list s e (string->utf8 (string-append "\"" nc "\"")))))
+                              inline-spans))))
+    (splice-regions! path regions)
+    sealed))
 
 ;; ---------- the verbs ----------
+;;
+;; Each verb runs through `call-with-store', which locates the envelope form
+;; (CLAUSES + [START,END)), the inline (idstr . cipher) pairs, and each inline
+;; ciphertext's byte SPANS, then hands them to PROC. Mutating verbs re-seal the
+;; merged map with `reseal-inline!', which rewrites the envelope and every
+;; inline ciphertext in one pass.
+
+(define (call-with-store path proc)
+  (call-with-values (lambda () (find-store-form path))
+    (lambda (clauses start end bv)
+      (unless clauses
+        (fail "no (secrets-store …) form in ~a — run `hexol secret init` first" path))
+      (let* ((inline (resolve-inline path))          ; (keystr . cipher), via resolve
+             (spans  (inline-cipher-spans bv inline)))
+        (proc clauses start end inline spans)))))
+
+;; True if KSTR is one of the inline-declared secrets.
+(define (inline-key? kstr spans) (and (member kstr (map car spans)) #t))
 
 (define (secret-ls path)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
-      (let ((keys (store-keys clauses)))
+  (call-with-store path
+    (lambda (clauses start end inline spans)
+      (let ((keys (sort (map car (merge-data clauses inline)) string<?)))
         (for-each (lambda (k) (format #t "~a~%" k)) keys)
         (let ((kinds (map car (or (clause-tail clauses 'keys) '()))))
-          (format #t ";; ~a secret~p~@[ · sealed ~a~]~@[ · recipients: ~a~]~%"
+          (format #t ";; ~a secret~p~@[ · sealed ~a~]~@[ · recipients: ~a~]~@[ · ~a inline~]~%"
                   (length keys) (length keys)
                   (clause-val clauses 'lastmodified)
                   (and (pair? kinds)
-                       (string-join (map symbol->string kinds) ", "))))))))
+                       (string-join (map symbol->string kinds) ", "))
+                  (and (pair? inline) (length inline))))))))
 
 (define (secret-get path key)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
-      (let* ((plain (load-plaintext clauses))
+  (call-with-store path
+    (lambda (clauses start end inline spans)
+      (let* ((plain (load-plaintext clauses inline))
              (entry (assoc (symbol->string key) plain)))
         (unless entry (fail "no such key: ~a" key))
         (display (cdr entry))
@@ -306,32 +452,38 @@
 
 ;; VALUE is a string, or #f to read the value from stdin.
 (define (secret-set path key value)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
+  (call-with-store path
+    (lambda (clauses start end inline spans)
       (let* ((v     (or value (string-trim-right (get-string-all (current-input-port)) #\newline)))
-             (plain (load-plaintext clauses))
+             (plain (load-plaintext clauses inline))
              (kstr  (symbol->string key))
+             (new?  (not (assoc kstr plain)))
              (next  (assoc-set! (alist-copy plain) kstr v)))
-        (reseal! path start end next)
+        (reseal-inline! path start end spans clauses next #f)
+        (when new?
+          (format (current-error-port)
+                  ";; ~a is new — sealed into the store's data block (no inline site)~%" kstr))
         (format (current-error-port) "✓ sealed ~a secret~p → ~a~%"
                 (length next) (length next) path)))))
 
 (define (secret-rm path key)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
+  (call-with-store path
+    (lambda (clauses start end inline spans)
       (let* ((kstr  (symbol->string key))
-             (plain (load-plaintext clauses)))
+             (plain (load-plaintext clauses inline)))
         (unless (assoc kstr plain) (fail "no such key: ~a" key))
+        (when (inline-key? kstr spans)
+          (fail "~a is declared inline — delete its (hx-secret …) form, then `rekey`" kstr))
         (let ((next (alist-delete kstr (alist-copy plain))))
-          (reseal! path start end next)
+          (reseal-inline! path start end spans clauses next #f)
           (format (current-error-port) "✓ removed ~a — sealed ~a secret~p → ~a~%"
                   key (length next) (length next) path))))))
 
 (define (secret-edit path key)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
+  (call-with-store path
+    (lambda (clauses start end inline spans)
       (let* ((kstr  (symbol->string key))
-             (plain (load-plaintext clauses))
+             (plain (load-plaintext clauses inline))
              (cur   (let ((e (assoc kstr plain))) (if e (cdr e) "")))
              (editor (or (getenv "EDITOR") "vi"))
              (tmpl  (string-copy "/tmp/hexol-edit-XXXXXX"))
@@ -349,7 +501,7 @@
              (format (current-error-port) ";; ~a unchanged — nothing to seal~%" key))
             (else
              (let ((next (assoc-set! (alist-copy plain) kstr new)))
-               (reseal! path start end next)
+               (reseal-inline! path start end spans clauses next #f)
                (format (current-error-port) "✓ updated ~a — sealed ~a secret~p → ~a~%"
                        key (length next) (length next) path)))))))))
 
@@ -409,9 +561,9 @@
       pairs)))
 
 (define (secret-edit-all path)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
-      (let* ((plain  (load-plaintext clauses))
+  (call-with-store path
+    (lambda (clauses start end inline spans)
+      (let* ((plain  (load-plaintext clauses inline))
              (editor (or (getenv "EDITOR") "vi"))
              (tmpl   (string-copy "/tmp/hexol-edit-XXXXXX"))
              (tp     (mkstemp! tmpl)))
@@ -424,21 +576,26 @@
         (let ((new-text (call-with-input-file tmpl get-string-all)))
           (delete-file tmpl)                       ; plaintext off disk before parsing
           (let* ((next (parse-plain-sexp new-text))
+                 (dropped (filter (lambda (id) (not (assoc id next)))
+                                  (delete-duplicates (map car spans) string=?)))
                  (norm (lambda (m) (sort (map (lambda (kv) (cons (car kv) (cdr kv))) m)
                                          (lambda (a b) (string<? (car a) (car b)))))))
+            (when (pair? dropped)
+              (fail "edited store drops inline secret~p ~a — delete the matching (hx-secret …) form~p instead"
+                    (length dropped) (string-join dropped ", ") (length dropped)))
             (cond
               ((equal? (norm next) (norm plain))
                (format (current-error-port) ";; store unchanged — nothing to seal~%"))
               (else
-               (reseal! path start end next)
+               (reseal-inline! path start end spans clauses next #f)
                (format (current-error-port) "✓ sealed ~a secret~p → ~a~%"
                        (length next) (length next) path)))))))))
 
 (define (secret-rekey path)
-  (call-with-values (lambda () (require-store path))
-    (lambda (clauses start end text)
-      (let ((plain (load-plaintext clauses)))
-        (reseal! path start end plain)
+  (call-with-store path
+    (lambda (clauses start end inline spans)
+      (let ((plain (load-plaintext clauses inline)))
+        (reseal-inline! path start end spans clauses plain #t)
         (format (current-error-port) "✓ rekeyed ~a secret~p to ~a → ~a~%"
                 (length plain) (length plain) (find-sops-config path) path)))))
 
