@@ -27,6 +27,7 @@ failures=0
 cases=(
   "examples/inventory.scm        sexp"
   "examples/kubernetes.scm       yaml"
+  "examples/secrets.scm          yaml"
   "examples/terraform.scm        terraform"
   "examples/ansible.scm          ansible"
   "examples/database-schema.scm  sql"
