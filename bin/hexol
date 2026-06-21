@@ -1033,39 +1033,12 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
       (inventory-or-default cmd inv))))
 
 ;; The prose tail of `hexol --help`; the verb synopses above it are generated
-;; from *actions*, so the help can't drift from the registered set.
+;; from *actions*, so the help can't drift from the registered set. Kept terse
+;; on purpose — `--help` is mostly used to list verbs/inventory actions, so the
+;; footer is just the cross-cutting notes that don't fit a synopsis line.
 (define usage-footer "\
-sexp (default) and json render the whole resolved state. -o yaml targets the
-(kubernetes_resources) list (a `helm template` equivalent); -o tf targets the
-(terraform_config) subtree (Terraform JSON config, a `terraform init`-ready
-*.tf.json file); -o ansible targets the (ansible_plays) accumulator (an Ansible
-playbook, emitted as JSON). -o NAME runs a renderer the inventory registered via
-`renders-with` (e.g. -o sql / -o ledger emit that file's domain text). --path
-overrides the target.
-
-apply runs the effect adapters an inventory registers with `applies-with`
-(e.g. tofu apply, kubectl apply), in their registered order, against one
-resolved state. --list prints that order. --only SPEC runs a subset, keeping
-order: SPEC is comma-separated NAMEs or jj-style ranges over the pipeline —
-A::B, A:: (A to end), ::B (start to B), e.g. --only kubernetes:: to resume.
---dry-run delegates to each tool's native dry-run (pair it with --only).
-Appliers prompt via their own tool; there is no separate hexol confirmation.
-
-tree prints a stable content hash beside each op; `show HASH` resolves any
-unambiguous prefix of one to that op's kind, label, source, location(s),
-children, and the state delta it introduced during the resolve. tree -v adds a
-per-op fold-time column (the time the resolve spent in each op's effect,
-inclusive of its children), so you can see where folding the inventory is slow.
-
-The inventory is never a positional: pass it with -i/--inventory FILE, or set
-$HEXOL_INVENTORY once for the session. So a verb's positional is purely its
-domain token, and an exploration loop is just `show HASH` / `explain PATH` —
-the iterated token is the only positional (up-arrow, edit it, re-run).
-
---color[=always|never|auto] (any position) forces the human views' coloring:
-auto (default) paints only on a TTY and honors NO_COLOR; always forces it on
-(for `… | less -R` or a colored log); never forces it off. Bare --color =
-always. The data renders (sexp/json/yaml/terraform/ansible) are never painted.")
+Inventory: -i/--inventory FILE, or set $HEXOL_INVENTORY (never a positional).
+Global: --color[=always|never|auto] forces the human views' coloring.")
 
 ;; Adapt a kernel <action> — an inventory-contributed (state args -> effects)
 ;; verb — into a dispatch <verb>, so built-ins and inventory verbs share one
