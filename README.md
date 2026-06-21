@@ -112,7 +112,10 @@ While the kernel is target-agnostic, the library provide a few syntaxic sugar he
 - **Secrets (SOPS)** — secrets live inline in the inventory, encrypted at rest
   with [sops](https://github.com/getsops/sops): no separate `*.sops.yaml` files
   to keep in sync. `(secret-ref 'key)` is a cheap marker, so only `render`
-  shells out to sops; manage the store with the `hexol secret` subcommands. See
+  shells out to sops; manage the store with the `hexol secret` subcommands.
+  [`examples/secrets.scm`](examples/secrets.scm) is self-contained — it ships a
+  throwaway age key, so `hexol render -o yaml -i examples/secrets.scm` decrypts
+  and substitutes real plaintext on a fresh clone. See also
   [`examples/homelab.scm`](examples/homelab.scm) and
   [`docs/authoring.md`](docs/authoring.md#secrets-inline-sops-backed).
 

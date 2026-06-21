@@ -180,6 +180,19 @@
   (unless (file-exists? inv) (die "no such inventory file: ~a" inv))
   (load-inventory-file inv))
 
+;; `hexol secret` rewrites the inventory *file* (byte-accurate splice), so —
+;; unlike `render` — it never evaluates it. But evaluating is exactly what runs
+;; the inventory's own key provisioning, e.g.
+;;   (setenv "SOPS_AGE_KEY" (fetch-age-key))
+;; so without it sops can't find the age/PGP identity to decrypt. Load the
+;; inventory first, purely for those side effects, so the same hook that serves
+;; `render` serves `secret` too — no separate key protocol. Best-effort: a file
+;; that doesn't load cleanly (no ops yet, mid-edit) just falls back to whatever
+;; key you've put in the real environment.
+(define (prime-inventory-env inv)
+  (when (and inv (file-exists? inv))
+    (catch #t (lambda () (load-inventory-file inv)) (lambda _ #f))))
+
 ;; Like `load-ops`, but also collect what the file registered onto COLLECTOR —
 ;; a kernel registration collector (current-renderers / -appliers / -actions).
 ;; Returns (values ops entries) in registration order. tree/explain/show don't
@@ -865,12 +878,19 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
        (lambda (inv vrest)
          (let* ((pos (filter (lambda (a) (not (string-prefix? "-" a))) vrest))
                 (sym string->symbol)
-                ;; Inventory or secret-error (not generic usage-error, so the
-                ;; secret usage block is shown).
+                (cached #f)
+                ;; Resolve the inventory (or secret-error, so the secret usage
+                ;; block is shown), then prime its env once — running the
+                ;; inventory's own key hook before secret-tool shells out to
+                ;; sops. Memoized so it loads at most once per command.
                 (inv* (lambda ()
-                        (or inv (env-inventory)
-                            (secret-error "secret ~a: no inventory — pass -i FILE or set $HEXOL_INVENTORY"
-                                          verb)))))
+                        (or cached
+                            (let ((p (or inv (env-inventory)
+                                         (secret-error "secret ~a: no inventory — pass -i FILE or set $HEXOL_INVENTORY"
+                                                       verb))))
+                              (prime-inventory-env p)
+                              (set! cached p)
+                              p)))))
            (match (cons verb pos)
              (("ls")            (secret-ls (inv*)))
              (("get" key)       (secret-get (inv*) (sym key)))
