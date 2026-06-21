@@ -666,15 +666,19 @@
   ("destroy" "destroy [--dry-run]   tear the stack down (tofu destroy)"
    (terraform-destroyer #:workdir "deploy" #:binary "tofu"))
 
-  ;; Re-fetch cluster credentials from existing tofu state, no apply: writes
-  ;; deploy/kubeconfig + deploy/talosconfig. Install with:
-  ;;   hexol output -i examples/homelab.scm
-  ;;   cp deploy/kubeconfig  ~/.kube/config
-  ;;   cp deploy/talosconfig ~/.talos/config
-  ("output" "output               write kubeconfig + talosconfig from tofu state"
-   (terraform-outputter #:workdir "deploy" #:binary "tofu"
-                        #:outputs '(("kubeconfig"  . "deploy/kubeconfig")
-                                    ("talosconfig" . "deploy/talosconfig"))))
+  ;; Validate the rendered Terraform config without touching infra (init
+  ;; -backend=false, then validate) — a fast `terraform validate' pre-flight:
+  ;;   hexol validate -i examples/homelab.scm
+  ("validate" "validate             validate the rendered tofu config (no apply)"
+   (terraform-validator #:workdir "deploy" #:binary "tofu"))
+
+  ;; Read terraform outputs from existing state, no apply — like `terraform
+  ;; output'. Bare prints all; a NAME prints one raw, so you can install creds:
+  ;;   hexol output                  -i examples/homelab.scm   # all outputs
+  ;;   hexol output kubeconfig       -i examples/homelab.scm > ~/.kube/config
+  ;;   hexol output talosconfig      -i examples/homelab.scm > ~/.talos/config
+  ("output" "output [NAME]        print tofu outputs (all, or NAME with -raw)"
+   (terraform-output-reporter #:workdir "deploy" #:binary "tofu"))
 
   ;; Day-2 config rollout: push machine config to nodes one at a time, waiting
   ;; for cluster health between each (so a reboot never breaks etcd quorum). Edit

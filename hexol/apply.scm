@@ -57,7 +57,7 @@
   ;; (hexol kernel).
   #:re-export (state-get)
   #:export (terraform-applier kubectl-applier terraform-destroyer
-            terraform-outputter talos-config-applier
+            terraform-output-reporter terraform-validator talos-config-applier
             appliers actions wait-for check report cmd sh-ok?))
 
 ;; ---------- shell helpers ----------
@@ -190,6 +190,20 @@ never fails.  Runs even under DRY?."
 
 ;; ---------- terraform applier ----------
 
+;; Write the resolved (terraform_config) subtree to WORKDIR/CONFIG-FILE as
+;; Terraform JSON, creating WORKDIR if absent; return the path.  Shared by the
+;; applier (before init/plan/apply) and the validator (before validate), so both
+;; operate on exactly the config hexol renders.  Errors if state has no
+;; (terraform_config).
+(define (write-terraform-config state workdir config-file)
+  (let ((config (or (state-get state '(terraform_config))
+                    (error "apply[terraform]: no (terraform_config) in state")))
+        (path   (string-append workdir "/" config-file)))
+    (unless (file-exists? workdir) (mkdir workdir))
+    (call-with-output-file path
+      (lambda (p) (emit-terraform-json p config)))
+    path))
+
 (define* (terraform-applier #:key (workdir "deploy") (binary "tofu")
                             (config-file "infra.tf.json") (output->file '())
                             (pre '()) (post '()))
@@ -202,15 +216,10 @@ for stock Terraform.  #:pre / #:post run their checks (one or a list) before
 init and after the outputs are written; name the result in an `appliers' form."
   (lambda (state dry?)
     (run-checks (as-checks pre) state dry?)
-    (let ((tf     (find-binary binary))
-          (config (or (state-get state '(terraform_config))
-                      (error "apply[terraform]: no (terraform_config) in state")))
-          (chdir  (string-append "-chdir=" workdir)))
-      (unless (file-exists? workdir) (mkdir workdir))
-      (let ((path (string-append workdir "/" config-file)))
-        (call-with-output-file path
-          (lambda (p) (emit-terraform-json p config)))
-        (log ";; apply[terraform]: wrote ~a~%" path))
+    (let ((tf    (find-binary binary))
+          (chdir (string-append "-chdir=" workdir)))
+      (log ";; apply[terraform]: wrote ~a~%"
+           (write-terraform-config state workdir config-file))
       (run* tf chdir "init" "-input=false")
       (cond
         (dry? (run* tf chdir "plan"))
@@ -241,25 +250,46 @@ explicit `hexol' verb — never a step in a bare `hexol apply'."
           (begin (log ";; destroy: ~a ~a destroy~%" binary chdir)
                  (run* tf chdir "destroy"))))))
 
-;; ---------- terraform outputter (a CLI action, not a pipeline step) ----------
+;; ---------- terraform validator (a CLI action, not a pipeline step) ----------
 
-(define* (terraform-outputter #:key (workdir "deploy") (binary "tofu") (outputs '()))
+(define* (terraform-validator #:key (workdir "deploy") (binary "tofu")
+                              (config-file "infra.tf.json"))
   "Return an *action* (a (state args -> effects) CLI verb, not an applier) that
-fetches terraform outputs out of the state and writes them to files: for each
-(OUTPUT . FILE) pair in OUTPUTS, capture `BINARY -chdir=WORKDIR output -raw
-OUTPUT' and write it to FILE.  Same hand-off `terraform-applier's #:output->file
-does after an apply, but on demand — so a `hexol output' verb can re-fetch the
-kubeconfig / talosconfig from existing state without re-running apply.  Register
-it with `defines-action'/`actions' to make it its own `hexol' verb."
+validates the rendered config — `terraform validate' for hexol.  Writes
+WORKDIR/CONFIG-FILE from (terraform_config), runs `BINARY -chdir=WORKDIR init
+-backend=false' (provider schemas only — no backend, no creds) then `BINARY
+-chdir=WORKDIR validate'.  Checks exactly what `hexol apply' would push without
+touching infra or state.  Register with `defines-action'/`actions' to expose it
+as its own `hexol' verb (e.g. `hexol validate')."
   (lambda (state args)
     (let ((tf    (find-binary binary))
           (chdir (string-append "-chdir=" workdir)))
-      (for-each
-        (lambda (pair)
-          (let ((val (capture tf chdir "output" "-raw" (car pair))))
-            (write-file (cdr pair) val)
-            (log ";; output: ~a -> ~a~%" (car pair) (cdr pair))))
-        outputs))))
+      (log ";; validate: wrote ~a~%"
+           (write-terraform-config state workdir config-file))
+      (run* tf chdir "init" "-backend=false" "-input=false")
+      (run* tf chdir "validate"))))
+
+;; ---------- terraform output reporter (a CLI action, not a pipeline step) ----
+
+(define* (terraform-output-reporter #:key (workdir "deploy") (binary "tofu"))
+  "Return an *action* (a (state args -> effects) CLI verb, not an applier) that
+reads terraform outputs from existing state and prints them to stdout — `hexol
+output', mirroring `terraform output': bare prints every output, a single NAME
+positional prints just that one with `-raw' (so `hexol output kubeconfig >
+deploy/kubeconfig' lands the file).  Pass `--json' for machine-readable output.
+Read-only: no apply, no files written by hexol.  Register with
+`defines-action'/`actions' to make it its own `hexol' verb."
+  (lambda (state args)
+    (let* ((tf    (find-binary binary))
+           (chdir (string-append "-chdir=" workdir))
+           (json? (and (member "--json" args) #t))
+           ;; first non-flag positional is the output name (terraform output NAME)
+           (name  (find (lambda (a) (not (string-prefix? "-" a))) args)))
+      (cond
+        ((and name json?) (run* tf chdir "output" "-json" name))
+        (name             (run* tf chdir "output" "-raw" name))
+        (json?            (run* tf chdir "output" "-json"))
+        (else             (run* tf chdir "output"))))))
 
 ;; ---------- talos day-2 lifecycle (CLI actions, not pipeline steps) ----------
 ;;
