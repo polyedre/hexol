@@ -18,7 +18,6 @@
             op-content-hash op-short-hash fnv1a-64
             apply-op resolve compose-ops scope-ops for-each-into
             op:merge op:set op:append op:when op:case
-            op:copy op:move op:delete
             ;; state helpers
             state-get state-set state-append state-delete deep-merge
             path->string
@@ -329,33 +328,6 @@ SOURCE is the authored form recorded for debugging."
   (make-op 'append source
            (lambda (state) (state-append state path value))
            (string-append "append " (path->string path))))
-
-(define (op:copy src dst source)
-  "Return an op that copies the value at path SRC to path DST.  A missing
-SRC (resolving to #f) leaves the state unchanged.  SRC and DST are lists of
-symbol keys; SOURCE is the authored form."
-  (make-op 'copy source
-           (lambda (state)
-             (let ((v (state-get state src)))
-               (if v (state-set state dst v) state)))
-           (string-append "copy " (path->string src) " -> " (path->string dst))))
-
-(define (op:move src dst source)
-  "Return an op that moves the value at path SRC to path DST (set DST, then
-delete SRC).  A missing SRC leaves the state unchanged.  SRC and DST should
-be disjoint paths; SOURCE is the authored form."
-  (make-op 'move source
-           (lambda (state)
-             (let ((v (state-get state src)))
-               (if v (state-delete (state-set state dst v) src) state)))
-           (string-append "move " (path->string src) " -> " (path->string dst))))
-
-(define (op:delete path source)
-  "Return an op that removes the entry at PATH (a list of symbol keys) from
-the state, leaving a missing PATH unchanged.  SOURCE is the authored form."
-  (make-op 'delete source
-           (lambda (state) (state-delete state path))
-           (string-append "delete " (path->string path))))
 
 (define (op:when pred body source)
   "Return an op that folds BODY (a list of ops) into the state only when
