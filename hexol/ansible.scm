@@ -13,10 +13,10 @@
 ;;; NOT here: fanning a role over a group (one play per host) is an
 ;;; *example's* structure, built from kernel compose-ops/map — see
 ;;; examples/ansible.scm. *Rendering* is the CLI's job: `hexol render -o
-;;; ansible` JSON-encodes `(ansible_plays)` (a playbook is valid JSON). No
-;;; CMDB, no HTTP — state is a nested alist built once from inventory.yml.
+;;; ansible` JSON-encodes `(ansible_plays)` (a playbook is valid JSON).
+;;; State is a nested alist built once from inventory.yml.
 ;;;
-;;; State shape (mirrors what we'd put in the CMDB if we did):
+;;; State shape:
 ;;;
 ;;;   ((hosts  (<host-name> (vars (<key> . <val>) ...)) ...)
 ;;;    (groups (<group-name> (hosts <h1> <h2> ...)

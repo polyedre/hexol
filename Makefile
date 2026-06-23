@@ -4,7 +4,7 @@ GUILE ?= guile
 
 help:
 	@echo "targets:"
-	@echo "  make test          run the smoke tests (kernel, surface, res, cmdb)"
+	@echo "  make test          run the smoke tests (kernel, surface, res, k8s)"
 	@echo "  make test-examples render the standalone examples, check they exit 0"
 	@echo "  make build         compile all modules (surfaces any load/compile error)"
 	@echo "  make clean   remove this project's Guile compile cache"
@@ -19,8 +19,6 @@ test:
 	$(GUILE) -L . test.scm
 	$(GUILE) -L . test/construct.scm
 	$(GUILE) -L . test/k8s-res.scm
-	$(GUILE) -L . test/cmdb-store.scm
-	$(GUILE) -L . test/cmdb-server.scm
 
 test-examples:
 	GUILE=$(GUILE) ./test/examples.sh

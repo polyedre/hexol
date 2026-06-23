@@ -71,5 +71,4 @@ exists *at that point in the fold*. So order matters twice:
 - No reverse index ("all nodes with feature X") — predicates are arbitrary
   functions, decidable only by running them against a concrete query.
 
-See the [README](../README.md) for the shipping API and `docs/cmdb.md` for the
-event-sourced CMDB built on this same kernel.
+See the [README](../README.md) for the shipping API.
