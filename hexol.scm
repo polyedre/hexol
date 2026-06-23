@@ -12,7 +12,7 @@
                make-op op? op-kind op-source op-effect op-label op-children
                apply-op resolve compose-ops for-each-into
                op:merge op:set op:append op:when op:case
-               state-get state-set state-append deep-merge deep-merge-with
+               state-get state-set state-append deep-merge
                current-trace resolve-with-trace path-get load-inventory-file
                current-timings resolve-with-timings
                renders-with

@@ -38,28 +38,6 @@
        (deep-merge '((nginx (workers . 4) (user . "nginx")))
                    '((nginx (workers . 8)))))
 
-(format #t "~%kernel: deep-merge-with (per-path strategies)~%")
-(check "dmw: default = same as deep-merge"
-       (deep-merge '((a (b . 1) (c . 2))) '((a (b . 9))))
-       (deep-merge-with '((a (b . 1) (c . 2))) '((a (b . 9))) '()))
-(check "dmw: replace at path drops siblings"
-       '((a . ((b . 9))))
-       (deep-merge-with '((a (b . 1) (c . 2)))
-                        '((a (b . 9)))
-                        '(((a) . replace))))
-(check "dmw: append concatenates at path"
-       '((xs . (1 2 3 4)))
-       (deep-merge-with '((xs 1 2)) '((xs 3 4))
-                        '(((xs) . append))))
-(check "dmw: replace-by-key swaps matching record"
-       '((items . (((id . 1) (v . "a"))
-                   ((id . 2) (v . "new"))
-                   ((id . 3) (v . "c")))))
-       (deep-merge-with
-         '((items ((id . 1) (v . "a")) ((id . 2) (v . "b")) ((id . 3) (v . "c"))))
-         '((items ((id . 2) (v . "new"))))
-         '(((items) . (replace-by-key id)))))
-
 (format #t "~%kernel: ops + resolve (raw constructors)~%")
 
 (define baseline  (op:merge '((nginx (workers . 4))) 'baseline))

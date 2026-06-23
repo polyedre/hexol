@@ -20,7 +20,7 @@
             op:merge op:set op:append op:when op:case
             op:copy op:move op:delete
             ;; state helpers
-            state-get state-set state-append state-delete deep-merge deep-merge-with
+            state-get state-set state-append state-delete deep-merge
             path->string
             ;; tracing (explain support)
             current-trace resolve-with-trace path-get
@@ -290,66 +290,18 @@ unchanged.  Deleting the empty path is a no-op (the root has no key)."
 (define (deep-merge target incoming)
   "Recursively merge INCOMING into TARGET.  Scalars and non-alist lists in
 INCOMING win outright; two alists are merged key-by-key, recursing on
-shared keys.  This is `deep-merge-with' with no per-path strategy
-overrides, so the two share one algorithm."
-  (deep-merge-walk target incoming '() '()))
-
-;; ---------- deep-merge-with: per-path strategy overrides ----------
-;;
-;; deep-merge plus an alist of (path . strategy) overrides, matched against the
-;; current path at each step; matched -> strategy decides, else default merge.
-;;
-;; Strategies:
-;;   replace            — incoming wins outright (skip recursion)
-;;   append             — list-concat target and incoming
-;;   (replace-by-key K) — lists of alists; for each incoming entry, replace the
-;;                        target entry whose K field matches, else append.
-;;
-;; Unmatched paths behave like deep-merge, so this is a strict superset.
-
-(define (deep-merge-with target incoming strategies)
-  "Like `deep-merge', but STRATEGIES is an alist of (path . strategy)
-overrides consulted at each step.  A strategy may be `replace' (incoming
-wins), `append' (list-concat), or (replace-by-key K) (replace list-of-alist
-entries matching field K).  Unmatched paths behave exactly like
-`deep-merge', making this a strict superset."
-  (deep-merge-walk target incoming strategies '()))
-
-(define (deep-merge-walk target incoming strategies path)
-  (let ((strat (assoc-ref strategies path)))
-    (cond
-      ((eq? strat 'replace) incoming)
-      ((eq? strat 'append)
-       (append (if (list? target) target '())
-               (if (list? incoming) incoming (list incoming))))
-      ((and (pair? strat) (eq? (car strat) 'replace-by-key))
-       (merge-by-key target incoming (cadr strat)))
-      ;; default: deep-merge, recursing with the strategy table.
-      ((not (alist? incoming)) incoming)
-      ((not (alist? target))   incoming)
-      (else
-       (fold (lambda (entry acc)
-               (let* ((k (car entry))
-                      (v (cdr entry))
-                      (existing (state-get acc (list k))))
-                 (state-set acc (list k)
-                            (deep-merge-walk existing v strategies
-                                             (append path (list k))))))
-             target
-             incoming)))))
-
-(define (merge-by-key target incoming key)
-  ;; lists of alists; each incoming entry replaces the target entry with a
-  ;; matching `key` value, or is appended.
-  (fold (lambda (new acc)
-          (let ((k-val (assq-ref new key)))
-            (if (any (lambda (rec) (equal? (assq-ref rec key) k-val)) acc)
-                (map (lambda (rec)
-                       (if (equal? (assq-ref rec key) k-val) new rec))
-                     acc)
-                (append acc (list new)))))
-        (if (list? target) target '())
-        (if (list? incoming) incoming '())))
+shared keys."
+  (cond
+    ((not (alist? incoming)) incoming)
+    ((not (alist? target))   incoming)
+    (else
+     (fold (lambda (entry acc)
+             (let* ((k (car entry))
+                    (v (cdr entry))
+                    (existing (state-get acc (list k))))
+               (state-set acc (list k) (deep-merge existing v))))
+           target
+           incoming))))
 
 ;; ---------- op constructors ----------
 
