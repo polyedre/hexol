@@ -639,19 +639,14 @@
        (exit 2))
       (else matches))))
 
-;; Is X a map-shaped alist (every entry a (symbol . _) pair)? Decides whether
-;; to recurse into a state node or treat it as a changed leaf.
-(define (map-alist? x)
-  (and (pair? x) (list? x)
-       (every (lambda (e) (and (pair? e) (symbol? (car e)))) x)))
-
 ;; Leaf-level diff of two state nodes: (path before after) for every path whose
-;; value differs. Recurses through map-shaped alists; anything else (scalars,
-;; vectors, plain lists) is compared whole.
+;; value differs. Recurses through map-shaped alists (via yaml's `object-shape?',
+;; sound because resolved state never carries duplicate keys); anything else
+;; (scalars, vectors, plain lists) is compared whole.
 (define (state-diff a b path)
   (cond
     ((equal? a b) '())
-    ((and (map-alist? a) (map-alist? b))
+    ((and (object-shape? a) (object-shape? b))
      (let ((keys (delete-duplicates (append (map car a) (map car b)) eq?)))
        (append-map (lambda (k)
                      (state-diff (assq-ref a k) (assq-ref b k)
