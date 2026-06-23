@@ -26,7 +26,7 @@ test-examples:
 	GUILE=$(GUILE) ./test/examples.sh
 
 build:
-	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (cmdb json)) (display "build ok\n"))'
+	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (hexol json)) (display "build ok\n"))'
 
 clean:
 	rm -rf ~/.cache/guile/ccache/*$(CURDIR)*

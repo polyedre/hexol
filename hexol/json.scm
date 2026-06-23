@@ -1,4 +1,4 @@
-;;; cmdb/json.scm — JSON adapter for CMDB state shapes.
+;;; hexol/json.scm — JSON adapter for hexol state shapes.
 ;;;
 ;;; Delegates to guile-json: it renders lists as JSON objects (alists)
 ;;; and vectors as arrays. Our state holds arrays as plain lists (e.g.
@@ -7,20 +7,11 @@
 ;;;
 ;;; `()` renders as `{}` (empty alist); for an empty array pass `#()`.
 
-(define-module (cmdb json)
+(define-module (hexol json)
   #:use-module (json)
+  #:use-module ((hexol yaml) #:select (object-shape?))
   #:use-module (srfi srfi-1)
   #:export (sexp->json-string state->json-ready))
-
-(define (object-shape? obj)
-  ;; Non-empty list of (symbol . X) with distinct keys. Unique-keys check
-  ;; disambiguates from arrays of symbol-headed elements (e.g. a fact list
-  ;; `((merge ...) (merge ...))` is an array, not an object).
-  (and (pair? obj)
-       (list? obj)
-       (every (lambda (e) (and (pair? e) (symbol? (car e)))) obj)
-       (let ((keys (map car obj)))
-         (= (length keys) (length (delete-duplicates keys eq?))))))
 
 (define (state->json-ready obj)
   (cond
