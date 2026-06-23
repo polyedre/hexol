@@ -682,84 +682,11 @@
 
 ;; ---------------------------------------------------------------------------
 ;; source blob — `show` prints the op's raw source s-expression. pretty-print
-;; lays it out; this adds light syntax tinting and a 2-space indent so the blob
-;; sits under the `;; source:` header and scans like the other views.
+;; lays it out; we add a 2-space indent so the blob sits under the `;; source:`
+;; header.
 ;; ---------------------------------------------------------------------------
 
-;; Where a bare token ends: next whitespace, paren/bracket, string quote, or
-;; comment. Lifts one atom out of the pretty-printed text at a time.
-(define (token-end s i n)
-  (let loop ((j i))
-    (if (>= j n)
-        j
-        (let ((c (string-ref s j)))
-          (if (or (char-whitespace? c)
-                  (memv c '(#\( #\) #\[ #\] #\" #\;)))
-              j
-              (loop (+ j 1)))))))
-
-;; Tint one atom. A symbol heading a list (operator slot) reads as a keyword;
-;; numbers, #-literals, and :keywords each get their own hue; everything else
-;; stays default.
-(define (tint-atom tok head?)
-  (cond
-    (head?                          (o-cyan tok))
-    ((string->number tok)           (o-yellow tok))
-    ((string-prefix? "#" tok)       (o-magenta tok))
-    ((string-prefix? ":" tok)       (o-magenta tok))
-    (else                           tok)))
-
-;; Colorize pretty-printed Scheme. A flat char scan, string-aware so we never
-;; paint inside a "literal" (where parens/semicolons aren't syntax). The token
-;; right after an opening paren is the list head; the rest are arguments.
-(define (highlight-sexp s)
-  (if (not stdout-color?)
-      s
-      (let ((out (open-output-string))
-            (n   (string-length s)))
-        (let loop ((i 0) (head? #f))
-          (if (>= i n)
-              (get-output-string out)
-              (let ((c (string-ref s i)))
-                (cond
-                  ;; string literal — consume through the closing quote,
-                  ;; honoring backslash escapes
-                  ((char=? c #\")
-                   (let scan ((j (+ i 1)))
-                     (cond
-                       ((>= j n)
-                        (display (o-green (substring s i j)) out)
-                        (loop j #f))
-                       ((char=? (string-ref s j) #\\) (scan (+ j 2)))
-                       ((char=? (string-ref s j) #\")
-                        (display (o-green (substring s i (+ j 1))) out)
-                        (loop (+ j 1) #f))
-                       (else (scan (+ j 1))))))
-                  ;; comment to end of line
-                  ((char=? c #\;)
-                   (let ((eol (or (string-index s #\newline i) n)))
-                     (display (o-dim (substring s i eol)) out)
-                     (loop eol #f)))
-                  ;; opening bracket — next atom is the list head
-                  ((or (char=? c #\() (char=? c #\[))
-                   (write-char c out) (loop (+ i 1) #t))
-                  ((or (char=? c #\)) (char=? c #\]))
-                   (write-char c out) (loop (+ i 1) #f))
-                  ;; whitespace carries head? across (so `(\n  foo` still tints
-                  ;; foo as the head)
-                  ((char-whitespace? c)
-                   (write-char c out) (loop (+ i 1) head?))
-                  ;; reader prefixes ' ` , don't consume the head slot
-                  ((memv c '(#\' #\` #\,))
-                   (write-char c out) (loop (+ i 1) head?))
-                  ;; a bare atom
-                  (else
-                   (let* ((j   (token-end s i n))
-                          (tok (substring s i j)))
-                     (display (tint-atom tok head?) out)
-                     (loop j #f))))))))))
-
-;; Pretty-print DATUM, indent every line two spaces, then tint.
+;; Pretty-print DATUM, indent every line two spaces.
 (define (print-source-blob datum)
   (let* ((raw      (call-with-output-string
                      (lambda (p)
@@ -771,7 +698,7 @@
                      (string-join (string-split (string-trim-right raw #\newline)
                                                  #\newline)
                                   "\n  "))))
-    (display (highlight-sexp indented))
+    (display indented)
     (newline)))
 
 ;; Render one side of a state-delta entry as `;;` comment lines. A one-line
