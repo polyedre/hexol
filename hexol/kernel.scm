@@ -15,7 +15,7 @@
   #:export (;; ops
             make-op op? op-kind op-source op-effect op-label op-children op-loc
             current-author-loc stamp-loc relabel
-            op-content-hash op-short-hash
+            op-content-hash op-short-hash fnv1a-64
             apply-op resolve compose-ops scope-ops for-each-into
             op:merge op:set op:append op:when op:case
             op:copy op:move op:delete
