@@ -11,7 +11,7 @@
 ;;; The body is a pure function of the attributes: `hx-case` on geo/hardware/
 ;;; network selects config, `hx-when` gates the k8s load and sovereign cross-cuts,
 ;;; `$` computes derived ids. The three regions exercise the branches
-;;; (gpu/advanced/prod, sovereign/strict, standard/basic/dev). No CMDB needed.
+;;; (gpu/advanced/prod, sovereign/strict, standard/basic/dev).
 
 (use-modules (hexol))
 
