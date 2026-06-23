@@ -13,7 +13,7 @@
 
 (define-module (cmdb server)
   #:use-module (cmdb store)
-  #:use-module (cmdb json)
+  #:use-module (hexol json)
   #:use-module (web server)
   #:use-module (web request)
   #:use-module (web response)

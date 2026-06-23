@@ -51,7 +51,7 @@
              (hexol yaml)
              (hexol terraform)
              (hexol secret-tool)
-             (cmdb json)
+             (hexol json)
              (srfi srfi-1)
              (srfi srfi-9)
              (ice-9 match)
