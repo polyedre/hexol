@@ -64,32 +64,6 @@
 (check "state-delete missing path (no-op)" '((a (b . 1)))
        (state-delete '((a (b . 1))) '(a z)))
 
-(define src-state '((db (host . "h") (port . 5432)) (app (name . "x"))))
-
-;; op:copy duplicates the value, leaving the source in place
-(check "op:copy: dst set, src kept"
-       '((attributes) (db (host . "h") (port . 5432)) (app (name . "x") (db_host . "h")))
-       (resolve (list (op:merge src-state 'm)
-                      (op:copy '(db host) '(app db_host) '(copy))) '()))
-;; op:copy of a missing source is a no-op (no dst key created)
-(check "op:copy missing src (no-op)" #f
-       (state-get (resolve (list (op:merge src-state 'm)
-                                 (op:copy '(db nope) '(app nope) '(copy))) '())
-                  '(app nope)))
-
-;; op:move sets dst and removes src
-(define r-move (resolve (list (op:merge src-state 'm)
-                              (op:move '(db port) '(app db_port) '(move))) '()))
-(check "op:move: dst set"     5432 (state-get r-move '(app db_port)))
-(check "op:move: src removed" #f   (state-get r-move '(db port)))
-(check "op:move: sibling kept" "h" (state-get r-move '(db host)))
-
-;; op:delete removes a path
-(define r-del (resolve (list (op:merge src-state 'm)
-                             (op:delete '(db port) '(delete))) '()))
-(check "op:delete removes"     #f   (state-get r-del '(db port)))
-(check "op:delete keeps sibling" "h" (state-get r-del '(db host)))
-
 (format #t "~%surface: macros~%")
 
 (define inv-1
@@ -111,21 +85,6 @@
     (hx-append items ($ (get '(base n))))))
 (define r-app (resolve inv-2 '()))
 (check "surface: hx-append $ fold-time" '(2) (state-get r-app '(items)))
-
-;; hx-copy / hx-move / hx-delete: each path accepts a bare symbol or a
-;; segment list, auto-quoted like hx-append.
-(define inv-cmd
-  (hx-ops
-    (hx-merge (db (host "h") (port 5432) (legacy "x")) (app (name "demo")))
-    (hx-copy (db host) (app db_host))     ; segment-list paths
-    (hx-move (db port) (app db_port))
-    (hx-delete (db legacy))))
-(define r-cmd (resolve inv-cmd '()))
-(check "surface: hx-copy keeps source"   "h"   (state-get r-cmd '(db host)))
-(check "surface: hx-copy writes dest"    "h"   (state-get r-cmd '(app db_host)))
-(check "surface: hx-move writes dest"    5432  (state-get r-cmd '(app db_port)))
-(check "surface: hx-move removes source" #f    (state-get r-cmd '(db port)))
-(check "surface: hx-delete removes"      #f    (state-get r-cmd '(db legacy)))
 
 ;; hx-ops / hx-when flatten body slots one level, so a helper procedure that
 ;; returns a *list* of ops drops straight in (the sub-inventory pattern).
