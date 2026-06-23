@@ -23,30 +23,16 @@
 ;;; results.
 
 (define-module (hexol cache)
+  #:use-module (hexol kernel)            ; fnv1a-64 — the op addresser's hash
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 textual-ports)
-  #:use-module (rnrs bytevectors)
   #:export (current-render-cache open-render-cache render-cache?
             cached-json))
 
-;; ---------- key hashing (FNV-1a/64, mirrors (hexol kernel)'s addresser) ----------
-;; A cache key only needs to avoid accidental collisions, not resist attack —
-;; same rationale as the op content hash, kept dependency-free so this module
-;; stands alone.
-
-(define %fnv-offset 14695981039346656037)
-(define %fnv-prime  1099511628211)
-(define %u64-mask   (- (expt 2 64) 1))
-
-(define (fnv1a-64 str)
-  (let ((bytes (string->utf8 str)))
-    (let loop ((i 0) (h %fnv-offset))
-      (if (>= i (bytevector-length bytes))
-          h
-          (loop (+ i 1)
-                (logand %u64-mask
-                        (* %fnv-prime (logxor h (bytevector-u8-ref bytes i)))))))))
+;; ---------- key hashing ----------
+;; A cache key only needs to avoid accidental collisions, not resist attack, so
+;; it shares the kernel's FNV-1a/64 op addresser (no crypto/deps).
 
 (define (hex16 str)
   (let ((s (number->string (fnv1a-64 str) 16)))
