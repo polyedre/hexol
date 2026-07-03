@@ -13,20 +13,14 @@
 ;;; `$` computes derived ids. The three regions exercise the branches
 ;;; (gpu/advanced/prod, sovereign/strict, standard/basic/dev).
 
-(use-modules (hexol))
+(use-modules (hexol) (examples regions))
 
 ;; ---------- the region table (data) ----------
 ;;
 ;; Dispatch axes as data: dc, geo, hw-profile, network-profile, tier,
-;; sovereignty. Each cdr is the attribute seed for the body.
-
-(define regions
-  '((alpha5 (region . alpha5) (dc . alpha) (geo . eu) (hw-profile . gpu-dense)
-     (network-profile . advanced)  (tier . prod) (sovereignty . none))
-    (bravo1 (region . bravo1) (dc . bravo) (geo . eu) (hw-profile . standard)
-          (network-profile . sovereign) (tier . prod) (sovereignty . strict))
-    (charlie6 (region . charlie6) (dc . charlie) (geo . na) (hw-profile . standard)
-          (network-profile . basic)     (tier . dev)  (sovereignty . none))))
+;; sovereignty. Each cdr is the attribute seed for the body. The table itself
+;; lives in examples/regions.scm as an importable module, so other consumers
+;; can share it — this file just folds a body over it.
 
 (hx-each regions #:into regions
    ;; Per-region defaults.

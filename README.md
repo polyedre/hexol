@@ -11,6 +11,36 @@ Hexol is both:
   top, and
 - a **CLI** — to act on an inventory: `render` it, `apply` it, `inspect` what it produced.
 
+## The shape: an engine, plus a thin layer you write
+
+Hexol ships an **engine**, not a catalog of targets. Four layers, each thinner than it sounds:
+
+```
+kernel / engine          the fold-of-ops core — domain-agnostic
+  ↓
+generic renderers        -o sexp / json / yaml — work on any resolved state
+  ↓
+YOUR thin domain layer   a renderer (renders-with) + a few constructs (define-construct)
+  ↓
+your inventory content   the actual resources / config you describe
+```
+
+The shipped Kubernetes, Terraform, and Ansible libraries *are* that thin layer — already written, for those
+domains. For a domain hexol doesn't ship — OpenStack oslo.config, a house INI format, an in-house CRD — **writing
+the thin layer is the intended first step, not a workaround.** It's a renderer registered with `renders-with`
+([`hexol/kernel.scm:484`](hexol/kernel.scm#L484)) plus a few `define-construct` constructs — typically a few dozen
+lines. In return the engine hands you ordering, introspection (`tree`/`explain`), and multi-target rendering for free.
+
+Three minimal, in-tree worked examples of exactly this bootstrap:
+- [`hexol/sql.scm`](hexol/sql.scm) — SQL-DDL vocabulary + a `-o sql` renderer (library form).
+- [`hexol/ledger.scm`](hexol/ledger.scm) — a ledger-cli journal + `-o ledger` (library form).
+- [`examples/oslo-config.scm`](examples/oslo-config.scm) — the whole bootstrap in one file: an oslo.config INI
+  renderer plus a `config-section` / `keystone-authtoken` service vocabulary, ~40 lines.
+
+So "hexol has no oslo.config renderer and no OpenStack vocabulary" is true the way "a compiler ships no program" is
+true: you write the thin layer for your domain. [`docs/extending.md`](docs/extending.md) walks the bootstrap step by
+step.
+
 ## Example
 
 An inventory is a program that builds your config. Here's a Kubernetes one

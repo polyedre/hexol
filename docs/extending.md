@@ -5,6 +5,104 @@ extensibility model, the rule for what belongs in a library, two worked
 target libraries (Terraform and a Helm-chart conversion), and the
 introspection you get for free.
 
+## hexol is a substrate — you bring the target
+
+The engine is deliberately domain-agnostic: it folds ops over an alist and
+knows nothing about Kubernetes, Terraform, or your domain. The shipped
+libraries (`(hexol k8s)`, `(hexol terraform)`, `(hexol ansible)`) are not
+"hexol's features" — they are **thin layers written on top of the engine**,
+each the same shape you write for a domain hexol doesn't ship.
+
+So if hexol has no renderer and no vocabulary for *your* target — an
+OpenStack oslo.config file, a bespoke INI format, an in-house CRD —
+**bootstrapping that thin layer is the normal first step, not a gap you're
+working around.** The whole layer is two moving parts:
+
+1. **A renderer** — a `(state -> writes text)` procedure registered with
+   `renders-with` ([`hexol/kernel.scm:484`](../hexol/kernel.scm#L484)), exposed
+   as `hexol render -o <name>`. (You often don't even need this: the built-in
+   `-o sexp | json | yaml` render *any* resolved state generically.)
+2. **A few constructs** — domain nouns built with `define-construct` (see the
+   section below), each returning an op that appends to some accumulator in
+   state.
+
+That's it. In return the engine hands you ordering, `tree`/`explain`
+introspection, and multi-target rendering — for free, because your constructs
+bottom out in the same op record as everything else.
+
+Two in-tree libraries are minimal worked examples of exactly this pattern:
+[`hexol/sql.scm`](../hexol/sql.scm) (a SQL-DDL vocabulary + `-o sql`) and
+[`hexol/ledger.scm`](../hexol/ledger.scm) (a ledger-cli journal + `-o ledger`).
+Each is well under 300 lines and touches no kernel code.
+
+### Worked example: standing up an oslo.config target
+
+[`examples/oslo-config.scm`](../examples/oslo-config.scm) keeps the *entire*
+bootstrap in one file — renderer + constructs + a small inventory — so you can
+see the shape and the effort at a glance. It's the OpenStack case the layering
+above describes, made concrete: ~40 lines to teach hexol to emit
+oslo.config-style INI with a service vocabulary.
+
+The renderer walks an `(ini_sections)` accumulator and prints each section:
+
+```scheme
+(define (render-ini state)
+  (for-each
+   (lambda (section)                       ; section = (name . ((key . value) …))
+     (format #t "[~a]\n" (car section))
+     (for-each (lambda (kv) (format #t "~a = ~a\n" (car kv) (ini-value (cdr kv))))
+               (cdr section))
+     (newline))
+   (or (state-get state '(ini_sections)) '())))
+
+(renders-with "ini" render-ini)          ; now: hexol render -o ini
+```
+
+Then the domain nouns. `config-section` is the generic one — `#:open? #t`
+lets any `(key value)` through, because an INI section has no fixed key set:
+
+```scheme
+(define-construct config-section
+  #:head name
+  #:open? #t
+  #:build (op:append '(ini_sections) (cons name extra) (list 'config-section name)))
+```
+
+`keystone-authtoken` is the *vocabulary* half — the `[keystone_authtoken]`
+block every OpenStack service carries, with the boilerplate defaulted so a
+caller only states what differs (this is the "service vocabulary" a thin layer
+adds; `config-section` alone would make you respell it in every service):
+
+```scheme
+(define-construct keystone-authtoken
+  #:head ()
+  #:fields ((auth-url #:required) (password #:required)
+            (username #:default "nova") (project-name #:default "service"))
+  #:build (op:append '(ini_sections)
+            `(keystone_authtoken (auth_url . ,auth-url) (auth_type . password)
+                                 (username . ,username) (password . ,password)
+                                 (project_name . ,project-name))
+            (list 'keystone-authtoken)))
+```
+
+An inventory then reads like real config, and every CLI view works unchanged:
+
+```scheme
+(hx-ops
+  (config-section 'DEFAULT (transport_url "rabbit://…") (debug #f))
+  (keystone-authtoken (auth-url "https://controller:5000/v3")
+                      (password "nova-service-password")))
+```
+```
+./bin/hexol render -o ini -i examples/oslo-config.scm   # the INI file
+./bin/hexol tree          -i examples/oslo-config.scm   # the op tree
+```
+
+That is the whole substrate story: the engine is general; the ~40 lines above
+are the layer *you* own. The rest of this document is the mechanics —
+`define-construct` in depth, the library/example boundary, and two larger
+worked targets.
+
 ## The contract
 
 The kernel exposes a small set of op constructors — `op:merge`, `op:set`,

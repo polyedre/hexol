@@ -290,7 +290,8 @@ hexol/
 bin/hexol           # the CLI: render / tree / ops / explain / secret
 examples/                          # one self-contained file each
   inventory.scm    # region table + per-region body + hx-each (the engine itself)
-  regions.scm      # the region table as an importable module (CMDB sync source)
+  regions.scm      # the region table as an importable module (shared by inventory.scm)
+  oslo-config.scm  # bootstrap sketch: a from-scratch INI/oslo.config target in one file
   kubernetes.scm   # consumer of (hexol k8s): namespaced apps + compliance demo
   helm-kube-prometheus-stack.scm  # the Helm chart converted to (hexol k8s) ops
   terraform.scm    # consumer of (hexol terraform): AWS + OpenStack, one combined config
@@ -303,17 +304,4 @@ docs/
   model.md          # the fold-of-ops engine model
   authoring.md      # this guide
   extending.md      # building target libraries + worked examples
-  cmdb.md           # the event-sourced CMDB (as built)
-cmdb/               # the event-sourced CMDB built on the same kernel (see docs/cmdb.md)
-  store.scm         # fact log, library lookup, refold
-  server.scm        # HTTP front-end
-  json.scm          # sexp -> JSON
-  region-render.scm # resolve the per-region body against a fact's attrs
-  region-body.scm   # the per-region hexol inventory
-  apps.scm          # Helm releases per region
-  libraries/        # versioned op vocabularies (v1, v2 — the library-bump demo)
-bin/cmdb-server     # boot the CMDB HTTP server
-bin/sync-inventory  # push a region table as facts
-bin/promote         # waved image/chart rollouts
-test/cmdb-store.scm  test/cmdb-server.scm  # CMDB tests
 ```
