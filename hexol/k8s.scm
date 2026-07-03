@@ -19,6 +19,20 @@
 ;;;   (http-route "app" (parent-name "edge") (backend-service "…") …) -> HTTPRoute
 ;;;   (custom-resource (api "…") (kind "…") (name "…") (spec …)) -> any CRD
 ;;;   (service-monitor "api" …)                      -> ServiceMonitor
+;;;   (hpa "api" (target "api") (max-replicas 10) (cpu 80)) -> HorizontalPodAutoscaler
+;;;   (pdb "api" (min-available 1))                  -> PodDisruptionBudget
+;;;
+;;; Workload sub-specs (values for a deployment/daemonset field):
+;;;   (probe 8080 (http "/healthz") (initial-delay 5)) ; httpGet; (tcp)/(exec …) too
+;;;   (strategy "RollingUpdate" (max-surge "25%") (max-unavailable 0))
+;;;   (port "metrics" 9797)      one of several container/service ports
+;;;   (host-rule "a.com" (service "api") (port 80) [(path "/x")])  one ingress rule
+;;; Deployment gains: liveness/readiness/startup probes, strategy, multiple
+;;; `ports`, `annotations` (pod template), `termination-grace-period`.
+;;;
+;;; Label scheme: selectors + the forced identity label key on `current-label-key`
+;;; (default `app`); `with-label-key` scopes an override (e.g.
+;;; app.kubernetes.io/name), #f drops the forced label.
 ;;;
 ;;; Volume / env source refs (do NOT clash with the secret/configmap
 ;;; constructors):
@@ -26,6 +40,7 @@
 ;;;   (sec "name")               secret source
 ;;;   (pvc "name")               PersistentVolumeClaim source
 ;;;   (host-path "/p")           hostPath source
+;;;   (empty-dir "scratch")      emptyDir scratch volume (name is arbitrary)
 ;;;   (mount <source> "/path" [#:read-only #t])   volume mount: source + path
 ;;;     (env-from (cm "api-config"))            ; whole-source env injection
 ;;;     (volumes  (mount (sec "tls") "/etc/tls")); mounted volume
@@ -57,6 +72,8 @@
                current-render-cache)
   #:export (;; namespace scope
             with-namespace current-k8s-namespace namespace
+            ;; label scheme
+            current-label-key with-label-key
             ;; compact resources spec
             res
             ;; resource sugar
@@ -64,8 +81,11 @@
             storage-class persistent-volume-claim
             gateway-class gateway listener http-route
             custom-resource service-monitor
+            hpa pdb
+            ;; workload sub-specs
+            probe strategy host-rule port
             ;; volume / env source refs
-            cm sec pvc mount host-path
+            cm sec pvc mount host-path empty-dir
             ;; RBAC
             service-account role role-binding rule
             cluster-role cluster-role-binding cluster-rbac
@@ -87,6 +107,27 @@
 ;; ---------------------------------------------------------------------------
 
 (define current-k8s-namespace (make-parameter "default"))
+
+;; ---------------------------------------------------------------------------
+;; label scheme
+;; ---------------------------------------------------------------------------
+;;
+;; Every workload/service keys its selector + default label on ONE key, `app`
+;; by default. Charts that select on `app.kubernetes.io/name` scope it with
+;; `with-label-key`; #f drops the forced label entirely (bring your own labels).
+
+(define current-label-key (make-parameter 'app))
+
+(define (selector-labels name)
+  "The forced identity label/selector for NAME under the current label key
+(empty when the key is #f)."
+  (let ((k (current-label-key)))
+    (if k `((,k . ,name)) '())))
+
+;; Build-time scope, like `with-namespace`: bake KEY into the body's ops.
+(define-syntax-rule (with-label-key key body ...)
+  (scope-ops 'with-label-key (current-label-key key) "label-key "
+    body ...))
 
 (define* (%namespace name #:key (labels '()))
   (resource `((apiVersion . "v1") (kind . "Namespace")
@@ -143,7 +184,7 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 (define* (k8s-metadata name namespace #:optional (extra-labels '()))
   `(,@(if namespace `((namespace . ,namespace)) '())
     (name . ,name)
-    (labels (app . ,name) ,@extra-labels)))
+    (labels ,@(selector-labels name) ,@extra-labels)))
 
 (define (envFrom-entries refs)
   (map (lambda (ref)
@@ -161,9 +202,9 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
    #\-))
 
 (define (volume-name kind ident)
-  (if (eq? kind 'hostPath)
-      (string-append "host-" (sanitize-name ident))
-      (string-append (symbol->string kind) "-" ident)))
+  (cond ((eq? kind 'hostPath) (string-append "host-" (sanitize-name ident)))
+        ((eq? kind 'emptyDir) (sanitize-name ident))   ; user picks a friendly name
+        (else (string-append (symbol->string kind) "-" ident))))
 
 (define (volume-entries refs)
   (map (lambda (ref)
@@ -176,6 +217,8 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                   `((name . ,(volume-name kind n)) (persistentVolumeClaim (claimName . ,n))))
                  ((eq? kind 'hostPath)
                   `((name . ,(volume-name kind n)) (hostPath (path . ,n))))
+                 ((eq? kind 'emptyDir)
+                  `((name . ,(volume-name kind n)) (emptyDir)))
                  (else (error "unknown volume kind:" kind)))))
        refs))
 
@@ -189,49 +232,76 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
              ,@(if ro '((readOnly . #t)) '()))))
        refs))
 
-(define* (container-alist #:key name image (port 0) (args '()) (command '())
+;; A port tuple (name number protocol target-port), shared by container `ports`
+;; and multi-port `service`; matches the `cm`/`sec`/`mount` builder convention.
+(define* (port name number #:key (protocol #f) (target-port #f))
+  (list name number protocol target-port))
+
+(define (containerPort-entries specs)
+  (map (lambda (p)
+         `((name . ,(list-ref p 0)) (containerPort . ,(list-ref p 1))
+           ,@(if (list-ref p 2) `((protocol . ,(list-ref p 2))) '())))
+       specs))
+
+(define* (container-alist #:key name image (port 0) (ports '()) (args '()) (command '())
                           (env '()) (env-from '()) (volumes '()) (resources '())
-                          (privileged #f) (capabilities '()) (host-port #f) (protocol #f))
-  (let ((resources (normalize-resources resources))
-        (sec-ctx   (append (if privileged '((privileged . #t)) '())
-                           (if (pair? capabilities)
-                               `((capabilities (add ,@capabilities))) '()))))
+                          (privileged #f) (capabilities '()) (host-port #f) (protocol #f)
+                          (liveness '()) (readiness '()) (startup '()))
+  (let* ((resources (normalize-resources resources))
+         (sec-ctx   (append (if privileged '((privileged . #t)) '())
+                            (if (pair? capabilities)
+                                `((capabilities (add ,@capabilities))) '())))
+         (port-entries
+           (append
+             (if (and (number? port) (> port 0))
+                 `(((containerPort . ,port)
+                    ,@(if host-port `((hostPort . ,host-port)) '())
+                    ,@(if protocol  `((protocol . ,protocol)) '())))
+                 '())
+             (containerPort-entries ports))))
     `((name . ,name)
       (image . ,image)
       ,@(if (null? command) '() `((command ,@command)))
       ,@(if (null? args)    '() `((args ,@args)))
-      ,@(if (and (number? port) (> port 0))
-            `((ports ((containerPort . ,port)
-                      ,@(if host-port `((hostPort . ,host-port)) '())
-                      ,@(if protocol  `((protocol . ,protocol)) '()))))
-            '())
+      ,@(if (null? port-entries) '() `((ports ,@port-entries)))
       ,@(if (null? env)      '() `((env ,@env)))
       ,@(if (null? env-from) '() `((envFrom ,@(envFrom-entries env-from))))
       ,@(if (null? volumes)  '() `((volumeMounts ,@(volumeMount-entries volumes))))
+      ,@(if (null? liveness)  '() `((livenessProbe ,@liveness)))
+      ,@(if (null? readiness) '() `((readinessProbe ,@readiness)))
+      ,@(if (null? startup)   '() `((startupProbe ,@startup)))
       ,@(if (null? resources) '() `((resources ,@resources)))
       ,@(if (null? sec-ctx) '() `((securityContext ,@sec-ctx))))))
 
-(define* (workload-alist #:key kind name image (port 0) (replicas #f)
+(define* (workload-alist #:key kind name image (port 0) (ports '()) (replicas #f)
                          (namespace (current-k8s-namespace)) (env '()) (env-from '()) (volumes '())
                          (resources '()) (privileged #f) (args '()) (command '())
                          (service-account #f) (host-network #f) (host-pid #f)
-                         (labels '()) (capabilities '()) (host-port #f) (protocol #f))
+                         (labels '()) (annotations '()) (capabilities '()) (host-port #f) (protocol #f)
+                         (liveness '()) (readiness '()) (startup '())
+                         (strategy '()) (termination-grace-period #f))
   `((apiVersion . "apps/v1")
     (kind . ,kind)
     (metadata ,@(k8s-metadata name namespace labels))
     (spec ,@(if replicas `((replicas . ,replicas)) '())
-          (selector (matchLabels (app . ,name)))
+          ,@(if (null? strategy) '() `((strategy ,@strategy)))
+          (selector (matchLabels ,@(selector-labels name)))
           (template
-            (metadata (labels (app . ,name) ,@labels))
+            (metadata (labels ,@(selector-labels name) ,@labels)
+                      ,@(if (null? annotations) '() `((annotations ,@annotations))))
             (spec ,@(if service-account `((serviceAccountName . ,service-account)) '())
                   ,@(if host-network `((hostNetwork . #t)) '())
                   ,@(if host-pid `((hostPID . #t)) '())
-                  (containers ,(container-alist #:name name #:image image #:port port
+                  ,@(if termination-grace-period
+                        `((terminationGracePeriodSeconds . ,termination-grace-period)) '())
+                  (containers ,(container-alist #:name name #:image image #:port port #:ports ports
                                                 #:args args #:command command
                                                 #:env env #:env-from env-from #:volumes volumes
                                                 #:resources resources #:privileged privileged
                                                 #:capabilities capabilities
-                                                #:host-port host-port #:protocol protocol))
+                                                #:host-port host-port #:protocol protocol
+                                                #:liveness liveness #:readiness readiness
+                                                #:startup startup))
                   ,@(if (null? volumes) '() `((volumes ,@(volume-entries volumes)))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -246,34 +316,82 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 (define (sec name) (list 'secret name))
 (define (pvc name) (list 'pvc name))
 (define (host-path path) (list 'hostPath path))
+(define (empty-dir name) (list 'emptyDir name))   ; scratch volume; NAME is arbitrary
 (define* (mount source path #:key (read-only #f))
   (append source (list path read-only)))
+
+;; ---------------------------------------------------------------------------
+;; workload sub-specs — probe / strategy
+;; ---------------------------------------------------------------------------
+;;
+;; Small record-body builders whose #:build returns an alist (like `rule`), fed
+;; to a workload's `liveness`/`readiness`/`startup` and `strategy` fields.
+
+;; (probe 8080 (http "/healthz") (initial-delay 5))  ; httpGet by default
+;; (probe 5432 (tcp))                                ; tcpSocket
+;; (probe 0 (exec "cat" "/tmp/ready"))               ; exec (port ignored)
+(define-construct probe
+  #:head port
+  #:fields ((http #:default #f) (tcp #:flag) (exec #:list)
+            (initial-delay #:default #f) (period #:default #f) (timeout #:default #f)
+            (success-threshold #:default #f) (failure-threshold #:default #f))
+  #:build (append
+            (cond ((pair? exec) `((exec (command ,@exec))))
+                  (tcp          `((tcpSocket (port . ,port))))
+                  (else         `((httpGet (path . ,(or http "/")) (port . ,port)))))
+            (filter pair?
+              (list (and initial-delay (cons 'initialDelaySeconds initial-delay))
+                    (and period (cons 'periodSeconds period))
+                    (and timeout (cons 'timeoutSeconds timeout))
+                    (and success-threshold (cons 'successThreshold success-threshold))
+                    (and failure-threshold (cons 'failureThreshold failure-threshold))))))
+
+;; (strategy "RollingUpdate" (max-surge "25%") (max-unavailable 0)) | (strategy "Recreate")
+(define-construct strategy
+  #:head type
+  #:fields ((max-surge #:default #f) (max-unavailable #:default #f))
+  #:build `((type . ,type)
+            ,@(if (or max-surge max-unavailable)
+                  `((rollingUpdate
+                      ,@(filter pair?
+                          (list (and max-surge (cons 'maxSurge max-surge))
+                                (and max-unavailable (cons 'maxUnavailable max-unavailable))))))
+                  '())))
 
 ;; ---------------------------------------------------------------------------
 ;; resource sugar
 ;; ---------------------------------------------------------------------------
 
-(define* (%deployment #:key name image (port 8080) (replicas 1) (namespace (current-k8s-namespace))
+(define* (%deployment #:key name image (port 8080) (ports '()) (replicas 1)
+                      (namespace (current-k8s-namespace))
                       (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                      (args '()) (command '()) (service-account #f) (labels '()))
-  (resource (workload-alist #:kind "Deployment" #:name name #:image image #:port port
+                      (args '()) (command '()) (service-account #f) (labels '()) (annotations '())
+                      (liveness '()) (readiness '()) (startup '())
+                      (strategy '()) (termination-grace-period #f))
+  (resource (workload-alist #:kind "Deployment" #:name name #:image image #:port port #:ports ports
                             #:replicas replicas #:namespace namespace #:env env #:env-from env-from
                             #:volumes volumes #:resources resources #:privileged privileged
                             #:args args #:command command #:service-account service-account
-                            #:labels labels)))
+                            #:labels labels #:annotations annotations
+                            #:liveness liveness #:readiness readiness #:startup startup
+                            #:strategy strategy #:termination-grace-period termination-grace-period)))
 
 (define-construct deployment
   #:head name
-  #:fields ((image #:required) (port #:default 8080) (replicas #:default 1)
+  #:fields ((image #:required) (port #:default 8080) (ports #:list) (replicas #:default 1)
             (namespace #:default (current-k8s-namespace))
             (env #:list) (env-from #:list) (volumes #:list)
             (resources #:default '()) (privileged #:flag)
             (args #:list) (command #:list)
-            (service-account #:default #f) (labels #:map))
-  #:build (%deployment #:name name #:image image #:port port #:replicas replicas
+            (service-account #:default #f) (labels #:map) (annotations #:map)
+            (liveness #:default '()) (readiness #:default '()) (startup #:default '())
+            (strategy #:default '()) (termination-grace-period #:default #f))
+  #:build (%deployment #:name name #:image image #:port port #:ports ports #:replicas replicas
                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
                        #:resources resources #:privileged privileged #:args args #:command command
-                       #:service-account service-account #:labels labels))
+                       #:service-account service-account #:labels labels #:annotations annotations
+                       #:liveness liveness #:readiness readiness #:startup startup
+                       #:strategy strategy #:termination-grace-period termination-grace-period))
 
 (define-construct daemonset
   #:head name
@@ -291,38 +409,69 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                                     #:host-network host-network #:host-pid host-pid #:labels labels
                                     #:capabilities capabilities #:host-port host-port #:protocol protocol)))
 
+(define (servicePort-entries specs)
+  (map (lambda (p)
+         (let ((name (list-ref p 0)) (num (list-ref p 1))
+               (proto (list-ref p 2)) (tp (list-ref p 3)))
+           `((name . ,name) (port . ,num) (targetPort . ,(or tp num))
+             ,@(if proto `((protocol . ,proto)) '()))))
+       specs))
+
+;; Single port via #:port/#:target-port/#:port-name, or several via #:ports
+;; (a list of `port` tuples): (service "api" (ports (port "http" 80) (port "grpc" 9090))).
 (define-construct service
   #:head name
-  #:fields ((port #:required) (target-port #:default port) (port-name #:default "http")
+  #:fields ((port #:default #f) (target-port #:default port) (port-name #:default "http")
+            (ports #:list)
             (namespace #:default (current-k8s-namespace))
             (type #:default #f) (selector-name #:default #f) (labels #:map))
-  #:build (let ((sel (or selector-name name)))
+  #:build (let* ((sel (or selector-name name))
+                 (specs (cond ((pair? ports) ports)
+                              (port (list (list port-name port #f target-port)))
+                              (else (error "service: needs (port …) or (ports …)")))))
             (resource
               `((apiVersion . "v1")
                 (kind . "Service")
                 (metadata ,@(k8s-metadata name namespace labels))
-                (spec (selector (app . ,sel))
+                (spec (selector ,@(selector-labels sel))
                       ,@(if type `((type . ,type)) '())
-                      (ports ((name . ,port-name) (port . ,port) (targetPort . ,target-port))))))))
+                      (ports ,@(servicePort-entries specs)))))))
 
-(define* (%ingress #:key name port (host #f) (namespace (current-k8s-namespace)) (path "/") (labels '()))
-  (let ((h (or host (string-append name ".example.com"))))
+;; One host+path rule for `ingress` (repeat for more hosts or paths):
+;;   (host-rule "a.com" (service "api") (port 80) (path "/api"))
+(define-construct host-rule
+  #:head host
+  #:fields ((service #:required) (port #:required)
+            (path #:default "/") (path-type #:default "Prefix"))
+  #:build `((host . ,host)
+            (http (paths ((path . ,path) (pathType . ,path-type)
+                          (backend (service (name . ,service) (port (number . ,port)))))))))
+
+(define* (%ingress #:key name port (host #f) (class #f) (hosts '())
+                   (namespace (current-k8s-namespace)) (path "/") (labels '()))
+  (let* ((h (or host (string-append name ".example.com")))
+         (rules (if (pair? hosts) hosts
+                    `(((host . ,h)
+                       (http (paths ((path . ,path)
+                                     (pathType . "Prefix")
+                                     (backend (service (name . ,name)
+                                                       (port (number . ,port))))))))))))
     (resource
       `((apiVersion . "networking.k8s.io/v1")
         (kind . "Ingress")
         (metadata ,@(k8s-metadata name namespace labels))
-        (spec (rules ((host . ,h)
-                      (http (paths ((path . ,path)
-                                    (pathType . "Prefix")
-                                    (backend (service (name . ,name)
-                                                      (port (number . ,port))))))))))))))
+        (spec ,@(if class `((ingressClassName . ,class)) '())
+              (rules ,@rules))))))
 
+;; Simple single host/path via #:port/#:host/#:path, or several via repeated
+;; `host-rule` (each an `ingress-host`); #:class sets ingressClassName.
 (define-construct ingress
   #:head name
-  #:fields ((port #:required) (host #:default #f)
+  #:fields ((port #:default #f) (host #:default #f) (class #:default #f)
+            (host-rule #:repeated #:construct host-rule)
             (namespace #:default (current-k8s-namespace)) (path #:default "/") (labels #:map))
-  #:build (%ingress #:name name #:port port #:host host #:namespace namespace
-                    #:path path #:labels labels))
+  #:build (%ingress #:name name #:port port #:host host #:class class #:hosts host-rule
+                    #:namespace namespace #:path path #:labels labels))
 
 (define-construct configmap
   #:head name
@@ -401,8 +550,50 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
   #:build (%custom-resource
             #:api "monitoring.coreos.com/v1" #:kind "ServiceMonitor"
             #:name name #:namespace namespace #:labels labels
-            #:spec `((selector (matchLabels (app . ,name)))
+            #:spec `((selector (matchLabels ,@(selector-labels name)))
                      (endpoints ((port . ,port) (path . ,path) (interval . ,interval))))))
+
+;; ---------------------------------------------------------------------------
+;; autoscaling / disruption
+;; ---------------------------------------------------------------------------
+
+(define (metric-resource res pct)
+  `((type . "Resource")
+    (resource (name . ,res)
+              (target (type . "Utilization") (averageUtilization . ,pct)))))
+
+;; (hpa "api" (target "api") (max-replicas 10) (cpu 80) (memory 75))
+(define-construct hpa
+  #:head name
+  #:fields ((target #:required) (target-kind #:default "Deployment")
+            (min-replicas #:default 1) (max-replicas #:required)
+            (cpu #:default #f) (memory #:default #f)
+            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (resource
+            `((apiVersion . "autoscaling/v2")
+              (kind . "HorizontalPodAutoscaler")
+              (metadata ,@(k8s-metadata name namespace labels))
+              (spec (scaleTargetRef (apiVersion . "apps/v1") (kind . ,target-kind) (name . ,target))
+                    (minReplicas . ,min-replicas)
+                    (maxReplicas . ,max-replicas)
+                    (metrics ,@(filter pair?
+                                 (list (and cpu    (metric-resource "cpu" cpu))
+                                       (and memory (metric-resource "memory" memory)))))))))
+
+;; (pdb "api" (min-available 1)) | (pdb "api" (max-unavailable "25%"))
+(define-construct pdb
+  #:head name
+  #:fields ((min-available #:default #f) (max-unavailable #:default #f)
+            (selector-name #:default #f)
+            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:build (let ((sel (or selector-name name)))
+            (resource
+              `((apiVersion . "policy/v1")
+                (kind . "PodDisruptionBudget")
+                (metadata ,@(k8s-metadata name namespace labels))
+                (spec ,@(if min-available `((minAvailable . ,min-available)) '())
+                      ,@(if max-unavailable `((maxUnavailable . ,max-unavailable)) '())
+                      (selector (matchLabels ,@(selector-labels sel))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Gateway API
@@ -672,7 +863,7 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
                 ports)))
     `((apiVersion . "v1")
       (kind . "Service")
-      (metadata ,@(if ns `((namespace . ,ns)) '()) (name . ,name) (labels (app . ,name)))
+      (metadata ,@(if ns `((namespace . ,ns)) '()) (name . ,name) (labels ,@selector))
       (spec (selector ,@selector)
             (ports ,@port-entries)))))
 

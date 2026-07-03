@@ -80,6 +80,23 @@
        '("z" "X" ((foo . "bar") (nums 1 2 3)))
        (openrec "z" (kind "X") (foo "bar") (nums 1 2 3)))
 
+;; ---- a sub-construct's value used as a scalar field (the probe-in-liveness
+;; pattern the k8s workload sugar relies on) ----
+(define-construct healthcheck
+  #:head port
+  #:fields ((path #:default "/"))
+  #:build `((httpGet (path . ,path) (port . ,port))))
+(define-construct workload2
+  #:head name
+  #:fields ((live #:default '()))
+  #:build (list name live))
+(format #t "~%construct: nested construct value in a scalar field~%")
+(check "scalar field holds another construct's alist"
+       '("api" ((httpGet (path . "/healthz") (port . 8080))))
+       (workload2 "api" (live (healthcheck 8080 (path "/healthz")))))
+(check "scalar field default when nested construct absent"
+       '("api" ()) (workload2 "api"))
+
 (format #t "~%~a~%" (if (zero? failures) "all construct checks passed"
                         (format #f "~a CONSTRUCT CHECK(S) FAILED" failures)))
 (exit (if (zero? failures) 0 1))

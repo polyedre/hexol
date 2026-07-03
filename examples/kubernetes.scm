@@ -30,37 +30,65 @@
 (hx-ops
 
   ;; ---- tintin: public app in namespace "tintin" ----
+  ;; Explicit workload + ingress so it can show off the fuller deployment sugar:
+  ;; probes, rolling-update strategy, a second (metrics) port, pod annotations,
+  ;; an emptyDir scratch mount, and grace period. `expose` derives a (multi-port)
+  ;; Service from the container ports; `hpa`/`pdb` scale + protect it; the
+  ;; `ingress` carries an ingressClassName and two hosts.
   (with-namespace "tintin"
     ;; ServiceAccount + ClusterRole + ClusterRoleBinding in one op.
     (cluster-rbac "tintin"
       (rule (api-groups "")     (resources "configmaps" "secrets") (verbs "get" "list" "watch"))
       (rule (api-groups "")     (resources "pods" "services")      (verbs "get" "list"))
       (rule (api-groups "apps") (resources "deployments")          (verbs "get" "list" "watch")))
-    (public-app "tintin"
-      (image "secure.io/tintin:1.0")
-      (port 8080)
-      (service-account "tintin")
-      (env-from (cm "tintin-config"))
-      (volumes  (mount (sec "tintin-secret") "/etc/tintin/secret"))
-      (resources "100m-500m/128Mi"))
+    (expose
+      (deployment "tintin"
+        (image "secure.io/tintin:1.0")
+        (port 8080)
+        (ports (port "metrics" 9797))           ; a second container port
+        (replicas 2)
+        (service-account "tintin")
+        (env-from (cm "tintin-config"))
+        (volumes (mount (sec "tintin-secret") "/etc/tintin/secret")
+                 (mount (empty-dir "scratch")  "/tmp"))
+        (liveness  (probe 8080 (http "/healthz") (initial-delay 5) (period 10)))
+        (readiness (probe 8080 (http "/readyz")  (failure-threshold 3)))
+        (startup   (probe 8080 (http "/healthz") (failure-threshold 30)))
+        (strategy  (strategy "RollingUpdate" (max-surge "25%") (max-unavailable 0)))
+        (annotations (prometheus.io/scrape "true") (prometheus.io/port "9797"))
+        (termination-grace-period 30)
+        (resources "100m-500m/128Mi")))
+    (ingress "tintin"
+      (class "nginx")
+      (host-rule "tintin.example.com"     (service "tintin") (port 8080))
+      (host-rule "www.tintin.example.com" (service "tintin") (port 8080)))
+    (hpa "tintin" (target "tintin") (min-replicas 2) (max-replicas 10) (cpu 80) (memory 75))
+    (pdb "tintin" (min-available 1))
     (configmap "tintin-config"
       (data (LOG_LEVEL "info") (FEATURE_MOON "true") (REGION "alpha5")))
     (secret "tintin-secret"
       (data (API_TOKEN "dGludGluLXRva2Vu"))))
 
   ;; ---- loulou: internal app in namespace "loulou" ----
-  (with-namespace "loulou"
-    (app "loulou"
-      (image "secure.io/loulou:2.1")
-      (port 9000)
-      (replicas 2)
-      (env-from (cm "loulou-config"))
-      (volumes  (mount (sec "loulou-secret") "/etc/loulou/secret"))
-      (resources "200m-*/256Mi"))
-    (configmap "loulou-config"
-      (data (LOG_LEVEL "debug") (CACHE_SIZE "256")))
-    (secret "loulou-secret"
-      (data (DB_PASSWORD "bG91bG91LXNlY3JldA=="))))
+  ;; Selects on `app.kubernetes.io/name` instead of the default `app` label, via
+  ;; `with-label-key` — so it interops with upstream charts that use that key.
+  ;; Everything inside (Deployment selector/labels, Service, PDB) picks it up.
+  (with-label-key 'app.kubernetes.io/name
+    (with-namespace "loulou"
+      (expose
+        (deployment "loulou"
+          (image "secure.io/loulou:2.1")
+          (port 9000)
+          (replicas 2)
+          (env-from (cm "loulou-config"))
+          (volumes  (mount (sec "loulou-secret") "/etc/loulou/secret"))
+          (readiness (probe 9000 (tcp)))
+          (resources "200m-*/256Mi")))
+      (pdb "loulou" (max-unavailable "25%"))
+      (configmap "loulou-config"
+        (data (LOG_LEVEL "debug") (CACHE_SIZE "256")))
+      (secret "loulou-secret"
+        (data (DB_PASSWORD "bG91bG91LXNlY3JldA==")))))
 
   ;; ---- cross-cutting ----
   (tls-all)
