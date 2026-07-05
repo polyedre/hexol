@@ -351,7 +351,7 @@ examples end with (tls-all)."
          (n (string-length s)))
     (if (>= n account-column)
         (string-append s "  ")
-        (string-append s (make-string (- account-column n) #\space)))))
+        (string-append s (make-string (max 2 (- account-column n)) #\space)))))
 
 (define (render-post p)
   (let ((account (assq-ref p 'account))
