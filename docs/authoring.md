@@ -148,6 +148,45 @@ needed, since `hx-ops`/`hx-when` already flatten the returned list.
 See `examples/inventory.scm` for a worked split: it pulls in
 `examples/kubernetes.scm` via `load-inventory-file`, gated by an `hx-when`.
 
+## Migrating: `hexol import`
+
+An existing deployment is the inventory's first draft. `hexol import` wraps
+what you have instead of asking for a rewrite:
+
+```sh
+./bin/hexol import -f manifests.yaml > app.scm        # k8s manifest stream (or `-` for stdin)
+./bin/hexol import -f main.tf.json --from terraform > infra.scm
+./bin/hexol render -o yaml -i app.scm                 # renders back to the same objects
+```
+
+The YAML import emits `(use-modules (hexol k8s))` and one op per document, in
+order — by default a generic `(resource '((apiVersion . "v1") (kind . …) …))`
+holding the object as a quoted alist. Plain scalars are typed (`replicas: 2`
+is the number 2), quoted ones stay strings (`PORT: "8080"` stays `"8080"`),
+so a ConfigMap survives the trip. Fields the API server fills in on a
+`kubectl get` dump — `status`, `metadata.managedFields`, `uid`,
+`resourceVersion`, `creationTimestamp`, `generation`, the
+last-applied-configuration annotation — are stripped; `--no-clean` keeps
+them. A `kind: List` envelope is unwrapped.
+
+`--sugar` lifts an object to its typed construct — `namespace`, `configmap`,
+`secret`, `service`, `deployment` — when the object is *exactly* what that
+construct would build. The check is by construction: the candidate form is
+evaluated and its resource compared to the imported object (maps
+order-insensitively). Anything the construct can't express — a second
+container, an extra annotation — stays a `resource`, so `--sugar` never
+changes what renders; it only makes the file shorter where it can.
+
+The Terraform import reads JSON config (`*.tf.json`, the format `render -o
+terraform` writes) and emits `terraform-settings` / `terraform-provider` /
+`terraform-resource` / `terraform-data` / `terraform-output` forms, with
+`terraform-block` for anything else (`variable`, `locals`, `module`). HCL
+text is not parsed — there is no HCL reader here.
+
+Either way the result is a plain inventory. Refactor from there: pull the
+repeated `resource` into a helper, gate a block with `hx-when`, replace a
+verbatim alist with the construct once you're ready.
+
 ## Ordering matters
 
 Resolution is a left fold in source order. Two consequences:
@@ -294,6 +333,8 @@ hexol/
                     #                   `res` compact limits, app/public-app,
                     #                   tls-all, checksum, compliance
   yaml.scm          # (hexol yaml)     — state -> YAML emitter (the k8s render back-end)
+  import.scm        # (hexol import)   — `hexol import`: k8s YAML / Terraform JSON ->
+                    #                    inventory file (resource ops, --sugar lifts)
   terraform.scm     # (hexol terraform)— terraform-resource/-provider/-settings/-output
                     #                   (macros w/ block/ref body), tf-ref/tf-output,
                     #                   transform-terraform-resources + *.tf.json emitter
@@ -306,7 +347,7 @@ hexol/
                     #                    (secret-ref 'k), (resolve-secret-refs) render op
   secret-tool.scm   # (hexol secret-tool) — engine behind `hexol secret`: position-aware
                     #                    reader + sops seal/decrypt + in-place form rewrite
-bin/hexol           # the CLI: render / tree / ops / explain / secret / doc
+bin/hexol           # the CLI: render / tree / ops / explain / secret / doc / lint / import
 examples/                          # one self-contained file each
   inventory.scm    # region table + per-region body + hx-each (the engine itself)
   kubernetes.scm   # consumer of (hexol k8s): namespaced apps + compliance demo

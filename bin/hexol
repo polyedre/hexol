@@ -17,6 +17,8 @@
 ;;;                                                  (or every path an op changed)
 ;;;   hexol lint                          [-i INV]   warn on $ reads that precede
 ;;;                                                  the write they depend on
+;;;   hexol import -f FILE [--from FMT]              existing k8s YAML / Terraform
+;;;                                                  JSON -> an inventory (stdout)
 ;;;
 ;;; Inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
 ;;;
@@ -54,6 +56,7 @@
              (hexol yaml)
              (hexol terraform)
              (hexol secret-tool)
+             (hexol import)
              (hexol json)
              (hexol construct)
              (hexol doc)
@@ -61,7 +64,8 @@
              (srfi srfi-9)
              (ice-9 match)
              (ice-9 pretty-print)
-             (ice-9 format))
+             (ice-9 format)
+             (ice-9 textual-ports))
 
 ;; ---------------------------------------------------------------------------
 ;; shared helpers
@@ -872,6 +876,69 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
                   (secret-error "secret: unknown verb ~a" v))))))))))
 
 ;; ---------------------------------------------------------------------------
+;; import — existing manifests -> an inventory file (stdout)
+;; ---------------------------------------------------------------------------
+;;
+;;   hexol import -f FILE|- [--from yaml|terraform] [--sugar] [--no-clean]
+;;
+;; The migration on-ramp: wrap what you have, refactor later. Takes no
+;; inventory — it *produces* one. --from defaults by extension (`.json` →
+;; terraform, else yaml). YAML: one op per document, `resource` by default,
+;; --sugar lifts exact fits to the typed constructs, --no-clean keeps the
+;; server-populated fields of a `kubectl get` dump. Terraform: JSON config
+;; only — HCL text is out of scope.
+
+(define import-usage "\
+usage:
+  hexol import -f FILE|-  [--from yaml|terraform] [--sugar] [--no-clean]
+
+  -f FILE|-        the manifests to wrap (- reads stdin)
+  --from FMT       yaml (k8s manifest stream) or terraform (JSON config,
+                   *.tf.json — HCL text is NOT parsed); default by extension
+  --sugar          lift Namespace/ConfigMap/Secret/Service/Deployment to the
+                   typed (hexol k8s) constructs when they fit exactly
+  --no-clean       keep status/managedFields/uid/resourceVersion/… (default: strip)
+
+Writes the inventory to stdout:  hexol import -f app.yaml > app.scm")
+
+(define (cmd-import args)
+  (let loop ((args args) (file #f) (from #f) (sugar? #f) (clean? #t))
+    (match args
+      (() (do-import file from sugar? clean?))
+      (((or "-f" "--file") f . rest) (loop rest f from sugar? clean?))
+      (("--from" f . rest)           (loop rest file f sugar? clean?))
+      (("--sugar" . rest)            (loop rest file from #t clean?))
+      (("--clean" . rest)            (loop rest file from sugar? #t))
+      (("--no-clean" . rest)         (loop rest file from sugar? #f))
+      ((arg . rest)
+       (cond
+         ((string-prefix? "--file=" arg) (loop rest (flag-value "--file=" arg) from sugar? clean?))
+         ((string-prefix? "--from=" arg) (loop rest file (flag-value "--from=" arg) sugar? clean?))
+         (else (format (current-error-port) "~a~%~a~%"
+                       (e-red (format #f "import: unexpected argument ~a" arg))
+                       (e-dim import-usage))
+               (exit 2)))))))
+
+(define (do-import file from sugar? clean?)
+  (unless file
+    (format (current-error-port) "~a~%~a~%" (e-red "import: missing -f FILE") (e-dim import-usage))
+    (exit 2))
+  (when (string-suffix? ".tf" file)
+    (die "import: ~a looks like HCL — only Terraform JSON config (*.tf.json) is parsed" file))
+  (let* ((stdin? (string=? file "-"))
+         (from   (or from (if (string-suffix? ".json" file) "terraform" "yaml")))
+         (text   (cond (stdin? (get-string-all (current-input-port)))
+                       ((file-exists? file) (call-with-input-file file get-string-all))
+                       (else (die "import: no such file: ~a" file))))
+         (source (if stdin? "stdin" file)))
+    (cond
+      ((string=? from "yaml")
+       (display (import-yaml text #:sugar? sugar? #:clean? clean? #:source source)))
+      ((string=? from "terraform")
+       (display (import-terraform-json text #:source source)))
+      (else (die "import: unknown --from ~s (want yaml | terraform)" from)))))
+
+;; ---------------------------------------------------------------------------
 ;; verbs — the dispatch registry
 ;; ---------------------------------------------------------------------------
 ;;
@@ -944,6 +1011,9 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 (register-verb!
  (make-verb "secret" (cmd-is "secret") (delegating-runner cmd-secret)
    "secret  <ls|get|set|edit|rm|rekey|init> … [-i INVENTORY]"))
+(register-verb!
+ (make-verb "import" (cmd-is "import") (delegating-runner cmd-import)
+   "import  -f FILE|- [--from yaml|terraform] [--sugar] [--no-clean]   (→ inventory on stdout)"))
 
 ;; "|"-joined verb list for terse usage lines.
 (define (verb-list) (string-join (map verb-name *verbs*) "|"))

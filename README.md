@@ -101,6 +101,16 @@ use them: `helm`/`yq` to expand charts, `sops` for inline secrets, and
 ./bin/hexol doc app -i examples/kubernetes.scm                            # one construct: fields + example
 ```
 
+**Migrating.** You don't rewrite what you already have — you wrap it.
+`hexol import -f manifests.yaml > app.scm` turns a k8s manifest stream (or a
+`kubectl get -o yaml` dump; server-populated fields are stripped) into an
+inventory with one `(resource …)` per document that renders back to the same
+YAML; `--sugar` lifts objects to the typed constructs (`deployment`,
+`service`, `configmap`, …) wherever they fit exactly. `hexol import -f
+main.tf.json --from terraform` does the same for a Terraform JSON config
+(HCL text is out of scope). From there you refactor at your own pace. See
+[`docs/authoring.md`](docs/authoring.md#migrating-hexol-import).
+
 ## The Library
 
 While the kernel is target-agnostic, the library provide a few syntaxic sugar helpers:

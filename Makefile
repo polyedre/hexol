@@ -4,7 +4,7 @@ GUILE ?= guile
 
 help:
 	@echo "targets:"
-	@echo "  make test          run the smoke tests (kernel, surface, res, k8s)"
+	@echo "  make test          run the smoke tests (kernel, surface, res, k8s, import)"
 	@echo "  make test-examples render the standalone examples, check they exit 0"
 	@echo "  make build         compile all modules (surfaces any load/compile error)"
 	@echo "  make clean   remove this project's Guile compile cache"
@@ -16,17 +16,19 @@ help:
 	@echo "  ./bin/hexol show HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol lint [-i INVENTORY]"
 	@echo "  ./bin/hexol doc [CONSTRUCT] [-i INVENTORY]"
+	@echo "  ./bin/hexol import -f FILE|- [--from yaml|terraform] [--sugar] [--no-clean]"
 
 test:
 	$(GUILE) -L . test.scm
 	$(GUILE) -L . test/construct.scm
 	$(GUILE) -L . test/k8s-res.scm
+	$(GUILE) -L . test/import.scm
 
 test-examples:
 	GUILE=$(GUILE) ./test/examples.sh
 
 build:
-	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (hexol json) (hexol lint)) (display "build ok\n"))'
+	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (hexol json) (hexol lint) (hexol import)) (display "build ok\n"))'
 
 clean:
 	rm -rf ~/.cache/guile/ccache/*$(CURDIR)*
