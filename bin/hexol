@@ -24,6 +24,7 @@
 ;;;                                                  JSON -> an inventory (stdout)
 ;;;
 ;;; Inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
+;;; `hexol --version` / `hexol version` prints the release ((hexol version)).
 ;;;
 ;;; render formats (-o / --output): sexp (default), json, yaml, terraform, ansible,
 ;;; plus any name an inventory registers with `renders-with`.
@@ -66,6 +67,7 @@
              ((hexol apply) #:select (current-diff-explainer))
              ((hexol sh) #:select (which-cmd))
              (ice-9 popen)
+             (hexol version)
              (srfi srfi-1)
              (srfi srfi-9)
              (ice-9 match)
@@ -1269,6 +1271,10 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
   (call-with-values (lambda () (extract-color (cdr args)))
    (lambda (mode rest)
     (when mode (set-color-mode! mode))
+    ;; Version is frame-level like help: no inventory, no verb lookup.
+    (when (or (member "--version" rest) (equal? rest '("version")))
+      (format #t "hexol ~a~%" %hexol-version)
+      (exit 0))
     ;; One render cache per invocation, scoped to this inventory's content, so
     ;; helm-template / remote-manifest shell-outs are reused across runs. #f (no
     ;; inventory, or an unusable cache dir) disables it — results are identical.

@@ -7,7 +7,9 @@
 
 (package
   (name "hexol")
-  (version "0.1")
+  ;; Keep in sync with %hexol-version in hexol/version.scm (a package definition
+  ;; can't load the module it packages, so this copy is unavoidable).
+  (version "0.1.0")
   (source (local-file "." "hexol-source"
                       #:recursive? #t
                       #:select? (lambda (f s)
