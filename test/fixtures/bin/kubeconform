@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# test/fixtures/bin/kubeconform — PATH shim; logs argv to $FAKE_LOG, drains
+# stdin, exits $FAKE_KUBECONFORM_EXIT (default 0).
+echo "kubeconform $*" >> "${FAKE_LOG:-/dev/null}"
+[ -t 0 ] || cat >/dev/null
+exit "${FAKE_KUBECONFORM_EXIT:-0}"

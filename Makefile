@@ -11,6 +11,8 @@ help:
 	@echo
 	@echo "everything else is the CLI — ./bin/hexol --help:"
 	@echo "  ./bin/hexol render [-o sexp|json|yaml|terraform|ansible] [--query K=V,…] [--path P] [-i INVENTORY]"
+	@echo "  ./bin/hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY]"
+	@echo "  ./bin/hexol diff [--only SPEC] [--explain] [-i INVENTORY]"
 	@echo "  ./bin/hexol tree [-i INVENTORY]"
 	@echo "  ./bin/hexol explain [--query K=V,…] PATH|HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol show HASH [-i INVENTORY]"
@@ -23,6 +25,8 @@ test:
 	$(GUILE) -L . test/construct.scm
 	$(GUILE) -L . test/k8s-res.scm
 	$(GUILE) -L . test/import.scm
+	$(GUILE) -L . test/apply-mode.scm
+	GUILE=$(GUILE) ./test/diff-cli.sh
 
 test-examples:
 	GUILE=$(GUILE) ./test/examples.sh

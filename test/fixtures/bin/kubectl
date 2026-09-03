@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# test/fixtures/bin/kubectl — PATH shim standing in for kubectl in tests.
+# Appends its argv to $FAKE_LOG, drains stdin, and exits per verb:
+#   apply  $FAKE_APPLY_EXIT (default 0)
+#   diff   $FAKE_DIFF_EXIT  (default 0; 1 = drift, as kubectl's)
+#   get    prints $FAKE_GET_JSON's contents (nothing when unset: not found)
+echo "kubectl $*" >> "${FAKE_LOG:-/dev/null}"
+verb=
+for a in "$@"; do case "$a" in -*) ;; *) verb=$a; break;; esac; done
+[ -t 0 ] || cat >/dev/null
+case "$verb" in
+  apply) exit "${FAKE_APPLY_EXIT:-0}" ;;
+  diff)  exit "${FAKE_DIFF_EXIT:-0}" ;;
+  get)   [ -n "${FAKE_GET_JSON:-}" ] && cat "$FAKE_GET_JSON"; exit 0 ;;
+  *)     exit 0 ;;
+esac

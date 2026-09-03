@@ -4,10 +4,19 @@
 ;;; state* and apply it. The only place hexol shells out (`tofu`, `kubectl`);
 ;;; `(hexol terraform)` / `(hexol k8s)` stay pure data translators.
 ;;;
-;;; An *applier* is a `(state dry? -> effects)`: reads its slice of state and
-;;; acts (under DRY?, delegates to the tool's native plan). The constructors
-;;; here — `terraform-applier', `kubectl-applier', and the checks
-;;; `wait-for'/`check'/`report' — only *return* one; none register.
+;;; An *applier* is a `(state mode -> effects)`: reads its slice of state and
+;;; acts. MODE is one of
+;;;   apply   push (the default);
+;;;   plan    delegate to the tool's native plan/dry-run (`hexol apply --dry-run');
+;;;   diff    report drift between the rendered state and the world (`hexol
+;;;           diff'): return the symbol `drift' when the two differ, anything
+;;;           else when clean; errors are errors. The runner folds these into
+;;;           its exit code (0 clean, 1 drift, 2 error).
+;;; For compatibility MODE may also be the old DRY? boolean — #t reads as `plan',
+;;; #f as `apply' (see `mode-of') — so a hand-written `(lambda (state dry?) …)'
+;;; keeps working. The constructors here — `terraform-applier',
+;;; `kubectl-applier', and the checks `wait-for'/`check'/`report'/
+;;; `kubeconform-check' — only *return* one; none register.
 ;;; Registration is the `appliers' form, naming a sequence run in textual order:
 ;;;
 ;;;   (appliers
@@ -20,8 +29,15 @@
 ;;;     ("check-apps" (check "apps Ready" my-predicate #:fatal? #f)))
 ;;;
 ;;; `hexol apply` resolves once, then runs the named appliers in order
-;;; (optionally `--only NAME'), passing the shared state and `--dry-run'. Only
-;;; under `apply' — elsewhere the collector is unbound and `appliers' no-ops.
+;;; (optionally `--only NAME'), passing the shared state and the mode
+;;; (`--dry-run' → plan; `hexol diff' → diff). Only under `apply'/`diff' —
+;;; elsewhere the collector is unbound and `appliers' no-ops.
+;;;
+;;; `hexol diff --explain' binds `current-diff-explainer' to a (path -> prints)
+;;; callback over the resolve trace; an applier that can compute a structural
+;;; diff (kubectl's does, over the live objects) calls it per changed path so
+;;; each hunk names the op that set the value. Appliers without one (terraform)
+;;; ignore it and stream their tool's plan.
 ;;;
 ;;; Two ways to place a check:
 ;;;   * an `appliers' entry — a visible, independently `--only'-able step;
@@ -48,6 +64,7 @@
   #:use-module ((hexol terraform) #:select (emit-terraform-json))
   #:use-module ((hexol yaml) #:select (emit-yaml-stream))
   #:use-module (hexol sh)
+  #:use-module ((hexol diff) #:select (structural-diff json->state))
   #:use-module (ice-9 popen)
   #:use-module (ice-9 textual-ports)
   #:use-module (ice-9 format)
@@ -58,12 +75,32 @@
   #:re-export (state-get)
   #:export (terraform-applier kubectl-applier terraform-destroyer
             terraform-output-reporter terraform-validator talos-config-applier
-            appliers actions wait-for check report cmd sh-ok?))
+            appliers actions wait-for check report kubeconform-check cmd sh-ok?
+            mode-of current-diff-explainer render-manifests))
+
+;; Normalise an applier's second argument to a mode symbol: the runner passes
+;; `apply'/`plan'/`diff'; a legacy caller may still pass DRY? (#t → plan, #f →
+;; apply). Every constructor here reads the mode through this.
+(define (mode-of m)
+  (cond ((eq? m #t) 'plan) ((not m) 'apply) (else m)))
+
+;; `hexol diff --explain' binds this to a (state-path -> prints) callback that
+;; names the op which set the value at that path. #f otherwise; an applier
+;; checks it under `diff' to choose the explained structural path.
+(define current-diff-explainer (make-parameter #f))
 
 ;; ---------- shell helpers ----------
 
 (define (find-binary name)
   (or (which-cmd name) (error "apply: command not found on PATH:" name)))
+
+;; Run PROG ARGS inheriting stdio, return the exit code (a signalled child
+;; reads as 128+signal) — for tools whose non-zero exits carry meaning
+;; (`tofu plan -detailed-exitcode', `kubectl diff').
+(define (run-status prog . args)
+  (force-output (current-error-port))
+  (let ((st (apply system* prog args)))
+    (or (status:exit-val st) (+ 128 (or (status:term-sig st) 0)))))
 
 ;; Log a progress line to stderr, flushing now. Guile block-buffers a piped
 ;; stderr and would emit these only at exit — *after* subprocess output on the
@@ -108,11 +145,13 @@
 ;; A check is an applier whose effect is *observation* (poll, assert, report),
 ;; not mutation. These builders return one; drop it into an `appliers' entry or
 ;; a #:pre/#:post. PRED is a `(state -> boolean)'; `cmd' lifts a shell command.
-;; They differ only in dry-run and failure policy:
-;;   wait-for  block until PRED holds (or time out → fatal); skipped on DRY?.
+;; They differ only in plan/diff and failure policy:
+;;   wait-for  block until PRED holds (or time out → fatal); skipped (logged)
+;;             under plan/diff.
 ;;   check     assert PRED once; #:fatal? (default #t) → error, else warn;
-;;             skipped on DRY? (nothing to check during a plan).
+;;             skipped under plan/diff (nothing to check during a plan).
 ;;   report    run THUNK for its side output; always, never fatal.
+;;   kubeconform-check  schema-validate the rendered manifests; every mode.
 
 ;; Lift a shell command into a state predicate: ignores state, true iff the
 ;; command exits 0.  (cmd "kubectl" "get" "--raw=/readyz")
@@ -129,11 +168,12 @@
 
 (define* (wait-for desc pred #:key (timeout 120) (interval 5) (needs #f))
   "Return an applier that polls PRED every INTERVAL seconds until it holds,
-erroring after TIMEOUT seconds.  A no-op under DRY? (the infra it waits on may
-not exist during a plan), or when #:needs names a binary absent from PATH."
-  (lambda (state dry?)
+erroring after TIMEOUT seconds.  A no-op under plan/diff (the infra it waits on
+may not exist during a plan), or when #:needs names a binary absent from PATH."
+  (lambda (state mode)
     (cond
-      (dry? (log ";; apply[wait]: would wait for ~a~%" desc))
+      ((not (eq? (mode-of mode) 'apply))
+       (log ";; apply[wait]: would wait for ~a~%" desc))
       ((not (needs-ok? 'wait desc needs)) #f)
       (else
         (let ((deadline (+ (current-time) timeout)))
@@ -147,12 +187,13 @@ not exist during a plan), or when #:needs names a binary absent from PATH."
 
 (define* (check desc pred #:key (fatal? #t) (needs #f))
   "Return an applier that asserts PRED once.  On failure it errors when FATAL?
-(the default) or warns otherwise.  A no-op under DRY?, or when #:needs names a
-binary absent from PATH (so a check shelling out to an optional tool skips
-rather than fails when the tool is missing)."
-  (lambda (state dry?)
+(the default) or warns otherwise.  A no-op under plan/diff, or when #:needs
+names a binary absent from PATH (so a check shelling out to an optional tool
+skips rather than fails when the tool is missing)."
+  (lambda (state mode)
     (cond
-      (dry?        (log ";; apply[check]: ~a (dry-run, skipped)~%" desc))
+      ((not (eq? (mode-of mode) 'apply))
+       (log ";; apply[check]: ~a (~a, skipped)~%" desc (mode-of mode)))
       ((not (needs-ok? 'check desc needs)) #f)
       ((pred state) (log ";; apply[check]: ~a — ok~%" desc))
       (fatal?      (error "apply[check]: failed:" desc))
@@ -160,19 +201,50 @@ rather than fails when the tool is missing)."
 
 (define (report desc thunk)
   "Return an applier that runs THUNK (state -> any) for its side output and
-never fails.  Runs even under DRY?."
-  (lambda (state dry?)
+never fails.  Runs under every mode."
+  (lambda (state mode)
     (log ";; apply[report]: ~a~%" desc)
     (thunk state)))
 
+;; Pipe TEXT to `PROG ARGS' on stdin (stdout/stderr inherited); return the exit
+;; code, letting the caller decide what a non-zero pass means.
+(define (pipe-to prog args text)
+  (force-output (current-error-port))
+  (let ((port (apply open-pipe* OPEN_WRITE prog args)))
+    (display text port)
+    (status:exit-val (close-pipe port))))
+
+;; The (kubernetes_resources) manifest stream as one YAML string, Namespaces and
+;; CRDs floated to the front (see `order-resources'). Shared by the kubectl
+;; applier, `kubeconform-check', and `hexol render --validate'.
+(define (render-manifests state)
+  (let ((rs (or (state-get state '(kubernetes_resources))
+                (error "apply[kubernetes]: no (kubernetes_resources) in state"))))
+    (call-with-output-string
+      (lambda (p) (emit-yaml-stream p (order-resources rs))))))
+
+(define* (kubeconform-check #:key (binary "kubeconform")
+                            (args '("-strict" "-summary")) (fatal? #t))
+  "Return an applier that pipes the rendered (kubernetes_resources) stream to
+`BINARY ARGS' (default `kubeconform -strict -summary') and fails — errors when
+FATAL?, warns otherwise — on a non-zero exit.  Static validation, so it runs
+under every mode; skipped with a log line when BINARY is not on PATH."
+  (lambda (state mode)
+    (cond
+      ((not (needs-ok? 'check "manifest schema" binary)) #f)
+      ((eqv? 0 (pipe-to (which-cmd binary) args (render-manifests state)))
+       (log ";; apply[check]: manifest schema — ok~%"))
+      (fatal? (error "apply[check]: kubeconform reported invalid manifests"))
+      (else   (log ";; apply[check]: manifest schema — FAILED (non-fatal)~%")))))
+
 ;; #:pre/#:post accept a single check or a list; normalise to a list.
 (define (as-checks x) (if (procedure? x) (list x) x))
-(define (run-checks cs state dry?) (for-each (lambda (c) (c state dry?)) cs))
+(define (run-checks cs state mode) (for-each (lambda (c) (c state mode)) cs))
 
 ;; ---------- registration ----------
 
 ;; Name and register a sequence of appliers in textual order. Each PROC
-;; evaluates to a `(state dry? -> effects)' — a deploy applier or a check.
+;; evaluates to a `(state mode -> effects)' — a deploy applier or a check.
 ;; Expands to `applies-with' calls, so a no-op outside `hexol apply'.
 (define-syntax appliers
   (syntax-rules ()
@@ -208,21 +280,29 @@ never fails.  Runs even under DRY?."
                             (config-file "infra.tf.json") (output->file '())
                             (pre '()) (post '()))
   "Return an applier for the (terraform_config) subtree: write WORKDIR/CONFIG-FILE,
-`BINARY -chdir=WORKDIR init`, then `plan` (when DRY?) or `apply`.  After a real
-apply, every (OUTPUT . FILE) pair in OUTPUT->FILE is written from `BINARY
+`BINARY -chdir=WORKDIR init`, then `apply`, or under plan/diff `plan
+-detailed-exitcode` (exit 2 = changes pending → `drift', 1 = error).  After a
+real apply, every (OUTPUT . FILE) pair in OUTPUT->FILE is written from `BINARY
 -chdir=WORKDIR output -raw OUTPUT` — the cred hand-off, e.g. (\"kubeconfig\"
 . \"deploy/kubeconfig\").  BINARY defaults to `tofu`; pass #:binary \"terraform\"
 for stock Terraform.  #:pre / #:post run their checks (one or a list) before
-init and after the outputs are written; name the result in an `appliers' form."
-  (lambda (state dry?)
-    (run-checks (as-checks pre) state dry?)
-    (let ((tf    (find-binary binary))
-          (chdir (string-append "-chdir=" workdir)))
+init and after the outputs are written; name the result in an `appliers' form.
+`--explain' has no structural path here: the plan streams as-is."
+  (lambda (state mode)
+    (run-checks (as-checks pre) state mode)
+    (let ((tf     (find-binary binary))
+          (chdir  (string-append "-chdir=" workdir))
+          (result #f))
       (log ";; apply[terraform]: wrote ~a~%"
            (write-terraform-config state workdir config-file))
       (run* tf chdir "init" "-input=false")
-      (cond
-        (dry? (run* tf chdir "plan"))
+      (case (mode-of mode)
+        ((plan diff)
+         (let ((code (run-status tf chdir "plan" "-detailed-exitcode")))
+           (case code
+             ((0) (log ";; apply[terraform]: no changes~%"))
+             ((2) (log ";; apply[terraform]: changes pending~%") (set! result 'drift))
+             (else (error "apply[terraform]: plan failed" code)))))
         (else
          (run* tf chdir "apply")            ; tofu's y/N prompt gates this
          (for-each
@@ -230,8 +310,9 @@ init and after the outputs are written; name the result in an `appliers' form."
              (let ((val (capture tf chdir "output" "-raw" (car pair))))
                (write-file (cdr pair) val)
                (log ";; apply[terraform]: output ~a -> ~a~%" (car pair) (cdr pair))))
-           output->file))))
-    (run-checks (as-checks post) state dry?)))
+           output->file)))
+      (run-checks (as-checks post) state mode)
+      result)))
 
 ;; ---------- terraform destroyer (a CLI action, not a pipeline step) ----------
 
@@ -323,13 +404,14 @@ machine_configuration.  Per node the config is fetched from terraform state,
 written to a temp file, and applied with `talosctl apply-config --mode MODE';
 then `talosctl health' must pass — queried from a DIFFERENT node, so the probe
 is not aimed at a rebooting apid — before the next.  TALOSCONFIG (client certs)
-is refreshed from state first.  With `--dry-run' in ARGS each node gets
-`apply-config --dry-run' (prints the diff, changes nothing, no reboot, no gate).
-Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
+is refreshed from state first.  With `--dry-run' (or `--diff') in ARGS each
+node gets `apply-config --dry-run' (prints the diff, changes nothing, no
+reboot, no gate).  Register with `defines-action'/`actions' to expose it as
+its own `hexol' verb."
   (lambda (state args)
     (let* ((tc-bin (find-binary binary))
            (tf-bin (find-binary tofu))
-           (dry?   (and (member "--dry-run" args) #t))
+           (dry?   (and (or (member "--dry-run" args) (member "--diff" args)) #t))
            ;; one tofu round-trip per value; addresses up front (for the
            ;; observe-from-another-node health gate), configs lazily per node.
            (addrs  (map (lambda (n) (tf-output-raw tf-bin workdir (cadr n))) nodes)))
@@ -377,44 +459,98 @@ Register with `defines-action'/`actions' to expose it as its own `hexol' verb."
                                    '("Namespace" "CustomResourceDefinition"))))
                     rs))))
 
-;; Pipe YAML to `kubectl ARGS` (which include `apply … -f -`); return the exit
-;; code, letting the caller decide whether a non-zero pass is fatal.
-(define (kubectl-pipe kubectl args yaml)
-  (force-output (current-error-port))
-  (let ((port (apply open-pipe* OPEN_WRITE kubectl args)))
-    (display yaml port)
-    (status:exit-val (close-pipe port))))
+;; `Kind/name' (namespace-qualified when scoped) — how a diff hunk names a
+;; resource.
+(define (resource-id r)
+  (let* ((md (or (assq-ref r 'metadata) '()))
+         (ns (assq-ref md 'namespace)))
+    (format #f "~a/~a~a" (assq-ref r 'kind) (assq-ref md 'name)
+            (if ns (format #f " (ns ~a)" ns) ""))))
+
+;; `kubectl get -o json' the live counterpart of rendered resource R; #f when
+;; it doesn't exist. KUBECTL-BASE is the binary plus its global flags.
+(define (fetch-live kubectl-base r)
+  (let* ((md   (or (assq-ref r 'metadata) '()))
+         (ns   (assq-ref md 'namespace))
+         (out  (apply capture (append kubectl-base
+                                      (list "get" "-o" "json" "--ignore-not-found")
+                                      (if ns (list "-n" ns) '())
+                                      (list (assq-ref r 'kind) (assq-ref md 'name))))))
+    (and (not (string-null? out)) (json->state out))))
+
+;; The explained diff: fetch each rendered resource's live object, structural-
+;; diff the two (see (hexol diff)), and print one hunk per changed leaf —
+;; value change, then the op that set it via EXPLAIN, a (state-path -> prints)
+;; callback keyed on the resource's index in (kubernetes_resources). Returns
+;; `drift' when anything differs.
+(define (kubectl-explained-diff kubectl-base rs explain)
+  (let ((drift? #f))
+    (for-each
+      (lambda (r i)
+        (let ((live (fetch-live kubectl-base r)))
+          (cond
+            ((not live)
+             (set! drift? #t)
+             (format #t "+ ~a (not in cluster)~%" (resource-id r))
+             (explain (list 'kubernetes_resources i)))
+            (else
+             (for-each
+               (lambda (d)
+                 (let ((path (car d)) (was (cadr d)) (now (caddr d)))
+                   (set! drift? #t)
+                   (if was
+                       (format #t "~~ ~a ~a: ~s -> ~s~%" (resource-id r) (path->string path) was now)
+                       (format #t "+ ~a ~a: ~s~%" (resource-id r) (path->string path) now))
+                   (explain (cons* 'kubernetes_resources i path))))
+               (structural-diff r live))))))
+      rs (iota (length rs)))
+    (if drift?
+        'drift
+        (log ";; apply[kubernetes]: no drift~%"))))
 
 (define* (kubectl-applier #:key (binary "kubectl") (kubeconfig #f)
                           (server-side #t) (passes 2) (pre '()) (post '()))
   "Return an applier for (kubernetes_resources): render the manifest stream —
-Namespaces and CRDs floated to the front — and `kubectl apply` it.  With DRY?,
-runs one `--dry-run=server` pass.  Otherwise applies up to PASSES times (default
-2): a custom resource whose CRD is created earlier in the *same* run fails the
-first pass (kubectl caches API types per invocation), so a second pass — not a
-wait — lands it.  CRDs created out of band (e.g. cert-manager's, installed later
-by Flux) converge on a subsequent `hexol apply --only kubernetes`.  #:kubeconfig
+Namespaces and CRDs floated to the front — and `kubectl apply` it.  Under
+`plan', runs one `--dry-run=server` pass.  Under `diff', runs `kubectl diff -f
+-' (exit 1 = drift, not an error → returns `drift'); with
+`current-diff-explainer' bound (`hexol diff --explain') it instead fetches each
+live object and prints a structural diff whose every hunk names the op that
+set the value.  Otherwise applies up to PASSES times (default 2): a custom
+resource whose CRD is created earlier in the *same* run fails the first pass
+(kubectl caches API types per invocation), so a second pass — not a wait —
+lands it.  CRDs created out of band (e.g. cert-manager's, installed later by
+Flux) converge on a subsequent `hexol apply --only kubernetes`.  #:kubeconfig
 sets --kubeconfig; #:server-side toggles --server-side (the default — big CRD
 bundles exceed client-side apply's annotation-size limit).  #:pre / #:post run
-their checks (one or a list) before and after applying — e.g. a #:pre `wait-for'
-that blocks until the API answers, so the gate travels with `--only kubernetes'."
-  (lambda (state dry?)
-    (run-checks (as-checks pre) state dry?)
-    (let* ((kc    (find-binary binary))
-           (rs    (or (state-get state '(kubernetes_resources))
-                      (error "apply[kubernetes]: no (kubernetes_resources) in state")))
-           (yaml  (call-with-output-string
-                    (lambda (p) (emit-yaml-stream p (order-resources rs)))))
-           (base  (append (if kubeconfig (list (string-append "--kubeconfig=" kubeconfig)) '())
-                          (list "apply")
-                          (if server-side '("--server-side" "--force-conflicts") '()))))
-      (cond
-        (dry?
-         (unless (eqv? 0 (kubectl-pipe kc (append base '("--dry-run=server" "-f" "-")) yaml))
+their checks (one or a list) before and after applying — e.g. a #:pre
+`wait-for' that blocks until the API answers, so the gate travels with `--only
+kubernetes'."
+  (lambda (state mode)
+    (run-checks (as-checks pre) state mode)
+    (let* ((kc     (find-binary binary))
+           (global (if kubeconfig (list (string-append "--kubeconfig=" kubeconfig)) '()))
+           (ss     (if server-side '("--server-side" "--force-conflicts") '()))
+           (yaml   (render-manifests state))
+           (base   (append global (list "apply") ss))
+           (result #f))
+      (case (mode-of mode)
+        ((plan)
+         (unless (eqv? 0 (pipe-to kc (append base '("--dry-run=server" "-f" "-")) yaml))
            (error "apply[kubernetes]: dry-run reported errors")))
+        ((diff)
+         (set! result
+           (if (current-diff-explainer)
+               (kubectl-explained-diff (cons kc global)
+                                       (state-get state '(kubernetes_resources))
+                                       (current-diff-explainer))
+               (case (pipe-to kc (append global (list "diff") ss '("-f" "-")) yaml)
+                 ((0) (log ";; apply[kubernetes]: no drift~%") #f)
+                 ((1) (log ";; apply[kubernetes]: drift~%") 'drift)
+                 (else (error "apply[kubernetes]: kubectl diff failed"))))))
         (else
          (let loop ((n 1))
-           (let ((code (kubectl-pipe kc (append base '("-f" "-")) yaml)))
+           (let ((code (pipe-to kc (append base '("-f" "-")) yaml)))
              (cond
                ((eqv? code 0)
                 (log ";; apply[kubernetes]: applied (pass ~a)~%" n))
@@ -423,5 +559,6 @@ that blocks until the API answers, so the gate travels with `--only kubernetes'.
                 (loop (+ n 1)))
                (else
                 (log ";; apply[kubernetes]: pass ~a still had errors — re-run `--only kubernetes` once out-of-band CRDs (e.g. cert-manager via Flux) exist~%"
-                     n))))))))
-    (run-checks (as-checks post) state dry?)))
+                     n)))))))
+      (run-checks (as-checks post) state mode)
+      result)))
