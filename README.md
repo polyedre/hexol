@@ -154,6 +154,7 @@ live homelab. Kick the tires before you bet a cluster on it.
 - [`docs/extending.md`](docs/extending.md) — building target libraries,
   the kernel/library/example boundary, worked Terraform and Helm
   conversions, and introspection.
+- The event-sourced CMDB prototype lives on the `cmdb` branch.
 
 ## License
 
