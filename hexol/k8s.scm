@@ -98,7 +98,8 @@
 
 (define-construct namespace
   #:head name
-  #:fields ((labels #:map))
+  #:doc "a Namespace resource (see also with-namespace)"
+  #:fields ((labels #:map #:doc "extra metadata.labels"))
   #:build (%namespace name #:labels labels))
 
 ;; Build-time scope over `scope-ops`; prepends the Namespace resource so
@@ -267,12 +268,20 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct deployment
   #:head name
-  #:fields ((image #:required) (port #:default 8080) (replicas #:default 1)
-            (namespace #:default (current-k8s-namespace))
-            (env #:list) (env-from #:list) (volumes #:list)
-            (resources #:default '()) (privileged #:flag)
-            (args #:list) (command #:list)
-            (service-account #:default #f) (labels #:map))
+  #:doc "a Deployment with one container"
+  #:fields ((image #:required #:doc "container image ref")
+            (port #:default 8080 #:doc "containerPort")
+            (replicas #:default 1 #:doc "pod replicas")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (privileged #:flag #:doc "privileged securityContext")
+            (args #:list #:doc "container args")
+            (command #:list #:doc "container command (entrypoint override)")
+            (service-account #:default #f #:doc "serviceAccountName")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (%deployment #:name name #:image image #:port port #:replicas replicas
                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
                        #:resources resources #:privileged privileged #:args args #:command command
@@ -280,13 +289,24 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct daemonset
   #:head name
-  #:fields ((image #:required) (port #:default 0)
-            (namespace #:default (current-k8s-namespace))
-            (env #:list) (env-from #:list) (volumes #:list)
-            (resources #:default '()) (privileged #:flag)
-            (args #:list) (command #:list) (service-account #:default #f)
-            (host-network #:flag) (host-pid #:flag) (labels #:map)
-            (capabilities #:list) (host-port #:default #f) (protocol #:default #f))
+  #:doc "a DaemonSet with one container (one pod per node)"
+  #:fields ((image #:required #:doc "container image ref")
+            (port #:default 0 #:doc "containerPort (0: none)")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (privileged #:flag #:doc "privileged securityContext")
+            (args #:list #:doc "container args")
+            (command #:list #:doc "container command (entrypoint override)")
+            (service-account #:default #f #:doc "serviceAccountName")
+            (host-network #:flag #:doc "hostNetwork: true")
+            (host-pid #:flag #:doc "hostPID: true")
+            (labels #:map #:doc "extra metadata.labels")
+            (capabilities #:list #:doc "securityContext.capabilities.add")
+            (host-port #:default #f #:doc "hostPort for the container port")
+            (protocol #:default #f #:doc "port protocol (TCP/UDP)"))
   #:build (resource (workload-alist #:kind "DaemonSet" #:name name #:image image #:port port
                                     #:replicas #f #:namespace namespace #:env env #:env-from env-from
                                     #:volumes volumes #:resources resources #:privileged privileged
@@ -296,9 +316,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct service
   #:head name
-  #:fields ((port #:required) (target-port #:default port) (port-name #:default "http")
-            (namespace #:default (current-k8s-namespace))
-            (type #:default #f) (selector-name #:default #f) (labels #:map))
+  #:doc "a Service selecting app=NAME (see also expose)"
+  #:fields ((port #:required #:doc "service port")
+            (target-port #:default port #:doc "pod port (defaults to port)")
+            (port-name #:default "http" #:doc "port name")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (type #:default #f #:doc "ClusterIP/NodePort/LoadBalancer")
+            (selector-name #:default #f #:doc "app label to select (defaults to NAME)")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (let ((sel (or selector-name name)))
             (resource
               `((apiVersion . "v1")
@@ -322,14 +347,20 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct ingress
   #:head name
-  #:fields ((port #:required) (host #:default #f)
-            (namespace #:default (current-k8s-namespace)) (path #:default "/") (labels #:map))
+  #:doc "an Ingress routing HOST/PATH to service NAME:PORT"
+  #:fields ((port #:required #:doc "backend service port")
+            (host #:default #f #:doc "hostname (default NAME.example.com)")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (path #:default "/" #:doc "path prefix")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (%ingress #:name name #:port port #:host host #:namespace namespace
                     #:path path #:labels labels))
 
 (define-construct configmap
   #:head name
-  #:fields ((data #:map) (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:doc "a ConfigMap"
+  #:fields ((data #:map #:doc "data entries, (key \"value\"); string keys ok (\"nginx.conf\")")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)") (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "v1")
               (kind . "ConfigMap")
@@ -338,8 +369,12 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct secret
   #:head name
-  #:fields ((data #:map) (string-data #:map) (namespace #:default (current-k8s-namespace))
-            (type #:default "Opaque") (labels #:map))
+  #:doc "a Secret"
+  #:fields ((data #:map #:doc "base64 data entries")
+            (string-data #:map #:doc "plaintext stringData entries")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (type #:default "Opaque" #:doc "secret type")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "v1")
               (kind . "Secret")
@@ -354,9 +389,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct storage-class
   #:head name
-  #:fields ((provisioner #:required) (default #:flag) (volume-binding-mode #:default #f)
-            (reclaim-policy #:default #f) (allow-volume-expansion #:flag)
-            (parameters #:map) (labels #:map))
+  #:doc "a StorageClass (cluster-scoped)"
+  #:fields ((provisioner #:required #:doc "provisioner name")
+            (default #:flag #:doc "mark as the default class")
+            (volume-binding-mode #:default #f #:doc "Immediate/WaitForFirstConsumer")
+            (reclaim-policy #:default #f #:doc "Delete/Retain")
+            (allow-volume-expansion #:flag #:doc "allowVolumeExpansion: true")
+            (parameters #:map #:doc "provisioner parameters")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "storage.k8s.io/v1")
               (kind . "StorageClass")
@@ -372,8 +412,12 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct persistent-volume-claim
   #:head name
-  #:fields ((size #:required) (namespace #:default (current-k8s-namespace))
-            (access-mode #:default "ReadWriteOnce") (storage-class #:default #f) (labels #:map))
+  #:doc "a PersistentVolumeClaim"
+  #:fields ((size #:required #:doc "requested storage (\"10Gi\")")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (access-mode #:default "ReadWriteOnce" #:doc "access mode")
+            (storage-class #:default #f #:doc "storageClassName")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "v1")
               (kind . "PersistentVolumeClaim")
@@ -391,16 +435,22 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct custom-resource
   #:head name
-  #:fields ((api #:required) (kind #:required)
-            (namespace #:default (current-k8s-namespace))
-            (spec #:default '()) (labels #:map))   ; spec: raw alist escape hatch
+  #:doc "any resource by apiVersion/kind, spec as a raw alist"
+  #:fields ((api #:required #:doc "apiVersion")
+            (kind #:required #:doc "kind")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (spec #:default '() #:doc "spec alist (raw escape hatch, use `body')")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (%custom-resource #:api api #:kind kind #:name name
                             #:namespace namespace #:spec spec #:labels labels))
 
 (define-construct service-monitor
   #:head name
-  #:fields ((port #:default "http") (path #:default "/metrics") (interval #:default "30s")
-            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:doc "a Prometheus ServiceMonitor scraping app=NAME"
+  #:fields ((port #:default "http" #:doc "service port name to scrape")
+            (path #:default "/metrics" #:doc "metrics path")
+            (interval #:default "30s" #:doc "scrape interval")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)") (labels #:map #:doc "extra metadata.labels"))
   #:build (%custom-resource
             #:api "monitoring.coreos.com/v1" #:kind "ServiceMonitor"
             #:name name #:namespace namespace #:labels labels
@@ -413,7 +463,8 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct gateway-class
   #:head name
-  #:fields ((controller-name #:required) (labels #:map))
+  #:doc "a Gateway API GatewayClass (cluster-scoped)"
+  #:fields ((controller-name #:required #:doc "controllerName") (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "gateway.networking.k8s.io/v1")
               (kind . "GatewayClass")
@@ -424,8 +475,12 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 ;; Secrets → a Terminate-mode tls block; absent → a plain listener.
 (define-construct listener
   #:head name
-  #:fields ((protocol #:default "HTTP") (port #:required) (hostname #:default #f)
-            (tls-certificate #:list) (allowed-routes-from #:default "All"))
+  #:doc "a Gateway listener (sub-construct of gateway)"
+  #:fields ((protocol #:default "HTTP" #:doc "HTTP/HTTPS/TCP")
+            (port #:required #:doc "listener port")
+            (hostname #:default #f #:doc "hostname to match")
+            (tls-certificate #:list #:doc "Secret names; sets Terminate-mode tls")
+            (allowed-routes-from #:default "All" #:doc "allowedRoutes.namespaces.from"))
   #:build (filter pair?
             (list (cons 'name name)
                   (cons 'protocol protocol)
@@ -441,18 +496,25 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct gateway
   #:head name
-  #:fields ((gateway-class-name #:required) (namespace #:default (current-k8s-namespace))
-            (listener #:repeated #:construct listener) (labels #:map))
+  #:doc "a Gateway API Gateway with listeners"
+  #:fields ((gateway-class-name #:required #:doc "gatewayClassName")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (listener #:repeated #:construct listener #:doc "one (listener NAME …) per entry")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (%custom-resource #:api "gateway.networking.k8s.io/v1" #:kind "Gateway"
             #:name name #:namespace namespace #:labels labels
             #:spec `((gatewayClassName . ,gateway-class-name) (listeners ,@listener))))
 
 (define-construct http-route
   #:head name
-  #:fields ((namespace #:default (current-k8s-namespace))
-            (parent-name #:required) (parent-namespace #:default #f)
-            (hostnames #:list) (backend-service #:required) (backend-port #:required)
-            (labels #:map))
+  #:doc "a Gateway API HTTPRoute to one backend service"
+  #:fields ((namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (parent-name #:required #:doc "parent Gateway name")
+            (parent-namespace #:default #f #:doc "parent Gateway namespace")
+            (hostnames #:list #:doc "hostnames to match")
+            (backend-service #:required #:doc "backend Service name")
+            (backend-port #:required #:doc "backend Service port")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (%custom-resource #:api "gateway.networking.k8s.io/v1" #:kind "HTTPRoute"
             #:name name #:namespace namespace #:labels labels
             #:spec `((parentRefs ((name . ,parent-name)
@@ -470,8 +532,12 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct rule
   #:head ()
-  #:fields ((api-groups #:list) (resources #:list) (non-resource-urls #:list)
-            (resource-names #:list) (verbs #:list))
+  #:doc "an RBAC policy rule (sub-construct of role/cluster-role/cluster-rbac)"
+  #:fields ((api-groups #:list #:doc "apiGroups (\"\" for core)")
+            (resources #:list #:doc "resources")
+            (non-resource-urls #:list #:doc "nonResourceURLs")
+            (resource-names #:list #:doc "resourceNames")
+            (verbs #:list #:doc "verbs (get list watch …)"))
   #:build (filter pair?
             (list (and (pair? api-groups)        (cons 'apiGroups api-groups))
                   (and (pair? resources)         (cons 'resources resources))
@@ -487,13 +553,15 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct service-account
   #:head name
-  #:fields ((namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:doc "a ServiceAccount"
+  #:fields ((namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)") (labels #:map #:doc "extra metadata.labels"))
   #:build (%service-account #:name name #:namespace namespace #:labels labels))
 
 (define-construct role
   #:head name
-  #:fields ((rule #:repeated #:construct rule)
-            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:doc "a Role from (rule …) entries"
+  #:fields ((rule #:repeated #:construct rule #:doc "one (rule …) per policy rule")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)") (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "rbac.authorization.k8s.io/v1")
               (kind . "Role")
@@ -502,8 +570,12 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct role-binding
   #:head name
-  #:fields ((namespace #:default (current-k8s-namespace)) (role #:required)
-            (service-account #:required) (sa-namespace #:default namespace) (labels #:map))
+  #:doc "a RoleBinding of a Role to a ServiceAccount"
+  #:fields ((namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (role #:required #:doc "Role name")
+            (service-account #:required #:doc "ServiceAccount name")
+            (sa-namespace #:default namespace #:doc "ServiceAccount namespace (defaults to namespace)")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (resource
             `((apiVersion . "rbac.authorization.k8s.io/v1")
               (kind . "RoleBinding")
@@ -520,7 +592,8 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct cluster-role
   #:head name
-  #:fields ((rule #:repeated #:construct rule) (labels #:map))
+  #:doc "a ClusterRole from (rule …) entries"
+  #:fields ((rule #:repeated #:construct rule #:doc "one (rule …) per policy rule") (labels #:map #:doc "extra metadata.labels"))
   #:build (%cluster-role #:name name #:rules rule #:labels labels))
 
 (define* (%cluster-role-binding #:key name role service-account
@@ -534,15 +607,19 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define-construct cluster-role-binding
   #:head name
-  #:fields ((role #:required) (service-account #:required)
-            (sa-namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:doc "a ClusterRoleBinding of a ClusterRole to a ServiceAccount"
+  #:fields ((role #:required #:doc "ClusterRole name")
+            (service-account #:required #:doc "ServiceAccount name")
+            (sa-namespace #:default (current-k8s-namespace) #:doc "ServiceAccount namespace")
+            (labels #:map #:doc "extra metadata.labels"))
   #:build (%cluster-role-binding #:name name #:role role #:service-account service-account
                                  #:sa-namespace sa-namespace #:labels labels))
 
 (define-construct cluster-rbac
   #:head name
-  #:fields ((rule #:repeated #:construct rule)
-            (namespace #:default (current-k8s-namespace)) (labels #:map))
+  #:doc "ServiceAccount + ClusterRole + ClusterRoleBinding, all named NAME"
+  #:fields ((rule #:repeated #:construct rule #:doc "one (rule …) per policy rule")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)") (labels #:map #:doc "extra metadata.labels"))
   #:build (compose-ops 'cluster-rbac (list 'cluster-rbac name)
             (list (%service-account #:name name #:namespace namespace #:labels labels)
                   (%cluster-role #:name name #:rules rule #:labels labels)
@@ -617,10 +694,17 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
 
 (define-construct app
   #:head name
-  #:fields ((image #:required) (port #:default 8080) (replicas #:default 2)
-            (namespace #:default (current-k8s-namespace))
-            (env #:list) (env-from #:list) (volumes #:list)
-            (resources #:default '()) (privileged #:flag) (service-account #:default #f))
+  #:doc "Deployment + Service (expose) for one container"
+  #:fields ((image #:required #:doc "container image ref")
+            (port #:default 8080 #:doc "containerPort (and Service port)")
+            (replicas #:default 2 #:doc "pod replicas")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (privileged #:flag #:doc "privileged securityContext")
+            (service-account #:default #f #:doc "serviceAccountName"))
   #:build (compose-ops 'app `(app ,name)
             (list (expose
                     (%deployment #:name name #:image image #:port port #:replicas replicas
@@ -630,11 +714,18 @@ JSON with yq, and appends every manifest it yields to (kubernetes_resources)."
 
 (define-construct public-app
   #:head name
-  #:fields ((image #:required) (port #:default 8080) (replicas #:default 2)
-            (namespace #:default (current-k8s-namespace))
-            (env #:list) (env-from #:list) (volumes #:list)
-            (resources #:default '()) (privileged #:flag) (service-account #:default #f)
-            (host #:default #f))
+  #:doc "app plus an Ingress on HOST"
+  #:fields ((image #:required #:doc "container image ref")
+            (port #:default 8080 #:doc "containerPort (and Service port)")
+            (replicas #:default 2 #:doc "pod replicas")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (privileged #:flag #:doc "privileged securityContext")
+            (service-account #:default #f #:doc "serviceAccountName")
+            (host #:default #f #:doc "ingress hostname (default NAME.example.com)"))
   #:build (compose-ops 'public-app `(public-app ,name)
             (list (expose
                     (%deployment #:name name #:image image #:port port #:replicas replicas

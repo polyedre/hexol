@@ -95,6 +95,10 @@ use them: `helm`/`yq` to expand charts, `sops` for inline secrets, and
 ./bin/hexol tree -i examples/kubernetes.scm                               # op tree (with hashes)
 ./bin/hexol show OP_HASH -i examples/kubernetes.scm                       # one op: source + delta
 ./bin/hexol explain regions.alpha5.network.cni -i examples/inventory.scm  # what touched a path
+
+# discover the library: which (key value) entries a construct accepts
+./bin/hexol doc                                                           # every construct (built-in libs)
+./bin/hexol doc app -i examples/kubernetes.scm                            # one construct: fields + example
 ```
 
 ## The Library

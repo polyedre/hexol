@@ -15,6 +15,7 @@ help:
 	@echo "  ./bin/hexol explain [--query K=V,…] PATH|HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol show HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol lint [-i INVENTORY]"
+	@echo "  ./bin/hexol doc [CONSTRUCT] [-i INVENTORY]"
 
 test:
 	$(GUILE) -L . test.scm

@@ -46,7 +46,37 @@
 (define-module (hexol construct)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 match)
-  #:export (define-construct %expand-call construct-flag construct-map-entries))
+  #:export (define-construct %expand-call construct-flag construct-map-entries
+            register-construct! construct-schemas find-constructs))
+
+;; ---------- schema registry ----------
+;;
+;; Every `define-construct` records its schema here at definition time (one
+;; `register-construct!` call spliced into the expansion, so a construct's
+;; call semantics are untouched). `hexol doc` reads it. A schema is an alist:
+;;   ((name . SYM) (module . (hexol k8s)) (head . (name …)) (doc . "…"|#f)
+;;    (fields . (FIELD …)))
+;; and each FIELD an alist: ((name . SYM) (kind . plain|flag|list|map|construct)
+;;   (required? . BOOL) (repeated? . BOOL) (construct . SYM|#f)
+;;   (default . DATUM|#f)   ; the #:default expression as written, or #f
+;;   (doc . "…"|#f))
+;; Keyed by name only loosely — the same name can live in two modules (sql's
+;; `references`, k8s's `rule`), so `find-constructs` returns every match.
+(define *constructs* '())
+
+(define (register-construct! schema)
+  (set! *constructs*
+        (cons schema (filter (lambda (s)
+                               (not (and (equal? (assq-ref s 'name) (assq-ref schema 'name))
+                                         (equal? (assq-ref s 'module) (assq-ref schema 'module)))))
+                             *constructs*))))
+
+;; All registered schemas, in definition order.
+(define (construct-schemas) (reverse *constructs*))
+
+;; Every schema named NAME (a symbol), in definition order.
+(define (find-constructs name)
+  (filter (lambda (s) (eq? (assq-ref s 'name) name)) (construct-schemas)))
 
 ;; Sentinel a valueless #:flag field carries: `(unique)` means `(unique #t)`.
 ;; Exposed so generated code can reference it.
@@ -120,7 +150,9 @@
 ;;   #:default E        value when the field is absent (else #f, or '() for list/map)
 ;;   #:coerce P         wrap the resolved value in (P …)
 ;;   #:wire W           (advisory; the builder decides output keys)
+;;   #:doc "…"          one-line description, shown by `hexol doc`
 ;;
+;; `#:doc "…"` at the construct level documents the construct itself.
 ;; #:head is one symbol or a list of positional params; #:open? #t passes
 ;; unknown keys through as evaluated `(k v)`/`(k a …)` attributes into the
 ;; `extra` local (an alist); #:build is the result expression with head params,
@@ -153,6 +185,7 @@
        (let* ((open?    (kw-get (syntax->datum #'(kw ...)) #:open? #f))
               (build    (kw-syntax #'(kw ...) #:build #'(error "construct: no #:build")))
               (fields-stx (stx->list (kw-syntax #'(kw ...) #:fields #'())))
+              (doc      (kw-get (syntax->datum #'(kw ...)) #:doc #f))
               ;; head identifiers kept as original syntax (with marks) so they
               ;; are the *same* bindings #:build references.
               (head-stx (kw-syntax #'(kw ...) #:head #'()))
@@ -184,12 +217,18 @@
                                ((flag) #'#f) ((list map) #''())
                                ((construct) (if rep? #''() #'#f))
                                (else #'#f))))
-                  (coerce (opt-syntax-after opts #:coerce)))
+                  (coerce (opt-syntax-after opts #:coerce))
+                  (fdoc   (and (has? #:doc) (syntax->datum (opt-syntax-after opts #:doc))))
+                  (schema `((name . ,fname) (kind . ,kind) (required? . ,req?)
+                            (repeated? . ,rep?) (construct . ,cname)
+                            (default . ,(and (has? #:default)
+                                             (syntax->datum (opt-syntax-after opts #:default))))
+                            (doc . ,fdoc))))
              ;; field-id is the ORIGINAL name identifier (car parts), marks
              ;; intact, so it is the very binding #:build references — correct
              ;; even when define-construct is itself produced by another macro
              ;; (e.g. SQL's type sugar).
-             (list fname (car parts) kind cname rep? req? deflt coerce)))
+             (list fname (car parts) kind cname rep? req? deflt coerce schema)))
          (let* ((infos    (map field-info fields-stx))
                 (fnames   (map car infos))
                 (field-ids (map cadr infos))
@@ -205,8 +244,13 @@
                       (let ((fid (cadr i)) (deflt (list-ref i 6)) (coerce (list-ref i 7)))
                         (cons #`(#,fid (if (eq? #,fid '%hx-unset) #,deflt #,fid))
                               (if coerce (list #`(#,fid (#,coerce #,fid))) '()))))
-                    infos)))
+                    infos))
+                (schema   `((name . ,name-sym) (head . ,head) (doc . ,doc)
+                            (fields . ,(map (lambda (i) (list-ref i 8)) infos)))))
            #`(begin
+               (register-construct!
+                 (cons (cons 'module (module-name (current-module)))
+                       '#,(datum->syntax #'name schema)))
                (define (#,impl #,@head-ids #,@field-ids #,extra-id)
                  (let* #,prologue #,build))
                (define-syntax name

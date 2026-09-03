@@ -55,6 +55,8 @@
              (hexol terraform)
              (hexol secret-tool)
              (hexol json)
+             (hexol construct)
+             (hexol doc)
              (srfi srfi-1)
              (srfi srfi-9)
              (ice-9 match)
@@ -781,6 +783,31 @@
         (_  (usage-error "show: want a single HASH (inventory is -i/--inventory)"))))))
 
 ;; ---------------------------------------------------------------------------
+;; doc — what `(key value)` entries a define-construct accepts
+;; ---------------------------------------------------------------------------
+;;
+;; Reads the schema registry (hexol construct) fills at definition time, so it
+;; documents whatever is *loaded*: with -i (or $HEXOL_INVENTORY) the inventory
+;; is loaded for its `use-modules` side effect — its own constructs included;
+;; without one, the built-in libraries are.
+(define (cmd-doc args)
+  (call-with-values (lambda () (extract-inventory "doc" args))
+    (lambda (inv rest)
+      (let ((inv (or inv (env-inventory))))
+        (if inv
+            (load-ops inv)
+            (for-each resolve-module '((hexol k8s) (hexol terraform) (hexol ansible)
+                                       (hexol sql) (hexol ledger)))))
+      (match rest
+        (() (print-construct-index))
+        ((name)
+         (when (string-prefix? "-" name) (usage-error "doc: unknown flag ~a" name))
+         (let ((found (find-constructs (string->symbol name))))
+           (when (null? found) (die "doc: no construct named ~a (`hexol doc' lists them)" name))
+           (for-each (lambda (s) (print-construct-doc s) (newline)) found)))
+        (_ (usage-error "doc: want a single CONSTRUCT (inventory is -i/--inventory)"))))))
+
+;; ---------------------------------------------------------------------------
 ;; secret — manage the inline (secrets-store …) in an inventory
 ;; ---------------------------------------------------------------------------
 ;;
@@ -911,6 +938,9 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 (register-verb!
  (make-verb "show" (cmd-is "show") (delegating-runner cmd-show)
    "show    HASH [-i INVENTORY]"))
+(register-verb!
+ (make-verb "doc" (cmd-is "doc") (delegating-runner cmd-doc)
+   "doc     [CONSTRUCT] [-i INVENTORY]"))
 (register-verb!
  (make-verb "secret" (cmd-is "secret") (delegating-runner cmd-secret)
    "secret  <ls|get|set|edit|rm|rekey|init> … [-i INVENTORY]"))

@@ -80,6 +80,33 @@
        '("z" "X" ((foo . "bar") (nums 1 2 3)))
        (openrec "z" (kind "X") (foo "bar") (nums 1 2 3)))
 
+;; ---- schema registry (what `hexol doc` reads) ----
+(define-construct documented
+  #:head name
+  #:doc "a documented construct"
+  #:fields ((image #:required #:doc "container image") (port #:default 8080)
+            (debug #:flag) (tags #:list) (rule #:repeated #:construct rule))
+  #:build (list name image port debug tags rule))
+(format #t "~%construct: schema registry~%")
+(let ((s (car (find-constructs 'documented))))
+  (check "registered under its name, with head and doc"
+         '((name) "a documented construct")
+         (list (assq-ref s 'head) (assq-ref s 'doc)))
+  (check "field names in definition order"
+         '(image port debug tags rule)
+         (map (lambda (f) (assq-ref f 'name)) (assq-ref s 'fields)))
+  (check "required / doc / default / flag / repeated construct recorded"
+         '((#t "container image") 8080 flag (construct #t rule))
+         (let ((f (lambda (n) (find (lambda (f) (eq? (assq-ref f 'name) n)) (assq-ref s 'fields)))))
+           (list (list (assq-ref (f 'image) 'required?) (assq-ref (f 'image) 'doc))
+                 (assq-ref (f 'port) 'default)
+                 (assq-ref (f 'debug) 'kind)
+                 (list (assq-ref (f 'rule) 'kind) (assq-ref (f 'rule) 'repeated?)
+                       (assq-ref (f 'rule) 'construct))))))
+(check "every construct of this file is registered, in order"
+       '(widget coerced rule policy sized openrec documented)
+       (map (lambda (s) (assq-ref s 'name)) (construct-schemas)))
+
 (format #t "~%~a~%" (if (zero? failures) "all construct checks passed"
                         (format #f "~a CONSTRUCT CHECK(S) FAILED" failures)))
 (exit (if (zero? failures) 0 1))
