@@ -23,6 +23,8 @@
             path->string
             ;; tracing (explain support)
             current-trace resolve-with-trace path-get
+            ;; read/write access log (lint support)
+            current-access note-read! resolve-with-access
             ;; per-op fold timing (tree -v support)
             current-timings resolve-with-timings
             ;; loader (exposed so other modules can override path resolution)
@@ -166,21 +168,56 @@ from its kind, source form, label, and the content hashes of its children."
 ;; (folds children through apply-op). Unbound -> zero timing overhead.
 (define current-timings (make-parameter #f))
 
+;; Nested-fold frames, innermost first: (prefix . outer-state). for-each-into
+;; pushes one per table entry while its body resolves, so the trace and the
+;; access log see the body's states re-embedded at their outer path
+;; ((regions alpha5 …)) and its read paths prefixed — a nested fold's deltas
+;; are attributed where the author addresses them, not to a bare sub-state.
+(define current-fold-frames (make-parameter '()))
+
+(define (embed-state s)
+  (fold (lambda (frame s) (state-set (cdr frame) (car frame) s))
+        s (current-fold-frames)))
+
+(define (full-path path)
+  (append (append-map car (reverse (current-fold-frames))) path))
+
+;; When bound to a box, collects every apply-op call's (op reads after-state)
+;; entry in fire order — like the trace, plus the state paths the effect read
+;; via note-read! (surface `get`/`attr`). current-reads is the per-effect box
+;; apply-op binds so reads land on the innermost op firing.
+(define current-access (make-parameter #f))
+(define current-reads  (make-parameter #f))
+
+(define (note-read! path)
+  "Record PATH as read by the op currently firing, when an access log is
+being collected (`resolve-with-access').  A no-op otherwise."
+  (let ((box (current-reads)))
+    (when box (set-car! box (cons (full-path path) (car box))))))
+
 (define (apply-op op state)
   "Apply OP's effect to STATE and return the new state.  When
 `current-trace' is bound to a box, records the (op . after-state) pair; when
+`current-access' is bound to a box, records (op reads after-state); when
 `current-timings' is bound to a hash table, accumulates OP's elapsed
 real-time (inclusive of children) keyed by op identity."
   (let* ((timings   (current-timings))
          (start     (and timings (get-internal-real-time)))
-         (new-state ((op-effect op) state)))
+         (log       (current-access))
+         (reads     (and log (list '())))
+         (new-state (if reads
+                        (parameterize ((current-reads reads)) ((op-effect op) state))
+                        ((op-effect op) state))))
     (when timings
       (hashq-set! timings op
                   (+ (- (get-internal-real-time) start)
                      (or (hashq-ref timings op) 0))))
     (let ((box (current-trace)))
       (when box
-        (set-car! box (cons (cons op new-state) (car box)))))
+        (set-car! box (cons (cons op (embed-state new-state)) (car box)))))
+    (when log
+      (set-car! log (cons (list op (reverse (car reads)) (embed-state new-state))
+                          (car log))))
     new-state))
 
 (define (resolve ops attributes)
@@ -196,6 +233,15 @@ under the `attributes' root key, returning the final resolved state."
 a list of (op . after-state) pairs in fire order."
   (let ((box (list '())))
     (let ((result (parameterize ((current-trace box))
+                    (resolve ops attributes))))
+      (values result (reverse (car box))))))
+
+(define (resolve-with-access ops attributes)
+  "Like `resolve', but return two values: the final state and the access log
+as a list of (op reads after-state) entries in fire order, READS being the
+paths the op's effect read via `note-read!'."
+  (let ((box (list '())))
+    (let ((result (parameterize ((current-access box))
                     (resolve ops attributes))))
       (values result (reverse (car box))))))
 
@@ -408,8 +454,12 @@ children for introspection."
            `(for-each-into ,base ,(map car table))
            (lambda (state)
              (fold (lambda (entry s)
-                     (state-set s (append base (list (car entry)))
-                                (resolve body (cdr entry))))
+                     (let ((prefix (append base (list (car entry)))))
+                       (state-set s prefix
+                                  (parameterize ((current-fold-frames
+                                                  (cons (cons prefix s)
+                                                        (current-fold-frames))))
+                                    (resolve body (cdr entry))))))
                    state table))
            (format #f "for-each-into ~a (~a)"
                    (string-join (map symbol->string base) ".")

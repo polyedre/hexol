@@ -14,6 +14,7 @@ help:
 	@echo "  ./bin/hexol tree [-i INVENTORY]"
 	@echo "  ./bin/hexol explain [--query K=V,…] PATH|HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol show HASH [-i INVENTORY]"
+	@echo "  ./bin/hexol lint [-i INVENTORY]"
 
 test:
 	$(GUILE) -L . test.scm
@@ -24,7 +25,7 @@ test-examples:
 	GUILE=$(GUILE) ./test/examples.sh
 
 build:
-	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (hexol json)) (display "build ok\n"))'
+	@$(GUILE) -L . -c '(begin (use-modules (hexol) (hexol k8s) (hexol terraform) (hexol apply) (hexol ansible) (hexol ledger) (hexol sql) (hexol json) (hexol lint)) (display "build ok\n"))'
 
 clean:
 	rm -rf ~/.cache/guile/ccache/*$(CURDIR)*

@@ -67,7 +67,7 @@
             ;; volume / env source refs
             cm sec pvc mount host-path
             ;; RBAC
-            service-account role role-binding rule
+            service-account role role-binding
             cluster-role cluster-role-binding cluster-rbac
             ;; external manifests (render-time splice)
             json-manifests cached-json-manifests remote-manifest
@@ -80,7 +80,10 @@
             compliance-check compliance-all
             check-resources-set check-cpu-limit-ge-request
             check-memory-limit-equals-request check-image-registry
-            check-no-privileged))
+            check-no-privileged)
+  ;; `rule` shadows a core binding; declare the override so importing this
+  ;; module into an inventory doesn't warn about it.
+  #:replace (rule))
 
 ;; ---------------------------------------------------------------------------
 ;; namespace scope

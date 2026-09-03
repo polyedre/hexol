@@ -159,6 +159,13 @@ Resolution is a left fold in source order. Two consequences:
    `(nginx workers)`, place the derivation *after* every op that may
    write `workers`, otherwise you'll see a stale value.
 
+`hexol lint -i INVENTORY` catches the second case: it folds the inventory
+once, recording what each op reads (`get`/`attr`) and writes, and warns
+`path P read by op X (file:line) before its last write by op Y (file:line)`
+for every read that precedes the last write to that path (or to a parent or
+child of it). Exit status is 1 when anything is reported, 0 otherwise, so it
+slots into CI. Paths under `hx-each` are reported at their full outer path.
+
 See [`model.md`](model.md) for the "load-bearing ordering" discussion.
 
 ## Secrets (inline, sops-backed)

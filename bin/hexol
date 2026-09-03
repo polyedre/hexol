@@ -15,6 +15,8 @@
 ;;;                                                  (-v: + per-op fold time)
 ;;;   hexol explain PATH|HASH             [-i INV]   ops that touched PATH
 ;;;                                                  (or every path an op changed)
+;;;   hexol lint                          [-i INV]   warn on $ reads that precede
+;;;                                                  the write they depend on
 ;;;
 ;;; Inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
 ;;;
@@ -47,6 +49,7 @@
 ;; CLI needs only the kernel — it reads inventories into ops and folds them,
 ;; never authors ops (so the hx-prefixed author surface isn't imported).
 (use-modules (hexol kernel)
+             (hexol lint)
              (hexol cache)
              (hexol yaml)
              (hexol terraform)
@@ -608,6 +611,19 @@
             (explain-path final trace (parse-path target)))))))
 
 ;; ---------------------------------------------------------------------------
+;; lint — reads that precede the write they depend on (see hexol/lint.scm)
+;; ---------------------------------------------------------------------------
+
+(define (cmd-lint args)
+  (let* ((inv      (inventory-only "lint" args))
+         (warnings (lint-ops (load-ops inv))))
+    (for-each (lambda (w) (format (current-error-port) "~a~%" (e-red (string-append "warning: " w))))
+              warnings)
+    (format (current-error-port) "~a~%"
+            (e-dim (format #f "hexol lint: ~a: ~a warning~p" inv (length warnings) (length warnings))))
+    (exit (if (null? warnings) 0 1))))
+
+;; ---------------------------------------------------------------------------
 ;; show — one op by its content hash (the hash `tree` prints)
 ;; ---------------------------------------------------------------------------
 
@@ -889,6 +905,9 @@ The inventory comes from -i/--inventory or $HEXOL_INVENTORY.")
 (register-verb!
  (make-verb "explain" (cmd-is "explain") (delegating-runner cmd-explain)
    "explain PATH|HASH [-i INVENTORY]"))
+(register-verb!
+ (make-verb "lint" (cmd-is "lint") (delegating-runner cmd-lint)
+   "lint    [-i INVENTORY]"))
 (register-verb!
  (make-verb "show" (cmd-is "show") (delegating-runner cmd-show)
    "show    HASH [-i INVENTORY]"))
