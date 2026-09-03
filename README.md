@@ -56,26 +56,40 @@ A few things this buys you over plain manifests:
 
 ## Install
 
+**Status:** 0.1.0 (`hexol --version`); see [CHANGELOG.md](CHANGELOG.md) for
+what's in it and what's coming.
+
 Hexol runs on [Guile](https://www.gnu.org/software/guile/) 3.x and needs two
 Guile libraries: **guile-json** (the `(json)` module) and **guile-libyaml**
 (the `(yaml)` module). It also uses `jq`. All of these are declared in
 [`manifest.scm`](manifest.scm), which is the source of truth for dependencies.
+Three ways to get them:
 
-The easy path is [Guix](https://guix.gnu.org/), which reads that manifest
-directly — no manual install:
+**From source** — install Guile 3.x, guile-json, guile-libyaml, and jq however
+your distro provides them (or let [Guix](https://guix.gnu.org/) read the
+manifest), then run from the checkout:
 
 ```sh
 git clone https://github.com/Polyedre/hexol && cd hexol
-guix shell -m manifest.scm -- ./bin/hexol render -i examples/kubernetes.scm
+./bin/hexol render -i examples/kubernetes.scm                                 # auto-compiles on first use
+guix shell -m manifest.scm -- ./bin/hexol render -i examples/kubernetes.scm   # with Guix
 ```
 
-(The repo's `.envrc` does this automatically under [direnv](https://direnv.net/).)
+(The repo's `.envrc` runs the `guix shell` for you under
+[direnv](https://direnv.net/).)
 
-Without Guix, install Guile 3.x plus guile-json, guile-libyaml, and jq however
-your distro provides them, then:
+**Container** — an OCI image built from [`Containerfile`](Containerfile)
+(`make image` builds it locally); mount your inventories in:
 
 ```sh
-./bin/hexol render -i examples/kubernetes.scm   # auto-compiles on first use
+podman run --rm -v "$PWD:/w" -w /w ghcr.io/polyedre/hexol render -i examples/kubernetes.scm
+```
+
+**Nix** — [`flake.nix`](flake.nix) packages the CLI and provides a dev shell:
+
+```sh
+nix run github:Polyedre/hexol -- render -i examples/kubernetes.scm
+nix develop github:Polyedre/hexol   # guile + deps in a shell
 ```
 
 The CLI itself shells out to nothing. Individual features do, and only when you
