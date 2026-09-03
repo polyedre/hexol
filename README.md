@@ -90,6 +90,9 @@ use them: `helm`/`yq` to expand charts, `sops` for inline secrets, and
 # act on it (appliers an inventory registers via `applies-with`)
 ./bin/hexol apply --list -i examples/kubernetes.scm                       # show the applier pipeline
 ./bin/hexol apply --dry-run -i examples/kubernetes.scm                    # delegate to each tool's dry-run
+./bin/hexol diff -i examples/kubernetes.scm                               # drift vs the world: exit 0 clean, 1 drift, 2 error
+./bin/hexol diff --explain -i examples/kubernetes.scm                     # each changed field + the op that set it (kubectl)
+./bin/hexol render -o yaml --validate -i examples/kubernetes.scm          # pipe the stream through kubeconform (if on PATH)
 
 # introspect: rendering is not opaque
 ./bin/hexol tree -i examples/kubernetes.scm                               # op tree (with hashes)

@@ -499,7 +499,7 @@ order."
 
 ;; What each collect! stores: a named record, not a positional tuple, so the
 ;; consumer reads named fields. A renderer carries a (state -> text) proc; an
-;; applier a (state dry? -> effects) proc; an action a (state args -> effects)
+;; applier a (state mode -> effects) proc; an action a (state args -> effects)
 ;; proc plus a one-line SYNOPSIS for --help.
 (define-record-type <renderer>
   (make-renderer name proc)
@@ -539,19 +539,19 @@ render -o NAME`.  A no-op when no collector is bound."
 
 ;; ---------- optional per-file apply adapters (effects) ----------
 ;;
-;; The mirror of renders-with, but for *effects*. An applier is a (state dry? ->
+;; The mirror of renders-with, but for *effects*. An applier is a (state mode ->
 ;; performs effects) proc: it reads its slice of resolved state and pushes it to
 ;; the world (tofu apply, kubectl apply). The inventory registers each by NAME
 ;; with applies-with; `hexol apply` runs them in *registration order* against a
-;; single resolve. --only NAME filters the set (order preserved); --dry-run is
-;; threaded as the applier's second arg, delegating to the tool's native
-;; dry-run. The parameter is #f outside apply, so applies-with is a no-op
-;; elsewhere.
+;; single resolve. --only NAME filters the set (order preserved). MODE is the
+;; applier's second arg: `apply` (push), `plan` (`--dry-run`: the tool's native
+;; dry-run), or `diff` (`hexol diff`: report drift by returning `drift`). The
+;; parameter is #f outside apply/diff, so applies-with is a no-op elsewhere.
 
 (define current-appliers (make-collector))
 
 (define (applies-with name proc)
-  "Register PROC, a (state dry? -> performs effects) applier, under string
+  "Register PROC, a (state mode -> performs effects) applier, under string
 NAME.  Appliers run under `hexol apply' in the order registered.  A no-op when
 no collector is bound."
   (collect! current-appliers (make-applier name proc)))

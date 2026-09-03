@@ -19,7 +19,9 @@
 ;;
 ;; `hexol apply` renders (kubernetes_resources) and `kubectl apply`s it against
 ;; your current kubeconfig (~/.kube/config); `--dry-run` delegates to kubectl's
-;; own `--dry-run=server`. The `wait-for` #:pre gates on the API answering first.
+;; own `--dry-run=server`, and `hexol diff` to `kubectl diff` (`--explain` fetches
+;; the live objects and names, per changed field, the op that set it). The
+;; `wait-for` #:pre gates on the API answering first.
 (appliers
   ("kubernetes"
    (kubectl-applier

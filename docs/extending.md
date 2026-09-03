@@ -207,6 +207,20 @@ introspection tools descend through it transparently.
   `(compliance_findings)`); the renderer / CI gate reads them.
 - **"I want a new surface syntax"** — add a `syntax-rules` macro in
   `hexol/surface.scm` (the k8s sugar lives in `hexol/k8s.scm`) that expands to an existing op constructor.
+- **"I want to push the state somewhere new"** — write an *applier*, a
+  `(state mode -> effects)` procedure, and name it in an `appliers` form
+  (`hexol/apply.scm`). `mode` is `'apply` (push), `'plan` (`hexol apply
+  --dry-run`: the tool's native dry-run) or `'diff` (`hexol diff`: compare
+  against the world and return the symbol `drift` when they differ — the CLI
+  exits 0 clean / 1 drift / 2 error). A legacy `(lambda (state dry?) …)`
+  still works: `#t` reads as plan, `#f` as apply. Under `hexol diff --explain`
+  the parameter `current-diff-explainer` holds a `(state-path -> prints)`
+  callback; an applier that can compute a structural diff (see
+  `kubectl-applier`, which uses `(hexol diff)` over `kubectl get -o json`)
+  calls it per changed path so each hunk names the op that set the value.
+  Appliers without one (terraform) ignore it and stream their plan. Checks
+  (`wait-for`, `check`) no-op under plan/diff; `report` and
+  `kubeconform-check` run in every mode.
 
 ## Worked example: the Terraform target
 

@@ -11,6 +11,9 @@
 ;;; same `resolve` fold:
 ;;;
 ;;;   hexol render [-o FMT] [--path P]    [-i INV]   resolve + emit (default)
+;;;                [--validate]                      (yaml: pipe to kubeconform)
+;;;   hexol apply [--only SPEC] [--dry-run] [-i INV] run the appliers (plan)
+;;;   hexol diff [--only SPEC] [--explain] [-i INV]  drift: 0 clean, 1 drift, 2 error
 ;;;   hexol tree [-v]                     [-i INV]   op tree, indented
 ;;;                                                  (-v: + per-op fold time)
 ;;;   hexol explain PATH|HASH             [-i INV]   ops that touched PATH
@@ -60,6 +63,9 @@
              (hexol json)
              (hexol construct)
              (hexol doc)
+             ((hexol apply) #:select (current-diff-explainer))
+             ((hexol sh) #:select (which-cmd))
+             (ice-9 popen)
              (srfi srfi-1)
              (srfi srfi-9)
              (ice-9 match)
@@ -264,19 +270,46 @@
 (define (cmd-render args)
   (call-with-values (lambda () (extract-inventory "render" args))
     (lambda (inv rest)
-      (let loop ((args rest) (fmt "sexp") (path #f))
+      (let loop ((args rest) (fmt "sexp") (path #f) (validate? #f))
         (match args
-          (() (do-render (inventory-or-default "render" inv) fmt path))
-          (((or "-o" "--output") f . rest) (loop rest f path))
-          (("--path" p . rest) (loop rest fmt (parse-path p)))
+          (()
+           (when (and validate? (not (string=? fmt "yaml")))
+             (usage-error "render: --validate needs -o yaml (kubeconform checks manifests)"))
+           (if validate?
+               (validate-render (lambda () (do-render (inventory-or-default "render" inv) fmt path)))
+               (do-render (inventory-or-default "render" inv) fmt path)))
+          (((or "-o" "--output") f . rest) (loop rest f path validate?))
+          (("--path" p . rest) (loop rest fmt (parse-path p) validate?))
+          (("--validate" . rest) (loop rest fmt path #t))
           ((arg . rest)
            (cond
              ((string-prefix? "--output=" arg)
-              (loop rest (flag-value "--output=" arg) path))
+              (loop rest (flag-value "--output=" arg) path validate?))
              ((string-prefix? "--path=" arg)
-              (loop rest fmt (parse-path (flag-value "--path=" arg))))
+              (loop rest fmt (parse-path (flag-value "--path=" arg)) validate?))
              ((string-prefix? "-" arg) (usage-error "render: unknown flag ~a" arg))
              (else (usage-error "render: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
+
+;; `render --validate': run RENDER (which writes the yaml stream to stdout) with
+;; stdout captured, echo it, then pipe it to `kubeconform -strict -summary' and
+;; exit with its status. kubeconform's report goes to stderr so stdout stays
+;; the bare stream (`… --validate | kubectl apply -f -' still works). Without
+;; kubeconform on PATH the stream is printed unchecked, with a warning.
+(define (validate-render render)
+  (let ((yaml (with-output-to-string render))
+        (kc   (which-cmd "kubeconform")))
+    (display yaml)
+    (force-output)
+    (cond
+      ((not kc)
+       (format (current-error-port) "~a~%"
+               (e-dim ";; render: kubeconform not on PATH — --validate skipped")))
+      (else
+       (let* ((port (with-output-to-port (current-error-port)
+                      (lambda () (open-pipe* OPEN_WRITE kc "-strict" "-summary"))))
+              (_    (display yaml port))
+              (code (status:exit-val (close-pipe port))))
+         (unless (eqv? code 0) (exit code)))))))
 
 ;; Full format list for error messages: built-ins plus `renders-with` names.
 (define builtin-formats '("sexp" "json" "yaml" "terraform" "ansible"))
@@ -317,12 +350,21 @@
 ;; ---------------------------------------------------------------------------
 ;;
 ;;   hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY]
+;;   hexol diff  [--only SPEC] [--explain]         [-i INVENTORY]
 ;;
 ;; Resolve once, then run the `applies-with` appliers in registration order,
-;; each (proc state dry?). --list prints that order. --dry-run delegates to each
-;; tool's native dry-run (pair with --only; a whole-pipeline dry-run is
-;; incoherent — k8s dry-run needs the cluster terraform builds). No hexol
-;; prompt — appliers lean on their tool's gate (`tofu apply` prompts).
+;; each (proc state mode), mode ∈ apply | plan | diff. --list prints that
+;; order. --dry-run is mode `plan`: each tool's native dry-run (pair with
+;; --only; a whole-pipeline dry-run is incoherent — k8s dry-run needs the
+;; cluster terraform builds). No hexol prompt — appliers lean on their tool's
+;; gate (`tofu apply` prompts).
+;;
+;; `diff` is mode `diff`: same pipeline, but each applier reports drift between
+;; the rendered state and the world by returning `drift`. Exit 0 clean, 1 drift,
+;; 2 error. --explain binds `current-diff-explainer` over the resolve trace, so
+;; an applier with a structural diff (kubectl) prints, under each changed path,
+;; the op that set it (label + file:line); terraform has no structural path and
+;; streams its plan as-is.
 ;;
 ;; --only SPEC selects a subset, keeping pipeline order. SPEC is comma-separated
 ;; terms, each a NAME or a jj-style range: A::B (through), A:: (to end), ::B
@@ -331,17 +373,39 @@
 (define (cmd-apply args)
   (call-with-values (lambda () (extract-inventory "apply" args))
     (lambda (inv rest)
-      (let loop ((args rest) (only #f) (dry? #f) (list? #f))
+      (let loop ((args rest) (only #f) (mode 'apply) (list? #f))
         (match args
-          (() (do-apply (inventory-or-default "apply" inv) only dry? list?))
-          (("--dry-run" . rest) (loop rest only #t list?))
-          (("--list" . rest) (loop rest only dry? #t))
-          (("--only" spec . rest) (loop rest spec dry? list?))
+          (() (do-apply (inventory-or-default "apply" inv) only mode list? #f))
+          (("--dry-run" . rest) (loop rest only 'plan list?))
+          (("--list" . rest) (loop rest only mode #t))
+          (("--only" spec . rest) (loop rest spec mode list?))
           ((arg . rest)
            (cond
-             ((string-prefix? "--only=" arg) (loop rest (flag-value "--only=" arg) dry? list?))
+             ((string-prefix? "--only=" arg) (loop rest (flag-value "--only=" arg) mode list?))
              ((string-prefix? "-" arg) (usage-error "apply: unknown flag ~a" arg))
              (else (usage-error "apply: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
+
+(define (cmd-diff args)
+  (call-with-values (lambda () (extract-inventory "diff" args))
+    (lambda (inv rest)
+      (let loop ((args rest) (only #f) (explain? #f))
+        (match args
+          (()
+           ;; Any error in a diff is exit 2 (1 is reserved for drift), so
+           ;; report it here rather than letting `main` turn it into a 1.
+           (catch #t
+             (lambda () (do-apply (inventory-or-default "diff" inv) only 'diff #f explain?))
+             (lambda (key . rest)
+               (if (eq? key 'quit)
+                   (apply exit rest)
+                   (begin (report-error key rest) (exit 2))))))
+          (("--explain" . rest) (loop rest only #t))
+          (("--only" spec . rest) (loop rest spec explain?))
+          ((arg . rest)
+           (cond
+             ((string-prefix? "--only=" arg) (loop rest (flag-value "--only=" arg) explain?))
+             ((string-prefix? "-" arg) (usage-error "diff: unknown flag ~a" arg))
+             (else (usage-error "diff: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
 ;; Select a subset of ordered APPLIERS by SPEC (see cmd-apply), in pipeline
 ;; order; errors on an unknown name or reversed range.
@@ -367,25 +431,52 @@
             ((vector-ref keep i) (pick (cdr as) (1+ i) (cons (car as) acc)))
             (else (pick (cdr as) (1+ i) acc))))))
 
-(define (do-apply inv only dry? list?)
+;; The `--explain` callback: given a state path a diff hunk changed, print the
+;; op that last set it — label and file:line — from the resolve TRACE, reusing
+;; `trace-hits`. Wrapper ops don't register hits, so this names the leaf.
+(define (make-diff-explainer trace)
+  (lambda (path)
+    (let ((hits (trace-hits trace path '((attributes)))))
+      (if (null? hits)
+          (format #t "    set by: ~a~%" (o-dim "(no op recorded for this path)"))
+          (let ((op (assq-ref (last hits) 'op)))
+            (format #t "    set by: ~a  ~a~%"
+                    (o-bold (op-display op)) (o-dim (loc->string (op-loc op)))))))))
+
+;; MODE is apply | plan | diff (see the section comment). Under diff, an applier
+;; returning `drift` marks the run; exit 1 once every chosen applier has run.
+;; EXPLAIN? (diff only) resolves with a trace and binds `current-diff-explainer`.
+(define (do-apply inv only mode list? explain?)
   (call-with-values (lambda () (load-ops+collected current-appliers inv))
     (lambda (ops appliers)
       (when (null? appliers)
-        (die "apply: ~a registers no appliers (use applies-with in the inventory)" inv))
+        (die "~a: ~a registers no appliers (use applies-with in the inventory)"
+             (if (eq? mode 'diff) "diff" "apply") inv))
       (cond
         (list?
          (note ";; ~a appliers (pipeline order):~%" (length appliers))
          (for-each (lambda (a) (format #t "  ~a~%" (applier-name a))) appliers))
         (else
          (let ((chosen (if only (select-appliers appliers only) appliers))
-               (state  (resolve ops '())))   ; resolve ONCE; appliers share it
-           (for-each
-             (lambda (a)
-               (format (current-error-port) ";; apply: ~a~a~%"
-                       (applier-name a) (if dry? " (dry-run)" ""))
-               (force-output (current-error-port))
-               ((applier-proc a) state dry?))
-             chosen)))))))
+               (drift? #f))
+           ;; resolve ONCE; appliers share the state (traced only for --explain)
+           (call-with-values
+             (lambda () (if explain? (resolve-with-trace ops '()) (values (resolve ops '()) #f)))
+             (lambda (state trace)
+               (parameterize ((current-diff-explainer (and trace (make-diff-explainer trace))))
+                 (for-each
+                   (lambda (a)
+                     (format (current-error-port) ";; ~a: ~a~a~%"
+                             (if (eq? mode 'diff) "diff" "apply")
+                             (applier-name a) (if (eq? mode 'plan) " (dry-run)" ""))
+                     (force-output (current-error-port))
+                     (when (eq? 'drift ((applier-proc a) state mode))
+                       (set! drift? #t)))
+                   chosen))))
+           (when (eq? mode 'diff)
+             (format (current-error-port) "~a~%"
+                     (if drift? (e-red ";; diff: drift detected") (e-dim ";; diff: clean")))
+             (exit (if drift? 1 0)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; tree — concise op-tree view (walks captured source recursively)
@@ -989,10 +1080,13 @@ Writes the inventory to stdout:  hexol import -f app.yaml > app.scm")
 
 (register-verb!
  (make-verb "render" (cmd-is "render") (delegating-runner cmd-render)
-   "render [-o sexp|json|yaml|terraform|ansible] [--path a.b.c] [-i INVENTORY]"))
+   "render [-o sexp|json|yaml|terraform|ansible] [--path a.b.c] [--validate] [-i INVENTORY]"))
 (register-verb!
  (make-verb "apply" (cmd-is "apply") (delegating-runner cmd-apply)
    "apply  [--only SPEC] [--dry-run] [--list] [-i INVENTORY]"))
+(register-verb!
+ (make-verb "diff" (cmd-is "diff") (delegating-runner cmd-diff)
+   "diff   [--only SPEC] [--explain] [-i INVENTORY]   (exit 0 clean, 1 drift, 2 error)"))
 (register-verb!
  (make-verb "tree" (cmd-is "tree") (delegating-runner cmd-tree)
    "tree    [-v] [-i INVENTORY]"))

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# test/fixtures/bin/tofu — PATH shim standing in for tofu in tests.
+# Appends its argv to $FAKE_LOG; `plan` exits $FAKE_PLAN_EXIT (default 0;
+# 2 = changes pending under -detailed-exitcode), `output` prints "out".
+echo "tofu $*" >> "${FAKE_LOG:-/dev/null}"
+verb=
+for a in "$@"; do case "$a" in -*) ;; *) verb=$a; break;; esac; done
+case "$verb" in
+  plan)   exit "${FAKE_PLAN_EXIT:-0}" ;;
+  output) echo out ;;
+esac
+exit 0
