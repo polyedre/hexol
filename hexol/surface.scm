@@ -55,6 +55,7 @@ current fold state.  Valid only inside a computed value ($ …) or an
 hx-when/hx-case predicate; errors otherwise."
   (let ((s (current-state)))
     (unless s (error "(attr) used outside a computed value or predicate"))
+    (note-read! (list 'attributes k))
     (state-get s (list 'attributes k))))
 
 (define (get p)
@@ -63,6 +64,7 @@ state.  Valid only inside a computed value ($ …) or an hx-when/hx-case
 predicate; errors otherwise."
   (let ((s (current-state)))
     (unless s (error "(get) used outside a computed value or predicate"))
+    (note-read! p)
     (state-get s p)))
 
 ;; ---------- string building for computed ($ …) values ----------

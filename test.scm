@@ -4,6 +4,7 @@
 
 (use-modules (hexol kernel)
              (hexol surface)
+             (hexol lint)
              (srfi srfi-1)
              (ice-9 format))
 
@@ -126,6 +127,50 @@
 (check "surface: hx-when lambda still works" 'yes
        (when-hit (resolve (hx-ops (hx-when (lambda (s) (eq? (state-get s '(attributes role)) 'web))
                                            (hx-merge (hit yes)))) '((role . web)))))
+
+(format #t "~%kernel: nested-fold provenance (hx-each) + access log~%")
+
+;; The trace records each nested op's after-state re-embedded at its outer
+;; path, so explain-style walks over the full path (regions r1 x) find the
+;; leaf op that wrote it — not just the for-each-into wrapper.
+(define inv-each
+  (hx-ops (hx-each '((r1 (n . 1)) (r2 (n . 2))) #:into regions
+            (hx-merge (x ($ (* 10 (attr 'n))))))))
+(call-with-values (lambda () (resolve-with-trace inv-each '()))
+  (lambda (final trace)
+    (define (writer path)
+      (let loop ((prev '((attributes))) (steps trace))
+        (cond ((null? steps) #f)
+              ((and (null? (op-children (caar steps)))
+                    (not (equal? (path-get prev path) (path-get (cdar steps) path))))
+               (op-kind (caar steps)))
+              (else (loop (cdar steps) (cdr steps))))))
+    (check "hx-each: final value"              20     (path-get final '(regions r2 x)))
+    (check "hx-each: leaf op blamed for r1.x"  'merge (writer '(regions r1 x)))
+    (check "hx-each: leaf op blamed for r2.x"  'merge (writer '(regions r2 x)))
+    (check "hx-each: trace tail is the full state" final (cdr (last trace)))))
+;; Read paths are prefixed the same way.
+(call-with-values (lambda () (resolve-with-access inv-each '()))
+  (lambda (final log)
+    (check "hx-each: reads prefixed" '((regions r1 attributes n))
+           (cadr (car log)))))
+
+(format #t "~%lint: stale reads~%")
+(define (lint-count ops) (length (lint-ops ops)))
+(check "lint: read after write is clean" 0
+       (lint-count (hx-ops (hx-merge (a (n 4)))
+                           (hx-merge (a (m ($ (* 2 (get '(a n)))))))))) 
+(check "lint: read before later write warns" 1
+       (lint-count (hx-ops (hx-merge (a (n 4)))
+                           (hx-merge (a (m ($ (* 2 (get '(a n)))))))
+                           (hx-merge (a (n 8))))))
+(check "lint: predicate read before write warns" 1
+       (lint-count (hx-ops (hx-when (get '(flag)) (hx-merge (hit yes)))
+                           (hx-merge (flag #t)))))
+(check "lint: message names path and ops" #t
+       (string-prefix? "path a.n read by op merge"
+                       (car (lint-ops (hx-ops (hx-merge (m ($ (get '(a n)))))
+                                              (hx-merge (a (n 8))))))))
 
 (format #t "~%example inventory: 3-region fleet (single render)~%")
 
