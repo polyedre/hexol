@@ -263,6 +263,17 @@ pass db/password | hexol secret set db/password inventory.scm   # seal a value f
 hexol secret ls inventory.scm                            # confirm
 ```
 
+## Discovering a library's constructs
+
+Every typed constructor (`deployment`, `app`, `varchar`, …) is a
+`define-construct`, and its schema — positional head, fields, which are
+required, their defaults, flags and one-line docs — is recorded when the
+module loads. `hexol doc` prints it: `hexol doc` alone lists every construct
+of the built-in libraries (name, module, one-line doc); `hexol doc app`
+prints `app`'s signature, a fields table and a minimal example built from its
+required fields; add `-i inventory.scm` to document whatever that inventory
+loads, its own `define-construct`s included. No need to read `k8s.scm`.
+
 ## Repository layout
 
 The engine ships as a Guile module named `hexol`; target libraries are
@@ -288,13 +299,14 @@ hexol/
                     #                   transform-terraform-resources + *.tf.json emitter
   ledger.scm        # (hexol ledger)   — personal-ledger writing UX + ledger-cli render
   sql.scm           # (hexol sql)      — table/column/constraint/index DSL + SQL DDL render
+  doc.scm           # (hexol doc)      — `hexol doc`: formats the define-construct schema registry
   ansible.scm       # (hexol ansible)  — inventory.yml bridge + state helpers, task/handler
                     #                    (macros over block/body) / as, `play` sink op
   secrets.scm       # (hexol secrets)  — inline sops-backed store: (secrets-store …),
                     #                    (secret-ref 'k), (resolve-secret-refs) render op
   secret-tool.scm   # (hexol secret-tool) — engine behind `hexol secret`: position-aware
                     #                    reader + sops seal/decrypt + in-place form rewrite
-bin/hexol           # the CLI: render / tree / ops / explain / secret
+bin/hexol           # the CLI: render / tree / ops / explain / secret / doc
 examples/                          # one self-contained file each
   inventory.scm    # region table + per-region body + hx-each (the engine itself)
   kubernetes.scm   # consumer of (hexol k8s): namespaced apps + compliance demo
