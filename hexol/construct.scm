@@ -362,31 +362,9 @@ the label exists before any fold."
 
 (define (construct-op label source thunk)
   "Return an op that runs THUNK at fold time with `current-state' bound and
-folds the op (or list of ops) it returns.  The produced ops are recorded as
-the op's realized children, so introspection can descend after one fold."
-  (letrec ((op (make-op 'construct source
-                        (lambda (state)
-                          ;; Re-bind the authored location too: the ops #:build
-                          ;; returns are made now, deep inside the fold, and
-                          ;; `explain' must still blame the line that wrote the
-                          ;; construct.
-                          (parameterize ((current-state state)
-                                         (current-author-loc (op-loc op)))
-                            (let* ((r   (thunk))
-                                   (ops (normalize-ops (if (op? r) (list r) r))))
-                              ;; First realization wins. One construct op fires
-                              ;; once per `hx-each` row, building a fresh set of
-                              ;; ops each time; overwriting would leave
-                              ;; introspection showing only the last row. The
-                              ;; sets are structurally the same modulo the row's
-                              ;; seed, and `show`/`explain` match by content
-                              ;; hash, so keeping the first is the stable
-                              ;; representative.
-                              (when (null? (op-realized-children op))
-                                (set-op-realized-children! op ops))
-                              (fold apply-op state ops))))
-                        label)))
-    op))
+folds the op (or list of ops) it returns.  A thin naming of the kernel's
+`op:late'."
+  (op:late 'construct source thunk label))
 
 ;; Wraps one field expression so a failure names the construct and the field.
 ;; Pre-unwind (a throw handler, not a catch) so the original stack survives for

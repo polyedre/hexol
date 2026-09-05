@@ -135,6 +135,31 @@ parenthesised form without `$` is always read as a nested map, silently:
 > evaluates where written — which, inside a deferred field, is already fold
 > time. See [`extending.md`](extending.md) for `define-construct`.
 
+## `hx-late` — when a whole form has to wait
+
+Two surfaces are still load-time, because neither has a per-field schema to
+defer: a construct's **positional head args**, and the schema-less
+`body`/`block` forms (`terraform-resource`, `terraform-settings`,
+`terraform-provider`, the ansible `task`). Wrap either in `(hx-late LABEL
+body …)` — one op, labeled LABEL, whose body is *built* when it fires, with
+the fold state bound:
+
+```scheme
+;; 1. a name computed from state (head args are eager)
+(hx-late "vault CR"
+  (custom-resource (str "vault-" (get '(env name))) (api "v1") (kind "Vault")))
+
+;; 2. the schema-less body surface
+(hx-late "db instance"
+  (terraform-resource "aws_db_instance" "main"
+    (body (instance_class (get '(db class)))
+          (allocated_storage (get '(db size-gb))))))
+```
+
+Body slots splice and stamp like `hx-ops` (an op, a list of ops, or `'()`),
+and `hexol tree --realize` shows what it built underneath it. LABEL itself is
+evaluated where written — it names the op before the fold, like a head arg.
+
 ## Helpers inside `$` and inside predicates
 
 - `(attr key)`  — read `(attributes key)` from the current fold state.

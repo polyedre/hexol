@@ -17,6 +17,12 @@ All notable changes to hexol are documented here. The format follows
   enclosing construct instead of an op; `hexol doc` shows it.
 - `current-state` is exported from `(hexol kernel)`, so an extension's own
   `make-op` effect can bind it and make `get`/`attr` work inside it.
+- `(hx-late LABEL body …)`: one op whose body is *built* at fold time, with
+  the state bound. The escape hatch for the two surfaces field deferral does
+  not reach — a construct's eager positional head args, and the schema-less
+  `body`/`block` forms (`terraform-resource`, the ansible `task`).
+- `tree --realize` folds once and shows the ops each construct produced.
+- `op:late` in `(hexol kernel)`: the primitive both of those are built on.
 
 ### Changed
 - Constructor fields (`define-construct`) are evaluated at fold time, so
@@ -26,7 +32,12 @@ All notable changes to hexol are documented here. The format follows
   `$` remains a merge-layer marker.
 - Scope forms (`with-namespace`, `with-schema`, `in-year`, …) bind their
   parameter at fold time as well as at build time, so a field defaulting to
-  `(current-k8s-namespace)` still sees the scope.
+  `(current-k8s-namespace)` still sees the scope. **A hand-rolled scope macro
+  that `parameterize`s around a `compose-ops` no longer works** — the binding
+  is gone by the time a field evaluates, and a default like
+  `(current-k8s-namespace)` silently falls back to `"default"` instead of
+  erroring. Build such macros on `scope-ops`, which binds at both times;
+  `compose-ops` binds nothing and now says so.
 - A construct's tree line now sits above the resources it produces and carries
   its head args (`configmap app-config`). Those produced ops only exist once
   the inventory folds, so `hexol tree` shows them behind the new `--realize`

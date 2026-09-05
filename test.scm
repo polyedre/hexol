@@ -282,6 +282,24 @@
            (parameterize ((current-author-loc '("b.scm" . 99)))
              (make-op 'merge '(set foo) identity "set foo"))))))
 
+(format #t "~%surface: hx-late~%")
+(let* ((ops   (hx-ops
+                (hx-merge (env (name "prod")))
+                (hx-late "late block"
+                  (op:set (list 'out) (str "app-" (get '(env name))) '(set out))
+                  ;; a slot that is a list of ops, and one contributing nothing
+                  (list (op:set (list 'n) (string-length (get '(env name))) '(set n)))
+                  '())))
+       (op    (cadr ops))
+       (final (resolve ops '())))
+  (check "hx-late is one op, labeled" '(1 "late block")
+         (list (length (cdr ops)) (op-label op)))
+  (check "its body is built at fold time, so get works"
+         '("app-prod" 4)
+         (list (state-get final '(out)) (state-get final '(n))))
+  (check "the ops it built are its realized children" 2
+         (length (op-realized-children op))))
+
 (format #t "~%kernel: scope-ops body flattening~%")
 (define current-test-scope (make-parameter #f))
 (let* ((op (scope-ops 'scoped (current-test-scope "s") "scope "

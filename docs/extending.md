@@ -125,7 +125,29 @@ and the authored `FILE:LINE`.
 
 The positional `#:head` args stay eager: they are evaluated where the call is
 written, because they form the op's label (`"deployment api"`) and its content
-hash, which introspection needs before any fold.
+hash, which introspection needs before any fold. When a head arg (or a
+schema-less `body`/`block` form) has to read state, wrap the whole form in
+`(hx-late LABEL …)`, which builds its body at fold time — see
+[`authoring.md`](authoring.md).
+
+> **Careful with load-time `parameterize`.** A macro of your own that bound a
+> library parameter around a body and bundled it with `compose-ops` —
+> ```scheme
+> (define-syntax-rule (in-ns ns body ...)                    ; DON'T
+>   (compose-ops 'in-ns '(in-ns) (parameterize ((current-k8s-namespace ns))
+>                                  (list body ...))))
+> ```
+> — used to work, because the constructs in `body` ran their `#:build` right
+> there. They no longer do: by the time a field evaluates
+> `#:default (current-k8s-namespace)` the `parameterize` has long exited, and
+> the default quietly falls back to `"default"` — wrong namespace, exit 0, no
+> error. Use `scope-ops`, which binds at build time *and* fold time:
+> ```scheme
+> (define-syntax-rule (in-ns ns body ...)                    ; DO
+>   (scope-ops 'in-ns (current-k8s-namespace ns) "namespace " body ...))
+> ```
+> `compose-ops` binds nothing, by construction: it only ever sees ops that are
+> already built, and their effects fire later still.
 
 Mark a construct **`#:value`** (a bare marker keyword) when `#:build` returns a
 value for an enclosing construct to consume rather than an op — the SQL column

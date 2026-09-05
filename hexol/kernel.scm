@@ -21,7 +21,7 @@
             op-content-hash op-short-hash fnv1a-64
             apply-op resolve normalize-ops compose-ops scope-ops for-each-into
             short-value
-            op:merge op:set op:append op:when op:case
+            op:merge op:set op:append op:when op:case op:late
             ;; state helpers
             state-get state-set state-append state-delete deep-merge
             path->string
@@ -494,6 +494,30 @@ SOURCE is the authored form."
            ;; exposes inner ops to introspection.
            (concatenate (map cdr arms))))
 
+;; Everything that has to be BUILT at fold time rather than at load time goes
+;; through here: the construct engine's deferred fields, and the author-facing
+;; `hx-late'. THUNK runs when the op fires, with the fold state bound (so
+;; `get'/`attr' work in whatever it evaluates) and this op's own authored line
+;; restored (so ops it builds deep inside the fold are still blamed on it);
+;; whatever it returns — one op or a list of ops — is then folded.
+(define* (op:late kind source thunk #:optional (label #f))
+  "Return an op of KIND that runs THUNK when it fires, with `current-state'
+and `current-author-loc' bound, then folds the op (or list of ops) THUNK
+returned.  Those ops are recorded as the op's realized children so
+introspection can descend after a fold; the FIRST realization is kept, since
+one op fires once per `for-each-into' row and each row rebuilds them."
+  (letrec ((op (make-op kind source
+                        (lambda (state)
+                          (parameterize ((current-state state)
+                                         (current-author-loc (op-loc op)))
+                            (let* ((r   (thunk))
+                                   (ops (normalize-ops (if (op? r) (list r) r))))
+                              (when (null? (op-realized-children op))
+                                (set-op-realized-children! op ops))
+                              (fold apply-op state ops))))
+                        label)))
+    op))
+
 ;; Bundle ops into ONE op whose effect folds them in order and whose children
 ;; are those ops, so introspection descends through it. The combinator every
 ;; target library uses to make a builder (app, aws-rds, fleet) look like one
@@ -528,7 +552,13 @@ SOURCE is the authored form."
   "Bundle OPS into a single op of KIND whose effect folds them in order and
 whose children are OPS, so introspection descends through it.  This is the
 combinator target libraries use to make a builder look like one operation.
-SOURCE is the authored form."
+SOURCE is the authored form.
+
+It binds NO parameters: OPS are already built by the time it sees them, and
+their effects fire later still.  A macro that wants a library parameter
+(`current-k8s-namespace', `current-sql-schema') in scope for what its body
+builds AND folds wants `scope-ops', not a `parameterize' around a
+`compose-ops'."
   (let ((ops (normalize-ops ops*)))
     (make-op kind source
              (lambda (state) (fold (lambda (op s) (apply-op op s)) state ops))

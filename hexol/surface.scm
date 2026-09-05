@@ -38,7 +38,7 @@
                op? op-kind op-source op-effect apply-op compose-ops for-each-into
                normalize-ops current-state
                renders-with applies-with)
-  #:export (hx-ops hx-each hx-merge hx-when hx-case hx-append
+  #:export (hx-ops hx-each hx-merge hx-when hx-case hx-append hx-late
             $ attr get attrs str fmt
             resource transform-resources annotate-all label-all
             block body
@@ -303,6 +303,31 @@ metadata.labels."
 (define-syntax hx-case   (syntax-rules ()  ((_ . a) (%case . a))))
 (define-syntax hx-append (syntax-rules ()  ((_ . a) (%append . a))))
 (define-syntax attrs     (syntax-rules ()  ((_ . a) (%attrs . a))))
+
+;; (hx-late LABEL body ...) -> ONE op, labeled LABEL, whose body is BUILT and
+;; folded at fold time with the state bound — so `get`/`attr` work anywhere in
+;; it, including the two places field deferral cannot reach:
+;;
+;;   • a construct's positional head args, which stay eager because they name
+;;     the op before the fold:
+;;       (hx-late "vault CR"
+;;         (custom-resource (str "vault-" (get '(env))) (api "v1") (kind "Vault")))
+;;   • the schema-less `body`/`block` surface (terraform-resource,
+;;     terraform-settings/provider, the ansible `task`), which has no per-field
+;;     schema to defer:
+;;       (hx-late "db"
+;;         (terraform-resource "aws_db_instance" "main"
+;;           (body (instance_class (get '(db class))))))
+;;
+;; Body slots splice and stamp like `hx-ops`, and the ops it builds show up
+;; under `hexol tree --realize` like a construct's do. LABEL is evaluated where
+;; written (it names the op before the fold, as a construct's head args do).
+(define-syntax hx-late
+  (syntax-rules ()
+    ((_ label body ...)
+     (op:late 'late '(late label body ...)
+              (lambda () (normalize-ops (list (stamp-loc body) ...)))
+              label))))
 
 ;; (hx-ops form ...) -> a flat list of ops. Each slot is an op or a list of ops,
 ;; flattened one level. Top-level wrapper for an inventory file (its value is
