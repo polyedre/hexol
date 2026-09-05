@@ -34,7 +34,7 @@
   #:use-module (ice-9 format)
   #:re-export (resolve state-get state-set state-append state-delete deep-merge
                op? op-kind op-source op-effect apply-op compose-ops for-each-into
-               normalize-ops
+               normalize-ops current-state
                renders-with applies-with)
   #:export (hx-ops hx-each hx-merge hx-when hx-case hx-append
             $ attr get attrs str fmt
@@ -45,10 +45,9 @@
 ;; ---------- attr / get helpers ----------
 ;;
 ;; Top-level so they're in scope wherever (hexol surface) is imported. They read
-;; a parameter bound to fold state by the deferred ops (hx-merge/hx-append) and
-;; by the hx-when/hx-case predicate/dispatch wrappers.
-
-(define current-state (make-parameter #f))
+;; `current-state' — a kernel parameter bound to the fold state by the deferred
+;; ops (hx-merge/hx-append), the hx-when/hx-case predicate/dispatch wrappers,
+;; and the construct engine's field forms.
 
 (define (attr k)
   "Read attribute K (a key under `attributes', i.e. the query) from the

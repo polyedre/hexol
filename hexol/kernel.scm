@@ -16,6 +16,7 @@
   #:export (;; ops
             make-op op? op-kind op-source op-effect op-label op-children op-loc
             current-author-loc stamp-loc relabel
+            current-state
             op-content-hash op-short-hash fnv1a-64
             apply-op resolve normalize-ops compose-ops scope-ops for-each-into
             short-value
@@ -85,6 +86,13 @@ ellipsis.  Used by error messages so a big structure can't flood stderr."
     (if (> (string-length s) limit)
         (string-append (substring s 0 limit) "…")
         s)))
+
+;; The fold state visible to author-facing readers (`get`/`attr` in (hexol
+;; surface)). Bound by every op that evaluates author expressions at fold time
+;; — the deferred merge/append values, hx-when/hx-case predicates, and the
+;; construct engine's field forms. Lives here, not in the surface, because
+;; (hexol construct) and extension-authored `make-op` effects must bind it too.
+(define current-state (make-parameter #f))
 
 ;; (file . line) of the authored form currently evaluating, bound by the
 ;; body-taking macros (inventory/when/case/with-namespace). make-op snapshots
