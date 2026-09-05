@@ -15,6 +15,7 @@
   #:use-module (rnrs bytevectors)
   #:export (;; ops
             make-op op? op-kind op-source op-effect op-label op-children op-loc
+            op-realized-children set-op-realized-children!
             current-author-loc stamp-loc relabel
             current-state
             op-content-hash op-short-hash fnv1a-64
@@ -47,7 +48,7 @@
 ;; ---------- op record ----------
 
 (define-record-type <op>
-  (%make-op kind source effect label children loc)
+  (%make-op kind source effect label children loc realized)
   op?
   (kind   op-kind)
   (source op-source)
@@ -65,7 +66,13 @@
   ;; op is built deep in a library helper ((public-app ...) -> several resource
   ;; ops, all blamed on the public-app call). #f if unknown. From
   ;; current-author-loc.
-  (loc      op-loc))
+  (loc      op-loc)
+  ;; A one-element box holding the ops this op's effect actually produced and
+  ;; folded, filled in when it fires. A deferred construct only knows its
+  ;; children once it runs, and `hexol tree' shows them after a trial fold.
+  ;; Deliberately NOT `children': that field feeds op-content-hash, and an
+  ;; op's address must not change just because it has been folded once.
+  (realized op-realized))
 
 ;; One-line printer. Without it an op prints its whole source form and child
 ;; tree — an error mentioning a top-level op could dump hundreds of kilobytes.
@@ -106,7 +113,17 @@ SOURCE is the authored form for debugging, LABEL an optional one-line
 description (#f falls back to KIND), and CHILDREN the nested ops for
 introspection.  The op's source location is snapshotted from
 `current-author-loc'."
-  (%make-op kind source effect label children (current-author-loc)))
+  (%make-op kind source effect label children (current-author-loc) (list '())))
+
+(define (op-realized-children op)
+  "The ops OP's effect produced the last time it fired, or '() if it has not
+fired (or produces none).  Unlike `op-children' this is discovered, not
+declared, so it is excluded from `op-content-hash'."
+  (car (op-realized op)))
+
+(define (set-op-realized-children! op ops)
+  "Record OPS as the ops OP's effect produced while firing."
+  (set-car! (op-realized op) ops))
 
 ;; Stamps a domain identity ("resource Deployment/api", "tx Rent") onto an op
 ;; built by a generic constructor (op:append/op:merge) that otherwise carries a
@@ -116,7 +133,7 @@ introspection.  The op's source location is snapshotted from
   "Return OP with its LABEL replaced, preserving kind, source, effect,
 children, and source location."
   (%make-op (op-kind op) (op-source op) (op-effect op)
-            label (op-children op) (op-loc op)))
+            label (op-children op) (op-loc op) (op-realized op)))
 
 ;; (stamp-loc form) evaluates form with current-author-loc bound to form's own
 ;; source location, so ops built while it runs are blamed on the authored line.

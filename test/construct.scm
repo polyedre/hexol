@@ -4,6 +4,9 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (hexol construct)
+             (hexol kernel)
+             (hexol surface)
+             (hexol lint)
              (srfi srfi-1)
              (ice-9 format))
 
@@ -130,6 +133,64 @@
 (check "every construct of this file is registered, in order"
        '(widget coerced rule policy sized openrec documented)
        (map (lambda (s) (assq-ref s 'name)) (construct-schemas)))
+
+;; ---- fold-time fields: get / attr work bare inside a construct ----
+;;
+;; A construct without #:value returns an op; its field expressions run when
+;; that op fires, so they read whatever the fold has written so far.
+(define-construct thing
+  #:head name
+  #:fields ((image #:required) (n #:default 1))
+  #:build (op:set '(out) (list name image n) (list 'thing name)))
+
+(format #t "~%construct: fold-time field values~%")
+(check "a construct call is an op, not its built value"
+       #t (op? (thing "api" (image "i"))))
+(check "(get …) in a field reads what an earlier hx-merge wrote"
+       '("api" "r.io/api" 3)
+       (state-get (resolve (hx-ops
+                             (hx-merge (cfg (registry "r.io") (replicas 3)))
+                             (thing "api"
+                                    (image (str (get '(cfg registry)) "/api"))
+                                    (n (get '(cfg replicas)))))
+                           '())
+                  '(out)))
+(check "(attr …) in a field sees the per-row seed inside hx-each"
+       '("web" "db")
+       (let ((final (resolve (hx-ops
+                               (hx-each '((r1 . ((role . "web"))) (r2 . ((role . "db"))))
+                                        #:into rows
+                                        (thing "x" (image (attr 'role)))))
+                             '())))
+         (list (cadr (state-get final '(rows r1 out)))
+               (cadr (state-get final '(rows r2 out))))))
+(check "the head arg still names the op before any fold"
+       "thing api" (op-label (thing "api" (image "i"))))
+(check "realized children are exposed after one fold"
+       '(1 set)
+       (let* ((op (thing "api" (image "i")))
+              (_  (resolve (list op) '())))
+         (list (length (op-realized-children op))
+               (op-kind (car (op-realized-children op))))))
+
+(format #t "~%construct: fold-time field errors~%")
+(check "a failing field names the construct and the field"
+       #t
+       (catch #t
+         (lambda () (resolve (hx-ops (thing "api" (image (error "boom")))) '()) #f)
+         (lambda (key . args)
+           (and (string-contains (format #f "~a ~a" key args) "thing: field (image …)")
+                #t))))
+
+(format #t "~%construct: lint sees reads made inside a field~%")
+(check "a field read before the write it depends on is reported"
+       #t
+       (let ((warnings (lint-ops (hx-ops
+                                   (thing "api" (image (get '(cfg registry))))
+                                   (hx-merge (cfg (registry "r.io")))))))
+         (and (= (length warnings) 1)
+              (string-contains (car warnings) "cfg.registry")
+              #t)))
 
 (format #t "~%~a~%" (if (zero? failures) "all construct checks passed"
                         (format #f "~a CONSTRUCT CHECK(S) FAILED" failures)))

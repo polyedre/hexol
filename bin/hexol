@@ -598,8 +598,23 @@
             (line bars last? (label-paint (label-from-source form))))
     (walk-children form (concatenate (list bars (list (not last?)))))))
 
+;; The children to show under OP. Declared children first; a deferred construct
+;; has none until it has fired, and then reports what it actually produced (see
+;; `realize-ops!'). A produced op that is a bare composer (compose-ops leaves
+;; its label #f) would only print its kind again under the construct's own
+;; line, so its children stand in for it.
+(define (display-children op)
+  (let ((declared (op-children op)))
+    (if (pair? declared)
+        declared
+        (append-map (lambda (o)
+                      (if (and (not (op-label o)) (pair? (op-children o)))
+                          (op-children o)
+                          (list o)))
+                    (op-realized-children op)))))
+
 (define (walk-op-children op bars)
-  (let ((children (op-children op)))
+  (let ((children (display-children op)))
     (cond
       ((not (null? children))
        (walk-list children bars walk-op))
@@ -623,19 +638,21 @@
   (call-with-values (lambda () (extract-verbose args))
     (lambda (verbose? rest)
       (let* ((inv (inventory-only "tree" rest))
-             (ops (load-ops inv)))
+             (ops (load-ops inv))
+             ;; Fold before measuring hash widths: the fold is what gives
+             ;; deferred constructs their children, and they need addresses too.
+             (timings (and verbose? (make-hash-table))))
+        (if timings
+            ;; Times include children (a parent totals its subtree). Seeded
+            ;; with the empty query, like `render`.
+            (false-if-exception (resolve-with-timings ops '() timings))
+            (realize-ops! ops))
         (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
           (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
-          (if verbose?
-              ;; Fold once to measure each op's time, then annotate the tree.
-              ;; Times include children (a parent totals its subtree). Seeded
-              ;; with the empty query, like `render`.
-              (let ((timings (make-hash-table)))
-                (resolve-with-timings ops '() timings)
-                (note ";; -v: fold time per op (inclusive of children)~%")
-                (parameterize ((tree-timings timings))
-                  (walk-list ops '() walk-op)))
-              (walk-list ops '() walk-op)))))))
+          (when timings
+            (note ";; -v: fold time per op (inclusive of children)~%"))
+          (parameterize ((tree-timings timings))
+            (walk-list ops '() walk-op)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; explain — every op that changed a path during the fold
@@ -750,7 +767,17 @@
 ;; Every op in the tree, depth-first (parents before children), so a hash
 ;; prefix matches the whole tree, not just the top level.
 (define (tree-op-list ops)
-  (append-map (lambda (op) (cons op (tree-op-list (op-children op)))) ops))
+  (append-map (lambda (op)
+                (cons op (tree-op-list (append (op-children op)
+                                               (op-realized-children op)))))
+              ops))
+
+;; Fold OPS once, discarding the state, so every deferred construct records the
+;; ops it produced (`op-realized-children') and introspection can descend into
+;; them. Failures are swallowed: a tree of an inventory that does not resolve is
+;; still worth printing, just without the realized layer.
+(define (realize-ops! ops)
+  (false-if-exception (resolve ops (list))))
 
 ;; Resolve a hash PREFIX against every op in the tree. Returns matching ops
 ;; (empty when none match, so callers can fall back to other addressing). Exits
@@ -862,6 +889,7 @@
 
 (define (do-show inv prefix)
   (let* ((ops     (load-ops inv))
+         (_       (realize-ops! ops))   ; addresses inside deferred constructs
          (matches (hash-matches ops prefix)))
     (cond
       ((null? matches)
@@ -877,7 +905,7 @@
          (note ";; label:     ~a~%" (op-display op))
          (note ";; location~p: ~a~%" (length matches)
                (string-join (map (lambda (o) (loc->string (op-loc o))) matches) ", "))
-         (let ((kids (op-children op)))
+         (let ((kids (display-children op)))
            (unless (null? kids)
              (note ";; children (~a):~%" (length kids))
              (for-each (lambda (k)

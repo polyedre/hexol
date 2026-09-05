@@ -48,12 +48,30 @@
 ;;; bound as a local (resolved: default-filled, coerced, collected), like a
 ;;; `define*` body sees its `#:key` args. It may return any value — a plain
 ;;; alist (a sub-block) or an op (a resource). The library decides.
+;;;
+;;; WHEN fields evaluate. A construct call does NOT run its `#:build` where it
+;;; is written: it returns an op, and the field expressions (plus `#:default`
+;;; and `#:coerce`) run when that op fires, with `current-state` bound. So the
+;;; surface's `get`/`attr` work bare in any field —
+;;;
+;;;   (deployment "api" (image (str (get '(cfg registry)) "/api"))
+;;;                     (replicas (get '(cfg replicas))))
+;;;
+;;; — reading whatever the merges before it in the fold have written. The
+;;; positional HEAD args stay eager: they name the thing, and the op's label
+;;; ("deployment api") has to exist before the fold.
+;;;
+;;; A `#:value` construct is the exception: it returns data for an enclosing
+;;; construct to consume (a sql column, a Gateway listener), so it evaluates
+;;; where it is written — which, inside a deferred field, is already fold time.
 
 (define-module (hexol construct)
+  #:use-module (hexol kernel)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 match)
   #:export (define-construct %expand-call construct-flag construct-map-entries
             construct-map-key construct-map-pair construct-map-splice
+            construct-op construct-label construct-field
             register-construct! construct-schemas find-constructs))
 
 ;; ---------- schema registry ----------
@@ -311,6 +329,51 @@
                                    #'#,impl
                                    '#,(datum->syntax #'name value?)))))))))))
 
+;; ---------- fold-time construct ops ----------
+;;
+;; A deferred construct call expands into `construct-op`: the authored form is
+;; the op's source (so its content hash is per-call-site), the label is the
+;; construct name plus its head args (computed at load, before any fold), and
+;; the effect runs THUNK — the `%…-impl` call, i.e. defaults, coercions and
+;; every field expression — with `current-state` bound, then folds whatever it
+;; returned (one op or a list of ops).
+
+(define (construct-label name args)
+  "The op label for a construct call: NAME plus its head ARGS, e.g.
+\"deployment api\".  Head args are evaluated where the call is written, so
+the label exists before any fold."
+  (string-join (cons name (map (lambda (a) (format #f "~a" a)) args)) " "))
+
+(define (construct-op label source thunk)
+  "Return an op that runs THUNK at fold time with `current-state' bound and
+folds the op (or list of ops) it returns.  The produced ops are recorded as
+the op's realized children, so introspection can descend after one fold."
+  (letrec ((op (make-op 'construct source
+                        (lambda (state)
+                          (parameterize ((current-state state))
+                            (let* ((r   (thunk))
+                                   (ops (normalize-ops (if (op? r) (list r) r))))
+                              (set-op-realized-children! op ops)
+                              (fold apply-op state ops))))
+                        label)))
+    op))
+
+;; Wraps one field expression so a failure names the construct and the field.
+;; Pre-unwind (a throw handler, not a catch) so the original stack survives for
+;; --backtrace; `apply-op' adds the FILE:LINE of the authored call on the way
+;; out, exactly as it does for any other fold-time error.
+(define (construct-field name field thunk)
+  "Evaluate THUNK, re-throwing any error prefixed with \"NAME: field (FIELD …)\"."
+  (with-throw-handler #t
+    thunk
+    (lambda (key . args)
+      (match args
+        ((subr (? string? msg) margs . rest)
+         (apply throw key subr (string-append "~a: " msg)
+                (cons (format #f "~a: field (~a …)" name field) (or margs '()))
+                rest))
+        (_ #f)))))
+
 ;; Runtime expander every generated `name` transformer calls. Splits the call
 ;; into positional head args + `(key …)` entries, computes each field's value
 ;; form by kind, checks required/unknown, emits one positional call to `%impl`
@@ -333,6 +396,15 @@
                              (cons (list k e) acc))))
                      '() entries))
        (define unset #''%hx-unset)
+       ;; Name the construct and field if this expression fails mid-fold. Only
+       ;; for deferred constructs: a value construct's fields run at load, where
+       ;; Guile already blames the right line.
+       (define (blame fn form)
+         (if value?
+             form
+             #`(construct-field '#,(datum->syntax impl name)
+                                '#,(datum->syntax impl fn)
+                                (lambda () #,form))))
        (define (field-form desc)
          (let* ((fn (list-ref desc 0)) (kind (list-ref desc 1))
                 (rep? (list-ref desc 2)) (cell (assq fn grouped))
@@ -368,7 +440,7 @@
            (let* ((k (caar unknowns)) (near (nearest k fnames)))
              (error (format #f "~a: unknown field (~a …)~a" name k
                             (if near (format #f " — did you mean (~a …)?" (car near)) "")))))
-         (let ((field-forms (map field-form descs))
+         (let ((field-forms (map (lambda (d) (blame (car d) (field-form d))) descs))
                (extra-form
                  (if open?
                      #`(list #,@(map (lambda (g)
@@ -377,5 +449,21 @@
                                                  #,(if (= (length a) 1) (car a) #`(list #,@a)))))
                                      unknowns))
                      #''())))
-           #`(#,impl #,@pos #,@field-forms #,extra-form)))))))
+           (if value?
+               ;; A value construct evaluates where it is written.
+               #`(#,impl #,@pos #,@field-forms #,extra-form)
+               ;; Everything else becomes an op: head args eagerly (they make
+               ;; the label), fields inside the fold-time thunk.
+               ;; `impl' is an identifier, so it is a valid datum->syntax
+               ;; context (the whole call `s' is a list, and would not wrap).
+               (let ((pos-ids (map (lambda (i)
+                                     (datum->syntax impl (string->symbol
+                                                           (format #f "%hx-pos~a" i))))
+                                   (iota (length pos)))))
+                 #`(let #,(map (lambda (id p) #`(#,id #,p)) pos-ids pos)
+                     (construct-op
+                       (construct-label #,(symbol->string name) (list #,@pos-ids))
+                       '#,(datum->syntax impl (syntax->datum s))
+                       (lambda ()
+                         (#,impl #,@pos-ids #,@field-forms #,extra-form))))))))))))
 
