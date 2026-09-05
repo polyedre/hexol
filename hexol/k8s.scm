@@ -39,6 +39,12 @@
 ;;;     (env-from (cm "api-config"))            ; whole-source env injection
 ;;;     (volumes  (mount (sec "tls") "/etc/tls")); mounted volume
 ;;;
+;;; Every workload construct (deployment/daemonset/stateful-set/job/cron-job)
+;;; shares one pod template, hence the same placement and hardening fields:
+;;;   (security-context …) (container-security-context …) (node-selector …)
+;;;   (tolerations …) (affinity …) (annotations …) (pod-annotations …)
+;;;   (service-account "…") (priority-class "…")
+;;;
 ;;; Composites:  (app …) (public-app …)
 ;;; Transforms / policy:  (tls-all) (checksum-config) (compliance-all registry)
 ;;;
@@ -210,9 +216,13 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 
 (define* (container-alist #:key name image (port 0) (args '()) (command '())
                           (env '()) (env-from '()) (volumes '()) (resources '())
-                          (privileged #f) (capabilities '()) (host-port #f) (protocol #f))
+                          (privileged #f) (capabilities '()) (host-port #f) (protocol #f)
+                          (security-context '()))
   (let ((resources (normalize-resources resources))
-        (sec-ctx   (append (if privileged '((privileged . #t)) '())
+        ;; explicit container securityContext first, then the `privileged'
+        ;; flag and `capabilities' sugar (which stay authoritative)
+        (sec-ctx   (append security-context
+                           (if privileged '((privileged . #t)) '())
                            (if (pair? capabilities)
                                `((capabilities (add ,@capabilities))) '()))))
     `((name . ,name)
@@ -234,20 +244,30 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                              (resources '()) (privileged #f) (args '()) (command '())
                              (service-account #f) (host-network #f) (host-pid #f)
                              (labels '()) (capabilities '()) (host-port #f) (protocol #f)
-                             (restart-policy #f))
+                             (restart-policy #f) (security-context '())
+                             (container-security-context '()) (node-selector '())
+                             (tolerations '()) (affinity '()) (pod-annotations '())
+                             (priority-class #f))
   "The pod template shared by every workload kind (Deployment, DaemonSet,
 StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
-  `((metadata (labels (app . ,name) ,@labels))
+  `((metadata (labels (app . ,name) ,@labels)
+              ,@(if (null? pod-annotations) '() `((annotations ,@pod-annotations))))
     (spec ,@(if service-account `((serviceAccountName . ,service-account)) '())
           ,@(if host-network '((hostNetwork . #t)) '())
           ,@(if host-pid '((hostPID . #t)) '())
           ,@(if restart-policy `((restartPolicy . ,restart-policy)) '())
+          ,@(if priority-class `((priorityClassName . ,priority-class)) '())
+          ,@(if (null? node-selector) '() `((nodeSelector ,@node-selector)))
+          ,@(if (null? tolerations) '() `((tolerations ,@tolerations)))
+          ,@(if (null? affinity) '() `((affinity ,@affinity)))
+          ,@(if (null? security-context) '() `((securityContext ,@security-context)))
           (containers ,(container-alist #:name name #:image image #:port port
                                         #:args args #:command command
                                         #:env env #:env-from env-from #:volumes volumes
                                         #:resources resources #:privileged privileged
                                         #:capabilities capabilities
-                                        #:host-port host-port #:protocol protocol))
+                                        #:host-port host-port #:protocol protocol
+                                        #:security-context container-security-context))
           ,@(let ((vs (volume-entries volumes)))
               (if (null? vs) '() `((volumes ,@vs)))))))
 
@@ -256,10 +276,15 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
                          (resources '()) (privileged #f) (args '()) (command '())
                          (service-account #f) (host-network #f) (host-pid #f)
                          (labels '()) (capabilities '()) (host-port #f) (protocol #f)
-                         (spec-extra '()))
+                         (spec-extra '())
+                         (security-context '()) (container-security-context '())
+                         (node-selector '()) (tolerations '()) (affinity '())
+                         (annotations '()) (pod-annotations '()) (priority-class #f)
+)
   `((apiVersion . "apps/v1")
     (kind . ,kind)
-    (metadata ,@(k8s-metadata name namespace labels))
+    (metadata ,@(k8s-metadata name namespace labels)
+              ,@(if (null? annotations) '() `((annotations ,@annotations))))
     (spec ,@(if replicas `((replicas . ,replicas)) '())
           (selector (matchLabels (app . ,name)))
           ,@spec-extra
@@ -269,7 +294,13 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
                         #:args args #:command command #:service-account service-account
                         #:host-network host-network #:host-pid host-pid #:labels labels
                         #:capabilities capabilities #:host-port host-port
-                        #:protocol protocol)))))
+                        #:protocol protocol
+                        #:security-context security-context
+                        #:container-security-context container-security-context
+                        #:node-selector node-selector #:tolerations tolerations
+                        #:affinity affinity #:pod-annotations pod-annotations
+                        #:priority-class priority-class
+                        )))))
 
 
 ;; ---------------------------------------------------------------------------
@@ -294,12 +325,20 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
 
 (define* (%deployment #:key name image (port 8080) (replicas 1) (namespace (current-k8s-namespace))
                       (env '()) (env-from '()) (volumes '()) (resources '()) (privileged #f)
-                      (args '()) (command '()) (service-account #f) (labels '()))
+                      (args '()) (command '()) (service-account #f) (labels '())
+                      (security-context '()) (container-security-context '())
+                      (node-selector '()) (tolerations '()) (affinity '())
+                      (annotations '()) (pod-annotations '()) (priority-class #f))
   (resource (workload-alist #:kind "Deployment" #:name name #:image image #:port port
                             #:replicas replicas #:namespace namespace #:env env #:env-from env-from
                             #:volumes volumes #:resources resources #:privileged privileged
                             #:args args #:command command #:service-account service-account
-                            #:labels labels)))
+                            #:labels labels
+                            #:security-context security-context
+                            #:container-security-context container-security-context
+                            #:node-selector node-selector #:tolerations tolerations
+                            #:affinity affinity #:annotations annotations
+                            #:pod-annotations pod-annotations #:priority-class priority-class)))
 
 (define-construct deployment
   #:head name
@@ -316,11 +355,24 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
             (args #:list #:doc "container args")
             (command #:list #:doc "container command (entrypoint override)")
             (service-account #:default #f #:doc "serviceAccountName")
-            (labels #:map #:doc "extra metadata.labels"))
+            (labels #:map #:doc "extra metadata.labels")
+            (security-context #:map #:doc "pod-level securityContext")
+            (container-security-context #:map #:doc "container-level securityContext")
+            (node-selector #:map #:doc "pod nodeSelector")
+            (tolerations #:list #:doc "raw toleration alists")
+            (affinity #:map #:doc "pod affinity (raw)")
+            (annotations #:map #:doc "extra metadata.annotations")
+            (pod-annotations #:map #:doc "extra pod-template annotations")
+            (priority-class #:default #f #:doc "priorityClassName"))
   #:build (%deployment #:name name #:image image #:port port #:replicas replicas
                        #:namespace namespace #:env env #:env-from env-from #:volumes volumes
                        #:resources resources #:privileged privileged #:args args #:command command
-                       #:service-account service-account #:labels labels))
+                       #:service-account service-account #:labels labels
+                       #:security-context security-context
+                       #:container-security-context container-security-context
+                       #:node-selector node-selector #:tolerations tolerations
+                       #:affinity affinity #:annotations annotations
+                       #:pod-annotations pod-annotations #:priority-class priority-class))
 
 (define-construct daemonset
   #:head name
@@ -341,13 +393,26 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
             (labels #:map #:doc "extra metadata.labels")
             (capabilities #:list #:doc "securityContext.capabilities.add")
             (host-port #:default #f #:doc "hostPort for the container port")
-            (protocol #:default #f #:doc "port protocol (TCP/UDP)"))
+            (protocol #:default #f #:doc "port protocol (TCP/UDP)")
+            (security-context #:map #:doc "pod-level securityContext")
+            (container-security-context #:map #:doc "container-level securityContext")
+            (node-selector #:map #:doc "pod nodeSelector")
+            (tolerations #:list #:doc "raw toleration alists")
+            (affinity #:map #:doc "pod affinity (raw)")
+            (annotations #:map #:doc "extra metadata.annotations")
+            (pod-annotations #:map #:doc "extra pod-template annotations")
+            (priority-class #:default #f #:doc "priorityClassName"))
   #:build (resource (workload-alist #:kind "DaemonSet" #:name name #:image image #:port port
                                     #:replicas #f #:namespace namespace #:env env #:env-from env-from
                                     #:volumes volumes #:resources resources #:privileged privileged
                                     #:args args #:command command #:service-account service-account
                                     #:host-network host-network #:host-pid host-pid #:labels labels
-                                    #:capabilities capabilities #:host-port host-port #:protocol protocol)))
+                                    #:capabilities capabilities #:host-port host-port #:protocol protocol
+                                    #:security-context security-context
+                                    #:container-security-context container-security-context
+                                    #:node-selector node-selector #:tolerations tolerations
+                                    #:affinity affinity #:annotations annotations
+                                    #:pod-annotations pod-annotations #:priority-class priority-class)))
 
 (define-construct service
   #:head name
@@ -518,7 +583,15 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
             (storage-class #:default #f #:doc "storageClassName of the generated claim")
             (access-mode #:default "ReadWriteOnce" #:doc "access mode of the generated claim")
             (volume-claim-templates #:list #:doc "extra raw volumeClaimTemplate alists")
-            (labels #:map #:doc "extra metadata.labels"))
+            (labels #:map #:doc "extra metadata.labels")
+            (security-context #:map #:doc "pod-level securityContext")
+            (container-security-context #:map #:doc "container-level securityContext")
+            (node-selector #:map #:doc "pod nodeSelector")
+            (tolerations #:list #:doc "raw toleration alists")
+            (affinity #:map #:doc "pod affinity (raw)")
+            (annotations #:map #:doc "extra metadata.annotations")
+            (pod-annotations #:map #:doc "extra pod-template annotations")
+            (priority-class #:default #f #:doc "priorityClassName"))
   #:build (let* ((mounts (if storage
                              (append volumes (list (mount (claim claim-name) mount-path)))
                              volumes))
@@ -536,6 +609,11 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
                               #:env-from env-from #:volumes mounts #:resources resources
                               #:privileged privileged #:args args #:command command
                               #:service-account service-account #:labels labels
+                              #:security-context security-context
+                              #:container-security-context container-security-context
+                              #:node-selector node-selector #:tolerations tolerations
+                              #:affinity affinity #:annotations annotations
+                              #:pod-annotations pod-annotations #:priority-class priority-class
                               #:spec-extra
                               `((serviceName . ,service-name)
                                 ,@(if (null? claims) '() `((volumeClaimTemplates ,@claims))))))))
@@ -544,6 +622,10 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
 (define* (job-spec-alist #:key name image (env '()) (env-from '()) (volumes '())
                          (resources '()) (privileged #f) (args '()) (command '())
                          (service-account #f) (labels '()) (restart-policy "OnFailure")
+                         (security-context '()) (container-security-context '())
+                         (node-selector '()) (tolerations '()) (affinity '())
+                         (pod-annotations '()) (priority-class #f)
+
                          (backoff-limit 6) (completions #f) (parallelism #f)
                          (active-deadline-seconds #f) (ttl-seconds-after-finished #f))
   `((backoffLimit . ,backoff-limit)
@@ -556,7 +638,13 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
                                     #:volumes volumes #:resources resources
                                     #:privileged privileged #:args args #:command command
                                     #:service-account service-account #:labels labels
-                                    #:restart-policy restart-policy))))
+                                    #:restart-policy restart-policy
+                                    #:security-context security-context
+                                    #:container-security-context container-security-context
+                                    #:node-selector node-selector #:tolerations tolerations
+                                    #:affinity affinity #:pod-annotations pod-annotations
+                                    #:priority-class priority-class
+                                    ))))
 
 (define-construct job
   #:head name
@@ -576,11 +664,20 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
             (parallelism #:default #f #:doc "spec.parallelism")
             (active-deadline-seconds #:default #f #:doc "spec.activeDeadlineSeconds")
             (ttl-seconds-after-finished #:default #f #:doc "delete the Job this long after it ends")
-            (labels #:map #:doc "extra metadata.labels"))
+            (labels #:map #:doc "extra metadata.labels")
+            (security-context #:map #:doc "pod-level securityContext")
+            (container-security-context #:map #:doc "container-level securityContext")
+            (node-selector #:map #:doc "pod nodeSelector")
+            (tolerations #:list #:doc "raw toleration alists")
+            (affinity #:map #:doc "pod affinity (raw)")
+            (annotations #:map #:doc "extra metadata.annotations")
+            (pod-annotations #:map #:doc "extra pod-template annotations")
+            (priority-class #:default #f #:doc "priorityClassName"))
   #:build (resource
             `((apiVersion . "batch/v1")
               (kind . "Job")
-              (metadata ,@(k8s-metadata name namespace labels))
+              (metadata ,@(k8s-metadata name namespace labels)
+                        ,@(if (null? annotations) '() `((annotations ,@annotations))))
               (spec ,@(job-spec-alist #:name name #:image image #:env env #:env-from env-from
                                       #:volumes volumes #:resources resources
                                       #:args args #:command command
@@ -589,7 +686,12 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
                                       #:backoff-limit backoff-limit
                                       #:completions completions #:parallelism parallelism
                                       #:active-deadline-seconds active-deadline-seconds
-                                      #:ttl-seconds-after-finished ttl-seconds-after-finished)))))
+                                      #:ttl-seconds-after-finished ttl-seconds-after-finished
+                                      #:security-context security-context
+                                      #:container-security-context container-security-context
+                                      #:node-selector node-selector #:tolerations tolerations
+                                      #:affinity affinity
+                                      #:pod-annotations pod-annotations #:priority-class priority-class)))))
 
 (define-construct cron-job
   #:head name
@@ -612,11 +714,20 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
             (restart-policy #:default "OnFailure" #:doc "OnFailure/Never")
             (backoff-limit #:default 6 #:doc "retries before one run fails")
             (time-zone #:default #f #:doc "spec.timeZone")
-            (labels #:map #:doc "extra metadata.labels"))
+            (labels #:map #:doc "extra metadata.labels")
+            (security-context #:map #:doc "pod-level securityContext")
+            (container-security-context #:map #:doc "container-level securityContext")
+            (node-selector #:map #:doc "pod nodeSelector")
+            (tolerations #:list #:doc "raw toleration alists")
+            (affinity #:map #:doc "pod affinity (raw)")
+            (annotations #:map #:doc "extra metadata.annotations")
+            (pod-annotations #:map #:doc "extra pod-template annotations")
+            (priority-class #:default #f #:doc "priorityClassName"))
   #:build (resource
             `((apiVersion . "batch/v1")
               (kind . "CronJob")
-              (metadata ,@(k8s-metadata name namespace labels))
+              (metadata ,@(k8s-metadata name namespace labels)
+                        ,@(if (null? annotations) '() `((annotations ,@annotations))))
               (spec (schedule . ,schedule)
                     ,@(if time-zone `((timeZone . ,time-zone)) '())
                     (concurrencyPolicy . ,concurrency-policy)
@@ -633,7 +744,12 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
                                               #:service-account service-account
                                               #:labels labels
                                               #:restart-policy restart-policy
-                                              #:backoff-limit backoff-limit)))))))
+                                              #:backoff-limit backoff-limit
+                                              #:security-context security-context
+                                              #:container-security-context container-security-context
+                                              #:node-selector node-selector #:tolerations tolerations
+                                              #:affinity affinity
+                                              #:pod-annotations pod-annotations #:priority-class priority-class)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; scaling / availability / policy

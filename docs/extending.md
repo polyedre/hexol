@@ -185,6 +185,7 @@ k8s))`. It is still just Scheme procedures returning ops:
 | `(resource <alist>)`              | A procedure that returns `op:append` into `(kubernetes_resources)`.      |
 | `app` / `public-app`              | Procedures that build N resource ops and bundle them via `compose-ops`.  |
 | `configmap` / `secret`            | Same — methods returning resource ops.                                   |
+| workload pod fields               | `deployment`/`daemonset`/`stateful-set`/`job`/`cron-job` share one `pod-template-alist`, so `security-context`, `container-security-context`, `node-selector`, `tolerations`, `affinity`, `annotations`, `pod-annotations`, `service-account` and `priority-class` mean the same thing on all of them. |
 | `tls-all`                         | A `transform-resources` walking Ingresses and deep-merging TLS sections. |
 | `annotate-all` / `label-all`      | `transform-resources` over every resource.                              |
 | `checksum-config`                 | A `make-op` that reads the resource list, hashes referenced CM/Secret data, and re-writes Deployments with a `config/checksum` annotation. |

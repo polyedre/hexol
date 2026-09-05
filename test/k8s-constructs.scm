@@ -97,6 +97,38 @@
        (at (r1 (limit-range "lr" (limits '((type . "Container") (default (cpu . "500m"))))))
            'spec 'limits))
 
+(format #t "~%k8s: pod-template fields (deployment / daemonset / cron-job)~%")
+(define dp (r1 (deployment "api" (image "i:1")
+                 (security-context (runAsNonRoot #t))
+                 (container-security-context (readOnlyRootFilesystem #t))
+                 (node-selector (pool "apps"))
+                 (tolerations '((key . "workload") (effect . "NoSchedule")))
+                 (affinity (nodeAffinity "x"))
+                 (annotations (owner "team"))
+                 (pod-annotations (prometheus.io/scrape "true"))
+                 (priority-class "high")
+                 (privileged))))
+(check "metadata annotations" '((owner . "team")) (at dp 'metadata 'annotations))
+(check "pod-template annotations" '((prometheus.io/scrape . "true"))
+       (at dp 'spec 'template 'metadata 'annotations))
+(check "pod securityContext" '((runAsNonRoot . #t)) (at (pod-spec dp) 'securityContext))
+(check "nodeSelector / tolerations / affinity / priorityClassName"
+       (list '((pool . "apps")) '(((key . "workload") (effect . "NoSchedule")))
+             '((nodeAffinity . "x")) "high")
+       (list (at (pod-spec dp) 'nodeSelector) (at (pod-spec dp) 'tolerations)
+             (at (pod-spec dp) 'affinity) (at (pod-spec dp) 'priorityClassName)))
+(check "container securityContext keeps the privileged flag working"
+       '((readOnlyRootFilesystem . #t) (privileged . #t))
+       (assq-ref (container dp) 'securityContext))
+
+(check "daemonset takes the same fields" '((pool . "sys"))
+       (at (pod-spec (r1 (daemonset "node" (image "i:1") (node-selector (pool "sys")))))
+           'nodeSelector))
+(check "cron-job pod template takes the same fields" "batch"
+       (at (r1 (cron-job "c" (schedule "* * * * *") (image "i:1")
+                         (priority-class "batch")))
+           'spec 'jobTemplate 'spec 'template 'spec 'priorityClassName))
+
 (format #t "~%~a~%"
         (if (zero? failures) "all checks passed" (format #f "~a failure(s)" failures)))
 (exit (if (zero? failures) 0 1))
