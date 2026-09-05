@@ -4,11 +4,11 @@
 ;;; `table` / `index` is an op; folding appends each `CREATE …` to the
 ;;; `(sql_commands)` accumulator (resolved state). Every CLI view works:
 ;;;
-;;;   ./bin/hexol render -o sql  examples/database-schema.scm   # the DDL
-;;;   ./bin/hexol render         examples/database-schema.scm   # resolved state (sexp)
-;;;   ./bin/hexol render -o json examples/database-schema.scm   # JSON array
-;;;   ./bin/hexol render --path sql_commands examples/database-schema.scm
-;;;   ./bin/hexol tree           examples/database-schema.scm   # the op tree
+;;;   ./bin/hexol render -o sql  -i examples/database-schema.scm   # the DDL
+;;;   ./bin/hexol render         -i examples/database-schema.scm   # resolved state (sexp)
+;;;   ./bin/hexol render -o json -i examples/database-schema.scm   # JSON array
+;;;   ./bin/hexol render --path sql_commands -i examples/database-schema.scm
+;;;   ./bin/hexol tree           -i examples/database-schema.scm   # the op tree
 ;;;
 ;;; `-o sql` runs the (state -> SQL text) adapter the next line registers.
 ;;;

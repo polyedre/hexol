@@ -4,8 +4,8 @@
 ;;; role, fanned over the fleet (one play per host in `all`) into the
 ;;; `(ansible_plays)` sink. Render it:
 ;;;
-;;;   hexol render -o ansible examples/ansible.scm   # the playbook (JSON)
-;;;   hexol tree              examples/ansible.scm   # plays -> their tasks
+;;;   hexol render -o ansible -i examples/ansible.scm   # the playbook (JSON)
+;;;   hexol tree              -i examples/ansible.scm   # plays -> their tasks
 ;;;
 ;;; The point: what inventory-as-a-program buys over role YAML. Each item is
 ;;; plain Scheme here, but a dedicated Ansible feature (or no equivalent) there:

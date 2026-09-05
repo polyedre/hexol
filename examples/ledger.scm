@@ -5,11 +5,11 @@
 ;;; `(ledger_journal)` (split rules into `(ledger_rules)`), and the trailing
 ;;; `(apply-splits)` expands rules into transactions. Every CLI view works:
 ;;;
-;;;   ./bin/hexol render -o ledger examples/ledger.scm   # ledger-cli text
-;;;   ./bin/hexol render           examples/ledger.scm   # resolved state (sexp)
-;;;   ./bin/hexol render -o json   examples/ledger.scm   # JSON
-;;;   ./bin/hexol render --path ledger_journal examples/ledger.scm
-;;;   ./bin/hexol tree             examples/ledger.scm   # the op tree
+;;;   ./bin/hexol render -o ledger -i examples/ledger.scm   # ledger-cli text
+;;;   ./bin/hexol render           -i examples/ledger.scm   # resolved state (sexp)
+;;;   ./bin/hexol render -o json   -i examples/ledger.scm   # JSON
+;;;   ./bin/hexol render --path ledger_journal -i examples/ledger.scm
+;;;   ./bin/hexol tree             -i examples/ledger.scm   # the op tree
 ;;;
 ;;; `-o ledger` runs the (state -> ledger-cli text) adapter registered below.
 ;;; Numbers and names are made up.

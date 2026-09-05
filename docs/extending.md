@@ -96,8 +96,8 @@ gave, minus the hand-quoted alists its argument values used to collapse into.
   #:fields ((image     #:required)              ; missing → compile error
             (port      #:default 8080)          ; default value (library scope)
             (replicas  #:default 1)
-            (env       #:map)                   ; free-form nested alist; ,@xs splices
-            (env-from  #:list)                  ; (k a b …) → (list a b …); ,@xs splices
+            (env       #:list)                  ; (k a b …) → (list a b …); ,@xs splices
+            (labels    #:map)                   ; free-form nested alist; ,@xs splices
             (resources #:coerce normalize-resources)  ; wrap the value in (P …)
             (privileged #:flag))                ; (privileged) → #t, absent → #f
   #:build (%deployment #:name name #:image image #:port port …))   ; any value/op
@@ -120,8 +120,14 @@ raw-alist escape:
 
 ```scheme
 (deployment "api" (image "x:1")
-  (env ,@base-env (FOO "1")))      ; base-env (a runtime list) ++ one literal entry
+  (env ,@base-env '((name . "FOO") (value . "1"))))
 ```
+
+Note what a `#:list` entry *is*: the entries are **evaluated**, in order, as
+ordinary Scheme. They are not `(NAME value)` pairs — `(env (FOO "1"))` is a
+call to `FOO` and fails with `Unbound variable: FOO`. For `env` specifically
+the entry is the wire-shape k8s alist, so a computed value reads
+``(env `((name . "FOO") (value . ,v)))``.
 
 A `#:map` field takes the same markers: `,@e` splices an evaluated alist of
 `(key . value)` pairs, `,e` inserts one such pair, and both mix freely with
@@ -167,7 +173,9 @@ macros (appliers, `split-with`-style rule builders) stay `#:keyword` — that's
 idiomatic Scheme, not a constructor surface.
 
 Because the schema names each field's kind, a typed constructor needs **no**
-nesting marker: `(deployment "api" (env (LOG_LEVEL "info")))` is unambiguous.
+nesting marker: `(deployment "api" (labels (tier "web")))` is unambiguous —
+`labels` is a `#:map` field, so its body is read as nested keys, while a
+`#:list` field's entries are evaluated as Scheme.
 Composites and the alist-producing layer stay plain Scheme — a `define-construct`
 `#:build` just calls them — so adding the record-body surface is additive and
 leaves rendered output unchanged.
@@ -281,7 +289,7 @@ single pass; and the keypair's `public_key` is read from `~/.ssh` at render
 time.
 
 ```
-HEXOL_ENV=prod ./bin/hexol render -o terraform examples/terraform.scm > main.tf.json && terraform init && terraform apply
+HEXOL_ENV=prod ./bin/hexol render -o terraform -i examples/terraform.scm > main.tf.json && terraform init && terraform apply
 # AWS creds via the usual env/profile; OpenStack via OS_* / clouds.yaml
 ```
 
@@ -314,19 +322,20 @@ transform.
  (with-namespace ns                     ; one scope for the whole release
   ;; prometheus-operator: resources listed inline, gated like `{{- if }}`
   (hx-when (on? '(prometheusOperator enabled))
-    (deployment #:name (fullname "operator") #:image (vget '(prometheusOperator image))
-                #:replicas (vget '(prometheusOperator replicas))
-                #:service-account (fullname "operator")
-                #:resources "100m-*/128Mi-256Mi")   ; cpu req / mem req-limit
-    (service #:name (fullname "operator") #:port 8080)
-    (service-monitor #:name (fullname "operator")))
+    (expose
+      (deployment (fullname "operator")                  ; name is positional
+                  (image (vget '(prometheusOperator image)))
+                  (replicas (vget '(prometheusOperator replicas)))
+                  (port 8080) (service-account (fullname "operator"))
+                  (resources "100m-*/128Mi-256Mi")))     ; cpu req / mem req-limit
+    (service-monitor (fullname "operator")))
   ;; ... other components ...
   (label-all (common-labels))))
 ```
 
 `with-namespace` binds the namespace for every resource constructed in its
-body (inner scopes win; an explicit `#:namespace` still overrides), and
-`#:resources` accepts the compact string `"<cpu-req>-<cpu-lim>/<mem-req>-<mem-lim>"`
+body (inner scopes win; an explicit `(namespace …)` still overrides), and
+`resources` accepts the compact string `"<cpu-req>-<cpu-lim>/<mem-req>-<mem-lim>"`
 — `*` omits a bound, a single memory value sets request = limit, a single
 cpu value leaves the limit unset. `(res "…")` returns the same alist for use
 inside a raw `custom-resource` spec.
@@ -334,8 +343,8 @@ inside a raw `custom-resource` spec.
 `(expose (deployment …))` folds the workload, then reads the resource it
 produced and appends a matching `Service` — selector `(app . <name>)`, one
 Service port per distinct container port (single → `http`, several →
-`port-<n>`). `(cluster-rbac #:name … #:rules …)` bundles a ServiceAccount +
-ClusterRole + ClusterRoleBinding so a `#:service-account` you reference
+`port-<n>`). `(cluster-rbac NAME (rule …) …)` bundles a ServiceAccount +
+ClusterRole + ClusterRoleBinding so a `(service-account …)` you reference
 actually exists.
 
 `examples/helm-kube-prometheus-stack.scm` is just an inventory — a single
@@ -344,10 +353,10 @@ it. Because it bottoms out in the same op record as everything else, the
 tooling works unchanged, and the gating is no longer opaque:
 
 ```
-./bin/hexol tree examples/helm-kube-prometheus-stack.scm   # op tree: each when -> its resources
-./bin/hexol render -o yaml examples/helm-kube-prometheus-stack.scm   # -> 30 manifests (multi-doc YAML)
+./bin/hexol tree -i examples/helm-kube-prometheus-stack.scm   # op tree: each when -> its resources
+./bin/hexol render -o yaml -i examples/helm-kube-prometheus-stack.scm   # -> 30 manifests (multi-doc YAML)
 ./bin/hexol explain kubernetes_resources.10.spec.replicas \
-            examples/helm-kube-prometheus-stack.scm   # which op set this? the Prometheus CR
+            -i examples/helm-kube-prometheus-stack.scm   # which op set this? the Prometheus CR
 ```
 
 Plain `render` (and `-o json`) prints the whole resolved state; `-o yaml`
@@ -379,18 +388,20 @@ Each op also carries the **authored source line** that produced it — the
 `at:` field below. This works even when the op is built deep inside a
 library helper: the body-taking macros (`hx-ops` / `hx-when` / `hx-case` /
 `with-namespace`) bind the line of each form they
-evaluate, so a `resource` op emitted by `(app #:replicas 2 …)` is blamed on
+evaluate, so a `resource` op emitted by `(app … (replicas 2))` is blamed on
 the `app` call, not on a line inside `hexol/k8s.scm`.
 
 ```
 $ ./bin/hexol explain kubernetes_resources.10.spec.replicas \
-              examples/kubernetes.scm
+              -i examples/kubernetes.scm
+;; inventory: examples/kubernetes.scm
 ;; path:      (kubernetes_resources 10 spec replicas)
 ;; final:     2
 ;; 1 op(s) touched this path:
 
-  step 13: resource Deployment/loulou
-    at:     examples/kubernetes.scm:39     # the (app … #:replicas 2) call
+  step 14: resource Deployment/loulou
+    at:     examples/kubernetes.scm:55     # the (app … (replicas 2)) call
+    source: (resource "Deployment" "loulou")
     before: #f
     after:  2
 ```

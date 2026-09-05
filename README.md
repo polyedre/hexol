@@ -114,7 +114,8 @@ use them: `helm`/`yq` to expand charts, `sops` for inline secrets, and
 ./bin/hexol explain regions.alpha5.network.cni -i examples/inventory.scm  # what touched a path
 
 # discover the library: which (key value) entries a construct accepts
-./bin/hexol doc                                                           # every construct (built-in libs)
+./bin/hexol doc                                                           # constructs of the preloaded libs (k8s, sql)
+./bin/hexol doc -i examples/terraform.scm                                  # what THAT inventory registers
 ./bin/hexol doc app -i examples/kubernetes.scm                            # one construct: fields + example
 ```
 

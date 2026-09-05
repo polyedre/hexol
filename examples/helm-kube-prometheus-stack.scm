@@ -12,10 +12,10 @@
 ;;;
 ;;; Same op record as everything else, so the one CLI works unchanged:
 ;;;
-;;;   ./bin/hexol tree    examples/helm-kube-prometheus-stack.scm
+;;;   ./bin/hexol tree    -i examples/helm-kube-prometheus-stack.scm
 ;;;   ./bin/hexol explain kubernetes_resources.3.spec.replicas \
-;;;                       examples/helm-kube-prometheus-stack.scm
-;;;   ./bin/hexol render -o yaml examples/helm-kube-prometheus-stack.scm  ; -> multi-doc YAML
+;;;                       -i examples/helm-kube-prometheus-stack.scm
+;;;   ./bin/hexol render -o yaml -i examples/helm-kube-prometheus-stack.scm  ; -> multi-doc YAML
 ;;;
 ;;; `#:resources` / `(res …)` strings are "cpuReq-cpuLim/memReq[-memLim]"
 ;;; (k8s requests/limits); `*` is unbounded, memory limit optional.

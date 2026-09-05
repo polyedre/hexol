@@ -4,8 +4,8 @@
 ;;; OVH public cloud) + cluster (platform Helm charts + self-hosted apps). Both
 ;;; live in one `(hx-ops …)` and split at *render* time by accumulator:
 ;;;
-;;;   ./bin/hexol render -o terraform examples/homelab.scm > infra.tf.json  # infra
-;;;   ./bin/hexol render -o yaml examples/homelab.scm | kubectl apply -f -  # cluster
+;;;   ./bin/hexol render -o terraform -i examples/homelab.scm > infra.tf.json  # infra
+;;;   ./bin/hexol render -o yaml -i examples/homelab.scm | kubectl apply -f -  # cluster
 ;;;   ./bin/hexol tree / explain …                                          # introspection
 ;;;
 ;;; Bootstrap is the `siderolabs/talos` provider: `talos_machine_secrets` makes
@@ -581,8 +581,8 @@
 ;; directly and shells out to its tool. Infra builds first and dumps its
 ;; kubeconfig to `deploy/kubeconfig`, so the cluster applies on it:
 ;;
-;;   hexol apply examples/homelab.scm                              # whole bootstrap
-;;   hexol apply --only check-api,kubernetes examples/homelab.scm  # re-apply cluster
+;;   hexol apply -i examples/homelab.scm                              # whole bootstrap
+;;   hexol apply --only check-api,kubernetes -i examples/homelab.scm  # re-apply cluster
 ;;
 ;; Between deploy steps sit checks (observe, don't mutate). `check-api` is a
 ;; *gate*: the kubeconfig points at the LB VIP via DNS, so it blocks until

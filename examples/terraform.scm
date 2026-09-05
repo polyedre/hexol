@@ -5,9 +5,9 @@
 ;;; fleet (keypair, private network, N VMs), both providers in one
 ;;; `terraform {}` block. One inventory, one `(terraform_config)` tree, one render:
 ;;;
-;;;   ./bin/hexol render -o terraform examples/terraform.scm > main.tf.json
+;;;   ./bin/hexol render -o terraform -i examples/terraform.scm > main.tf.json
 ;;;   terraform init && terraform apply        # creds via env / clouds.yaml
-;;;   ./bin/hexol tree examples/terraform.scm  # the op tree
+;;;   ./bin/hexol tree -i examples/terraform.scm  # the op tree
 ;;;
 ;;; The point: what inventory-as-a-program buys over hand-written HCL. Each is
 ;;; a few lines of Scheme here, a dedicated feature (or no equivalent) in HCL:

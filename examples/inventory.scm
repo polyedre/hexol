@@ -4,9 +4,9 @@
 ;;; over the kernel's `for-each-into`) resolves the body once per region with
 ;;; that region's attributes as the query, stashing each under `(regions <name>)`:
 ;;;
-;;;   ./bin/hexol render examples/inventory.scm                 # whole fleet
-;;;   ./bin/hexol render --path regions.alpha5 examples/inventory.scm
-;;;   ./bin/hexol explain regions.alpha5.network.cni examples/inventory.scm
+;;;   ./bin/hexol render -i examples/inventory.scm                 # whole fleet
+;;;   ./bin/hexol render --path regions.alpha5 -i examples/inventory.scm
+;;;   ./bin/hexol explain regions.alpha5.network.cni -i examples/inventory.scm
 ;;;
 ;;; The body is a pure function of the attributes: `hx-case` on geo/hardware/
 ;;; network selects config, `hx-when` gates the k8s load and sovereign cross-cuts,
