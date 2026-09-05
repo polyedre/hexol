@@ -282,6 +282,19 @@
            (parameterize ((current-author-loc '("b.scm" . 99)))
              (make-op 'merge '(set foo) identity "set foo"))))))
 
+(format #t "~%kernel: scope-ops body flattening~%")
+(define current-test-scope (make-parameter #f))
+(let* ((op (scope-ops 'scoped (current-test-scope "s") "scope "
+                      (op:set '(a) 1 '(set a 1))
+                      ;; a conditional arm contributing nothing, and a helper
+                      ;; returning a list of ops — both must flatten, as in hx-ops
+                      '()
+                      (list (op:set '(b) 2 '(set b 2)))))
+       (out (apply-op op '())))
+  (check "scope-ops drops '() and splices op lists"
+         '((a . 1) (b . 2)) out)
+  (check "scope-ops children are the flattened ops" 2 (length (op-children op))))
+
 (format #t "~%yaml: scalar quoting~%")
 (let ((y (lambda (v) (call-with-output-string
                        (lambda (p) (emit-yaml-document p `((k . ,v))))))))

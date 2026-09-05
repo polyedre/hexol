@@ -16,7 +16,7 @@
             make-op op? op-kind op-source op-effect op-label op-children op-loc
             current-author-loc stamp-loc relabel
             op-content-hash op-short-hash fnv1a-64
-            apply-op resolve compose-ops scope-ops for-each-into
+            apply-op resolve normalize-ops compose-ops scope-ops for-each-into
             op:merge op:set op:append op:when op:case
             ;; state helpers
             state-get state-set state-append state-delete deep-merge
@@ -413,15 +413,21 @@ SOURCE is the authored form."
 ;; are those ops, so introspection descends through it. The combinator every
 ;; target library uses to make a builder (app, aws-rds, fleet) look like one
 ;; operation. Domain-agnostic, hence here.
-(define (compose-ops kind source ops)
+(define (normalize-ops xs)
+  "Flatten a body list one level: each element of XS is an op or a list of ops
+(including the empty list, so a conditional arm may contribute nothing)."
+  (concatenate (map (lambda (x) (if (op? x) (list x) x)) xs)))
+
+(define (compose-ops kind source ops*)
   "Bundle OPS into a single op of KIND whose effect folds them in order and
 whose children are OPS, so introspection descends through it.  This is the
 combinator target libraries use to make a builder look like one operation.
 SOURCE is the authored form."
-  (make-op kind source
-           (lambda (state) (fold (lambda (op s) (apply-op op s)) state ops))
-           #f
-           ops))
+  (let ((ops (normalize-ops ops*)))
+    (make-op kind source
+             (lambda (state) (fold (lambda (op s) (apply-op op s)) state ops))
+             #f
+             ops)))
 
 ;; Build-time scope: bind PARAM to VAL while the body's ops are *constructed*
 ;; (baking the value into each op), then bundle them into a composing op of KIND
@@ -433,7 +439,7 @@ SOURCE is the authored form."
     ((_ kind (param val) label-prefix body ...)
      (let* ((v   val)
             (ops (parameterize ((param v))
-                   (list (stamp-loc body) ...))))
+                   (normalize-ops (list (stamp-loc body) ...)))))
        (make-op kind (list kind v)
                 (lambda (state) (fold apply-op state ops))
                 (string-append label-prefix (format #f "~a" v))
@@ -444,13 +450,14 @@ SOURCE is the authored form."
 ;; attributes, stashed under (base… key). A mapping of seeds becomes a mapping
 ;; of resolved sub-states — the combinator behind enumerations like the region
 ;; fleet. body is exposed as children.
-(define (for-each-into base table body)
+(define (for-each-into base table body*)
   "Return an op that maps BODY (a list of ops) over TABLE, an alist of
 (key . seed).  For each entry it runs a fresh `resolve' of BODY seeded with
 that entry's attributes and stashes the result under (base… key), turning a
 table of seeds into a mapping of resolved sub-states.  BODY is exposed as
 children for introspection."
-  (make-op 'for-each-into
+  (let ((body (normalize-ops body*)))
+   (make-op 'for-each-into
            `(for-each-into ,base ,(map car table))
            (lambda (state)
              (fold (lambda (entry s)
@@ -464,7 +471,7 @@ children for introspection."
            (format #f "for-each-into ~a (~a)"
                    (string-join (map symbol->string base) ".")
                    (length table))
-           body))
+           body)))
 
 ;; ---------- registration collectors ----------
 ;;

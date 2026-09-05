@@ -34,6 +34,7 @@
   #:use-module (ice-9 format)
   #:re-export (resolve state-get state-set state-append state-delete deep-merge
                op? op-kind op-source op-effect apply-op compose-ops for-each-into
+               normalize-ops
                renders-with applies-with)
   #:export (hx-ops hx-each hx-merge hx-when hx-case hx-append
             $ attr get attrs str fmt
@@ -179,8 +180,7 @@ metadata.labels."
 ;;
 ;; Body-taking ops (hx-ops/hx-when/hx-case) accept each slot as an op or a list
 ;; of ops, flattening one level — a helper returning a list of ops drops in.
-(define (normalize-ops xs)
-  (concatenate (map (lambda (x) (if (op? x) (list x) x)) xs)))
+;; `normalize-ops' itself lives in the kernel (scope-ops/compose-ops need it).
 
 ;; ---------- $ marker ----------
 ;;
