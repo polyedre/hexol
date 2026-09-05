@@ -100,6 +100,7 @@
   (begin
     (define-construct name
       #:head (col-name)
+      #:value                       ; a column value, consumed by `table'
       #:fields ((primary-key #:flag) (not-null #:flag) (unique #:flag)
                 (default #:default 'none) (check #:default #f) (references #:default #f))
       #:build (column col-name type
@@ -124,6 +125,7 @@
 ;; Parametric types take their argument(s) as extra positional head params.
 (define-construct varchar
   #:head (name n)
+  #:value
   #:fields ((not-null #:flag) (unique #:flag) (default #:default 'none) (check #:default #f))
   #:build (column name (format #f "VARCHAR(~a)" n)
                   #:not-null not-null #:unique unique
@@ -131,6 +133,7 @@
 
 (define-construct numeric
   #:head (name precision scale)
+  #:value
   #:fields ((not-null #:flag) (default #:default 'none) (check #:default #f))
   #:build (column name (format #f "NUMERIC(~a, ~a)" precision scale)
                   #:not-null not-null #:default default #:check check))
@@ -140,6 +143,7 @@
 ;; default (dangling FK is usually a bug); opt out via `(nullable)`.
 (define-construct references
   #:head (name target)
+  #:value
   #:fields ((on #:default 'id) (unique #:flag) (default #:default 'none) (nullable #:flag))
   #:build (column name "INTEGER"
                   #:not-null (not nullable) #:unique unique #:default default

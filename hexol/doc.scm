@@ -82,6 +82,8 @@
          (w-shape (widest shapes)))
     (format #t "~a  ~a~%" (assq-ref s 'name) (module->string (assq-ref s 'module)))
     (when (assq-ref s 'doc) (format #t "  ~a~%" (assq-ref s 'doc)))
+    (when (assq-ref s 'value?)
+      (format #t "  value construct: returns a value for an enclosing construct, evaluated where written~%"))
     (format #t "~%signature:~%  ~a~%" (signature s))
     (format #t "~%head (positional): ~a~%"
             (if (null? (assq-ref s 'head)) "none"

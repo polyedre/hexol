@@ -882,6 +882,7 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
 (define-construct listener
   #:head name
   #:doc "a Gateway listener (sub-construct of gateway)"
+  #:value                       ; a listener alist, not an op
   #:fields ((protocol #:default "HTTP" #:doc "HTTP/HTTPS/TCP")
             (port #:required #:doc "listener port")
             (hostname #:default #f #:doc "hostname to match")
@@ -939,6 +940,7 @@ StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
 (define-construct rule
   #:head ()
   #:doc "an RBAC policy rule (sub-construct of role/cluster-role/cluster-rbac)"
+  #:value                       ; a policy-rule alist, not an op
   #:fields ((api-groups #:list #:doc "apiGroups (\"\" for core)")
             (resources #:list #:doc "resources")
             (non-resource-urls #:list #:doc "nonResourceURLs")

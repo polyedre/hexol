@@ -20,6 +20,7 @@
 ;; ---- defaults, evaluated values, flags, lists, maps ----
 (define-construct widget
   #:head name
+  #:value
   #:fields ((image #:required) (port #:default 8080) (debug #:flag)
             (tags #:list) (env #:map))
   #:build (list name image port debug tags env))
@@ -58,6 +59,7 @@
 (define (double x) (if (number? x) (* 2 x) x))
 (define-construct coerced
   #:head name
+  #:value
   #:fields ((n #:coerce double #:default 10))
   #:build (list name n))
 (format #t "~%construct: coerce~%")
@@ -67,10 +69,12 @@
 ;; ---- sub-constructs (#:construct, #:repeated) ----
 (define-construct rule
   #:head ()
+  #:value
   #:fields ((verbs #:list))
   #:build (cons 'rule verbs))
 (define-construct policy
   #:head name
+  #:value
   #:fields ((rule #:repeated #:construct rule))
   #:build (list name rule))
 (format #t "~%construct: sub-constructs~%")
@@ -82,6 +86,7 @@
 ;; ---- multi-positional head ----
 (define-construct sized
   #:head (name n)
+  #:value
   #:fields ((unit #:default "px"))
   #:build (list name n unit))
 (format #t "~%construct: multi-positional head~%")
@@ -90,6 +95,7 @@
 ;; ---- open schema: unknown keys collected into `extra` ----
 (define-construct openrec
   #:head name #:open? #t
+  #:value
   #:fields ((kind #:required))
   #:build (list name kind extra))
 (format #t "~%construct: open schema~%")
@@ -101,14 +107,15 @@
 (define-construct documented
   #:head name
   #:doc "a documented construct"
+  #:value
   #:fields ((image #:required #:doc "container image") (port #:default 8080)
             (debug #:flag) (tags #:list) (rule #:repeated #:construct rule))
   #:build (list name image port debug tags rule))
 (format #t "~%construct: schema registry~%")
 (let ((s (car (find-constructs 'documented))))
-  (check "registered under its name, with head and doc"
-         '((name) "a documented construct")
-         (list (assq-ref s 'head) (assq-ref s 'doc)))
+  (check "registered under its name, head, doc and value? marker"
+         '((name) "a documented construct" #t)
+         (list (assq-ref s 'head) (assq-ref s 'doc) (assq-ref s 'value?)))
   (check "field names in definition order"
          '(image port debug tags rule)
          (map (lambda (f) (assq-ref f 'name)) (assq-ref s 'fields)))

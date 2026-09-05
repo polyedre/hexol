@@ -62,7 +62,7 @@
 ;; `register-construct!` call spliced into the expansion, so a construct's
 ;; call semantics are untouched). `hexol doc` reads it. A schema is an alist:
 ;;   ((name . SYM) (module . (hexol k8s)) (head . (name …)) (doc . "…"|#f)
-;;    (fields . (FIELD …)))
+;;    (value? . BOOL) (fields . (FIELD …)))
 ;; and each FIELD an alist: ((name . SYM) (kind . plain|flag|list|map|construct)
 ;;   (required? . BOOL) (repeated? . BOOL) (construct . SYM|#f)
 ;;   (default . DATUM|#f)   ; the #:default expression as written, or #f
@@ -188,6 +188,10 @@
 ;;   #:doc "…"          one-line description, shown by `hexol doc`
 ;;
 ;; `#:doc "…"` at the construct level documents the construct itself.
+;; `#:value` (a bare marker) says #:build returns a VALUE for an enclosing
+;; construct to consume — a column alist, a Gateway listener — rather than an
+;; op. A value construct is evaluated where it is written; every other
+;; construct is deferred to fold time (see %expand-call).
 ;; #:head is one symbol or a list of positional params; #:open? #t passes
 ;; unknown keys through as evaluated `(k v)`/`(k a …)` attributes into the
 ;; `extra` local (an alist); #:build is the result expression with head params,
@@ -207,23 +211,31 @@
 
 (define-syntax define-construct
   (lambda (stx)
+    ;; Bare marker keywords: they stand alone, so they are stripped before the
+    ;; rest of the option list is read as key/value pairs.
+    (define markers '(#:value))
     (define (kw-get args k default)
       (let ((m (memq k args))) (if m (cadr m) default)))
+    ;; KWS is a LIST of syntax objects, markers already removed: strict pairs.
     (define (kw-syntax kws k default)
       (let loop ((kws kws))
-        (syntax-case kws ()
-          (() default)
-          ((a b . rest)
-           (if (eq? (syntax->datum #'a) k) #'b (loop #'rest))))))
+        (cond ((or (null? kws) (null? (cdr kws))) default)
+              ((eq? (syntax->datum (car kws)) k) (cadr kws))
+              (else (loop (cddr kws))))))
     (syntax-case stx ()
       ((_ name kw ...)
-       (let* ((open?    (kw-get (syntax->datum #'(kw ...)) #:open? #f))
-              (build    (kw-syntax #'(kw ...) #:build #'(error "construct: no #:build")))
-              (fields-stx (stx->list (kw-syntax #'(kw ...) #:fields #'())))
-              (doc      (kw-get (syntax->datum #'(kw ...)) #:doc #f))
+       (let* ((all-kws  (stx->list #'(kw ...)))
+              (value?   (and (memq #:value (map syntax->datum all-kws)) #t))
+              (kws      (filter (lambda (s) (not (memq (syntax->datum s) markers)))
+                                all-kws))
+              (kw-data  (map syntax->datum kws))
+              (open?    (kw-get kw-data #:open? #f))
+              (build    (kw-syntax kws #:build #'(error "construct: no #:build")))
+              (fields-stx (stx->list (kw-syntax kws #:fields #'())))
+              (doc      (kw-get kw-data #:doc #f))
               ;; head identifiers kept as original syntax (with marks) so they
               ;; are the *same* bindings #:build references.
-              (head-stx (kw-syntax #'(kw ...) #:head #'()))
+              (head-stx (kw-syntax kws #:head #'()))
               (head-ids (syntax-case head-stx ()
                           ((a ...) (stx->list head-stx))
                           (single  (list head-stx))))
@@ -281,6 +293,7 @@
                               (if coerce (list #`(#,fid (#,coerce #,fid))) '()))))
                     infos))
                 (schema   `((name . ,name-sym) (head . ,head) (doc . ,doc)
+                            (value? . ,value?)
                             (fields . ,(map (lambda (i) (list-ref i 8)) infos)))))
            #`(begin
                (register-construct!
@@ -295,13 +308,14 @@
                                    '#,(datum->syntax #'name descs)
                                    '#,(datum->syntax #'name open?)
                                    '#,(datum->syntax #'name fnames)
-                                   #'#,impl))))))))))
+                                   #'#,impl
+                                   '#,(datum->syntax #'name value?)))))))))))
 
 ;; Runtime expander every generated `name` transformer calls. Splits the call
 ;; into positional head args + `(key …)` entries, computes each field's value
 ;; form by kind, checks required/unknown, emits one positional call to `%impl`
 ;; (which defaults and coerces). Absent fields pass sentinel '%hx-unset.
-(define (%expand-call s name head descs open? fnames impl)
+(define* (%expand-call s name head descs open? fnames impl #:optional (value? #f))
   (syntax-case s ()
     ((_ . rest)
      (let* ((forms   (stx->list #'rest))
