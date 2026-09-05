@@ -18,7 +18,9 @@
 ;;; The $ marker is required when a value could otherwise parse as a nested map.
 ;;;
 ;;; Inside ($ expr), `(attr key)` and `(get path)` read fold state — same `$`
-;;; defers to fold time in `hx-merge` and `hx-append`. `(str …)` concatenates
+;;; defers to fold time in `hx-merge` and `hx-append`. They also work bare in
+;;; a typed constructor's fields, which the construct engine evaluates at fold
+;;; time. `(str …)` concatenates
 ;;; (coercing symbols/numbers), `(fmt template …)` fills a format string.
 ;;;
 ;;; An hx-when/hx-case predicate is an expression evaluated with fold state
@@ -51,19 +53,20 @@
 
 (define (attr k)
   "Read attribute K (a key under `attributes', i.e. the query) from the
-current fold state.  Valid only inside a computed value ($ …) or an
-hx-when/hx-case predicate; errors otherwise."
+current fold state.  Valid wherever the fold binds the state: a computed
+value ($ …), an hx-when/hx-case predicate, or a construct field; errors
+otherwise."
   (let ((s (current-state)))
-    (unless s (error "(attr) used outside a computed value or predicate"))
+    (unless s (error "(attr) used outside a computed value, predicate, or construct field"))
     (note-read! (list 'attributes k))
     (state-get s (list 'attributes k))))
 
 (define (get p)
   "Read the value at path P (a list of symbol keys) from the current fold
-state.  Valid only inside a computed value ($ …) or an hx-when/hx-case
-predicate; errors otherwise."
+state.  Valid wherever the fold binds the state: a computed value ($ …), an
+hx-when/hx-case predicate, or a construct field; errors otherwise."
   (let ((s (current-state)))
-    (unless s (error "(get) used outside a computed value or predicate"))
+    (unless s (error "(get) used outside a computed value, predicate, or construct field"))
     (note-read! p)
     (state-get s p)))
 

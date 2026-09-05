@@ -74,7 +74,9 @@ because the form head tells you which you're in:
 - **Typed library constructors** — everything built with `define-construct`
   (all of `(hexol k8s)`, the SQL column sugar, …). Values are **evaluated
   Scheme** (`(image "x")`, `(replicas (if prod? 3 1))`, `(uuid (ref …))`);
-  strings are quoted, references and arithmetic are natural. No `$`.
+  strings are quoted, references and arithmetic are natural. No `$` — fields
+  are evaluated at fold time anyway, so `attr`/`get` work in them bare:
+  `(deployment "api" (image (str (get '(cfg registry)) "/api")))`.
 
 The schema-less escapes (`terraform-resource`, the ansible `task`,
 `custom-resource`'s `spec`) are also evaluate-by-default, but keep an explicit
@@ -110,6 +112,37 @@ Field kinds: plain scalar, `#:flag` (valueless `(x)` ≡ `#t`), `#:list`,
 occurrences collect into a list — this is how RBAC `(rule …)` works). `#:build`
 sees the head params and every field bound as locals and may return a plain
 value (a column, a task) or an op (a resource) — the engine is agnostic.
+
+### When fields evaluate, and `#:value`
+
+A construct call does **not** run `#:build` where it is written: it returns an
+op, and the field expressions — together with `#:default` and `#:coerce` — run
+when that op fires. `current-state` is bound then, which is why `get`/`attr`
+work bare in a field, and why a `#:default (current-k8s-namespace)` still sees
+the enclosing `with-namespace` (scope forms bind their parameter at build time
+*and* at fold time). A field that throws is blamed on the construct, the field,
+and the authored `FILE:LINE`.
+
+The positional `#:head` args stay eager: they are evaluated where the call is
+written, because they form the op's label (`"deployment api"`) and its content
+hash, which introspection needs before any fold.
+
+Mark a construct **`#:value`** (a bare marker keyword) when `#:build` returns a
+value for an enclosing construct to consume rather than an op — the SQL column
+types, the k8s `listener` and `rule` sub-constructs. Those evaluate where they
+are written, which inside a deferred field is already fold time. `hexol doc`
+shows the marker.
+
+```scheme
+(define-construct rule
+  #:head ()
+  #:value                                     ; a policy-rule alist, not an op
+  #:fields ((verbs #:list))
+  #:build (list (cons 'verbs verbs)))
+```
+
+Getting this wrong is loud: a value construct left unmarked returns an op where
+its parent expects data.
 
 `#:open? #t` lets unknown `(key value)` entries through into an `extra` local
 (an alist) instead of erroring — for generic forms whose key set isn't fixed.
@@ -179,6 +212,10 @@ nesting marker: `(deployment "api" (labels (tier "web")))` is unambiguous —
 Composites and the alist-producing layer stay plain Scheme — a `define-construct`
 `#:build` just calls them — so adding the record-body surface is additive and
 leaves rendered output unchanged.
+
+Writing a raw `make-op` effect? Bind `current-state` (re-exported from
+`(hexol kernel)` and every target library) around any author expression you
+evaluate inside it, and `get`/`attr` will work there too.
 
 ## What we built on top, without touching the kernel
 

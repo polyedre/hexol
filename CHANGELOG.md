@@ -13,6 +13,23 @@ All notable changes to hexol are documented here. The format follows
 - `lint` verb: static checks over an inventory.
 - `--validate` flag: schema-check the resolved state before rendering.
 - `explain` reports the fix location for ops generated under `hx-each`.
+- `#:value` marks a `define-construct` whose `#:build` returns a value for an
+  enclosing construct instead of an op; `hexol doc` shows it.
+- `current-state` is exported from `(hexol kernel)`, so an extension's own
+  `make-op` effect can bind it and make `get`/`attr` work inside it.
+
+### Changed
+- Constructor fields (`define-construct`) are evaluated at fold time, so
+  `get`/`attr` work bare inside any field —
+  `(deployment "api" (image (str (get '(cfg registry)) "/api")))`. Positional
+  head args and `#:value` constructs still evaluate where they are written.
+  `$` remains a merge-layer marker.
+- Scope forms (`with-namespace`, `with-schema`, `in-year`, …) bind their
+  parameter at fold time as well as at build time, so a field defaulting to
+  `(current-k8s-namespace)` still sees the scope.
+- `hexol tree` and `hexol show` fold the inventory once so a construct's
+  produced ops are addressable; a construct's tree line now sits above the
+  resources it produces and carries its head args (`configmap app-config`).
 
 ## [0.1.0] - 2026-09-03
 

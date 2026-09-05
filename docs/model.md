@@ -47,6 +47,10 @@ effect **and** its source form, label, and children:
 <op> = (kind, source, effect : state -> state, label, children)
 ```
 
+Constructs discover their children only by running, so an op also carries the
+ops its effect produced (`op-realized-children`) — filled in on fire, excluded
+from the content hash, and what `tree` descends into after one trial fold.
+
 The fold runs `effect`; tooling (`explain`, `tree`, `ops`) reads `source`
 without executing anything. This is the price that buys back introspection —
 without it the inventory would be an opaque black box. It is the property that
@@ -55,24 +59,28 @@ is a labelled record, not a string substitution buried in a template.
 
 ## Two value rules, one seam
 
-The surface has two layers with opposite rules, and the seam between them is
-the load-time / fold-time boundary:
+The surface has two layers with opposite rules about what a value in a body
+position means:
 
 - **Config tree** (`hx-merge`/`hx-append`/`hx-when`/`hx-case`): nothing in
   value position is evaluated. Symbols self-quote, and any parenthesised form
   is a nested map — so *every* computed value takes the `$` marker, which
   defers it to fold time where `attr`/`get` exist.
 - **Typed constructors** (`define-construct`: `(deployment …)`, `(varchar …)`,
-  …): the schema names each field, so values are ordinary Scheme, evaluated
-  at load time. No `$` — and no `attr`/`get`, which do not exist yet.
+  …): the schema names each field, so values are ordinary Scheme. No `$` —
+  the constructor call *is* an op, and its fields evaluate when that op fires,
+  so `attr`/`get` are already in scope.
 
 ```scheme
-(hx-merge (nginx (workers ($ (* 2 (attr 'cores))))))   ; fold time, needs $
-(deployment "api" (image "x") (replicas (if prod? 3 1)))  ; load time, plain Scheme
+(hx-merge (nginx (workers ($ (* 2 (attr 'cores))))))   ; needs $
+(deployment "api" (image (get '(cfg image))) (replicas (if prod? 3 1)))
 ```
 
-Consequence: a constructor body cannot depend on resolved state. Vary it in
-Scheme instead (see `authoring.md`, "large inventories").
+So `$` is a marker the *config-tree* layer needs and nothing else: the seam is
+which layer you are in, not when things run. Two things still evaluate where
+they are written — a constructor's positional head args (they label the op
+before the fold) and a `#:value` construct (it returns data for the construct
+around it).
 
 ## Why ordering is load-bearing
 

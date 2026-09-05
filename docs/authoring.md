@@ -110,20 +110,30 @@ parenthesised form without `$` is always read as a nested map, silently:
 > *config-tree* layer (`hx-merge`/`hx-append`/`hx-when`/`hx-case`), where
 > nothing evaluates and `$` is how you compute. **Typed library constructors**
 > (`(hexol k8s)`, the SQL column sugar, …) use the opposite,
-> evaluate-by-default rule: a record body of `(key value)` entries where
-> values are ordinary Scheme, evaluated at load time.
+> evaluate-by-default rule: a record body of `(key value)` entries whose
+> values are ordinary Scheme.
 >
 > ```scheme
 > (hx-merge  (nginx (workers ($ (* 2 (attr 'cores))))))  ; config tree: $ to compute
 > (deployment "api" (image "x") (replicas (if prod? 3 1)))  ; construct: plain Scheme
 > ```
 >
-> The corollary is that `$`/`attr`/`get` are **fold**-time and a constructor
-> body is **load**-time, so `$` inside a constructor field is an error
-> (`$ used outside of merge value position`). Which rule applies is always
-> decided by the form you're in. See [`extending.md`](extending.md) for
-> `define-construct`, and "large inventories" below for how to vary a
-> constructor per environment.
+> Constructor fields evaluate at **fold** time, when the construct's op fires,
+> so `attr`/`get` work bare inside them — no `$`, which stays a merge-layer
+> marker and is an error anywhere else (`$ used outside of merge value
+> position`):
+>
+> ```scheme
+> (deployment "api" (image (str (get '(cfg registry)) "/api"))
+>                   (replicas (get '(cfg replicas))))
+> ```
+>
+> Two things stay eager. The **positional head args** (`"api"` above) are
+> evaluated where you write them — they name the op before the fold starts.
+> And a **value construct** (`hexol doc` says so: the SQL column types, the
+> k8s `listener` and `rule`) returns data for the construct around it, so it
+> evaluates where written — which, inside a deferred field, is already fold
+> time. See [`extending.md`](extending.md) for `define-construct`.
 
 ## Helpers inside `$` and inside predicates
 
@@ -134,7 +144,8 @@ parenthesised form without `$` is always read as a nested map, silently:
 - `(fmt template arg ...)` — fill a format string's `~a`/`~s` holes:
   `(fmt "https://api.~a:6443" (attr 'region))`.
 
-`attr`/`get` are bound during op evaluation, not at file load.
+`attr`/`get` are bound during op evaluation, not at file load — that includes
+the fields of a typed constructor, which fire as part of the fold.
 
 An `hx-when` / `hx-case` predicate is just an expression evaluated against
 the current state, so `attr`/`get` work in it directly. `(attrs (k v) …)` is
@@ -210,7 +221,8 @@ operator edits in one place, and derive everything from it:
 ;; 3. fan out. `hx-each` owns the config-tree layer and gives you the
 ;;    per-env nesting + attribute seed; `append-map` + a one-row `hx-each`
 ;;    keeps that nesting while letting the body be a plain function of the env
-;;    (a constructor body cannot read `attr`/`get` — see "two value rules").
+;;    (constructor fields *can* read `attr`/`get`; this shape is for when the
+;;    row itself decides which ops exist at all).
 (hx-ops
   (append-map
     (lambda (e)
