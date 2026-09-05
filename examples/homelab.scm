@@ -1054,7 +1054,7 @@
                   (route-host "git") (route-gateway "homelab-private")))
 
   ;; One pass stamps every cluster resource with a common label.
-  (label-all `((app.kubernetes.io/part-of . ,(cfg 'cluster-name))))
+  (label-all (labels (app.kubernetes.io/part-of (cfg 'cluster-name))))
 
   ;; Decrypt the inline secrets-store, substituting each (secret-ref …). Last so
   ;; it sees every resource; render-only, never `tree`/`ops`.

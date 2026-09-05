@@ -32,6 +32,7 @@
 
 (define-module (hexol surface)
   #:use-module (hexol kernel)
+  #:use-module (hexol construct)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
   #:re-export (resolve state-get state-set state-append state-delete deep-merge
@@ -146,19 +147,32 @@ Usable inside (when …) as a cross-cutting transform."
              (let ((rs (or (state-get state '(kubernetes_resources)) '())))
                (state-set state '(kubernetes_resources) (map f rs))))))
 
-(define (annotate-all annotations)
-  "Return an op that deep-merges ANNOTATIONS into every resource's
-metadata.annotations."
-  (relabel (transform-resources
-             (lambda (r) (deep-merge r `((metadata (annotations ,@annotations))))))
-           "annotate-all"))
+;; Constructs, so the label/annotation set can be *computed from state*:
+;; a #:map field is read as nested keys, evaluated at fold time, and `,@`
+;; splices a runtime alist.
+;;
+;;   (label-all (labels (tier "web") (env ($ …ish)) ,@(common-labels)))
+;;
+;; `transform-resources` stays a plain procedure — it takes a procedure, not
+;; data, so there is nothing for a schema to name.
 
-(define (label-all labels)
-  "Return an op that deep-merges LABELS into every resource's
-metadata.labels."
-  (relabel (transform-resources
-             (lambda (r) (deep-merge r `((metadata (labels ,@labels))))))
-           "label-all"))
+(define-construct annotate-all
+  #:head ()
+  #:doc "deep-merge annotations into every resource's metadata.annotations"
+  #:fields ((annotations #:map
+             #:doc "annotation entries, (key \"value\"); ,@ splices a computed alist"))
+  #:build (relabel (transform-resources
+                     (lambda (r) (deep-merge r `((metadata (annotations ,@annotations))))))
+                   "annotate-all"))
+
+(define-construct label-all
+  #:head ()
+  #:doc "deep-merge labels into every resource's metadata.labels"
+  #:fields ((labels #:map
+             #:doc "label entries, (key \"value\"); ,@ splices a computed alist"))
+  #:build (relabel (transform-resources
+                     (lambda (r) (deep-merge r `((metadata (labels ,@labels))))))
+                   "label-all"))
 
 ;; ---------- Deferred constructors (fold-time $ values) ----------
 ;;

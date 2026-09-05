@@ -130,9 +130,14 @@
                  (assq-ref (f 'debug) 'kind)
                  (list (assq-ref (f 'rule) 'kind) (assq-ref (f 'rule) 'repeated?)
                        (assq-ref (f 'rule) 'construct))))))
+;; The registry is global, so filter to this file's module — importing
+;; (hexol surface) brings its own constructs along.
 (check "every construct of this file is registered, in order"
        '(widget coerced rule policy sized openrec documented)
-       (map (lambda (s) (assq-ref s 'name)) (construct-schemas)))
+       (let ((here (module-name (current-module))))
+         (filter-map (lambda (s)
+                       (and (equal? (assq-ref s 'module) here) (assq-ref s 'name)))
+                     (construct-schemas))))
 
 ;; ---- fold-time fields: get / attr work bare inside a construct ----
 ;;

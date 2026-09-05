@@ -30,6 +30,11 @@ All notable changes to hexol are documented here. The format follows
   `(deployment "api" (image (str (get '(cfg registry)) "/api")))`. Positional
   head args and `#:value` constructs still evaluate where they are written.
   `$` remains a merge-layer marker.
+- `label-all` and `annotate-all` are constructs with one `#:map` field —
+  `(label-all (labels (env (get '(cfg env))) ,@computed))` — so a cross-cutting
+  label set can be read from resolved state. The old form took an already-built
+  alist: `(label-all '((k . "v")))` becomes `(label-all (labels (k "v")))`.
+  `transform-resources` stays a procedure; it takes a procedure, not data.
 - Scope forms (`with-namespace`, `with-schema`, `in-year`, …) bind their
   parameter at fold time as well as at build time, so a field defaulting to
   `(current-k8s-namespace)` still sees the scope. **A hand-rolled scope macro

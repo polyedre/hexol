@@ -454,7 +454,7 @@ preloads — today `(hexol k8s)` and `(hexol sql)`. Everything else (terraform,
 your own `define-construct`s, any third-party library) shows up only when you
 pass an inventory that loads it: `hexol doc -i inventory.scm` lists exactly
 what *that* inventory registers, and nothing it doesn't load. Note the listing
-covers constructs only — plain procedures and macros (`expose`, `label-all`,
+covers constructs only — plain procedures and macros (`expose`,
 `transform-resources`, `appliers`, …) never appear.
 
 ## Repository layout

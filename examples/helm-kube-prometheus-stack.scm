@@ -218,4 +218,4 @@
                                (annotations (summary . "Targets are down"))))))))))
 
   ;; _helpers.tpl common labels, applied to every resource.
-  (label-all (common-labels))))
+  (label-all (labels ,@(common-labels)))))

@@ -96,8 +96,8 @@
 
    ;; Sovereign regions: stamp every loaded k8s resource.
    (hx-when (attrs (sovereignty strict))
-            (annotate-all '((audit.example.com/required . "true")))
-            (label-all    '((compliance . "strict"))))
+            (annotate-all (annotations (audit.example.com/required "true")))
+            (label-all    (labels (compliance "strict"))))
 
    ;; Derived summary, once features exist.
    (hx-when (pair? (get '(features)))
