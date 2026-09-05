@@ -15,7 +15,7 @@ help:
 	@echo "  ./bin/hexol render [-o sexp|json|yaml|terraform|ansible] [--query K=V,…] [--path P] [-i INVENTORY]"
 	@echo "  ./bin/hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY]"
 	@echo "  ./bin/hexol diff [--only SPEC] [--explain] [-i INVENTORY]"
-	@echo "  ./bin/hexol tree [-i INVENTORY]"
+	@echo "  ./bin/hexol tree [-v] [--realize] [-i INVENTORY]"
 	@echo "  ./bin/hexol explain [--query K=V,…] PATH|HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol show HASH [-i INVENTORY]"
 	@echo "  ./bin/hexol lint [-i INVENTORY]"
@@ -33,6 +33,7 @@ test:
 	GUILE=$(GUILE) ./test/diff-cli.sh
 	GUILE=$(GUILE) ./test/render-buffer.sh
 	GUILE=$(GUILE) ./test/errors.sh
+	GUILE=$(GUILE) ./test/tree-cli.sh
 
 test-examples:
 	GUILE=$(GUILE) ./test/examples.sh

@@ -12,6 +12,7 @@
 ;;; knows nothing about k8s, renders any state.
 
 (define-module (hexol yaml)
+  #:use-module ((hexol kernel) #:select (op? short-value))
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
   #:use-module (ice-9 regex)
@@ -72,6 +73,15 @@ keys do not mix.  Anything else is treated as a sequence."
                  (else (string c))))
          (string->list s))))
 
+;; An op in value position is an authoring mistake, not a value: a construct
+;; used inside another construct's field (or spliced into a raw alist) that was
+;; never marked `#:value`. Rendering it would emit `#<op …>` into the manifest.
+(define (check-not-op x)
+  (when (op? x)
+    (error (format #f "cannot render an op as a value: ~a — a construct used inside another construct's field must be marked #:value"
+                   (short-value x))))
+  x)
+
 (define (scalar->yaml x)
   (cond
     ((eq? x #t) "true")
@@ -82,7 +92,7 @@ keys do not mix.  Anything else is treated as a sequence."
     ((string? x) (if (needs-quote? x)
                      (string-append "\"" (escape x) "\"")
                      x))
-    (else (format #f "~a" x))))
+    (else (format #f "~a" (check-not-op x)))))
 
 (define (key->yaml k) (if (string? k) k (symbol->string k)))
 (define (indent n) (make-string n #\space))

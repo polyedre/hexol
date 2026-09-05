@@ -141,8 +141,10 @@ shows the marker.
   #:build (list (cons 'verbs verbs)))
 ```
 
-Getting this wrong is loud: a value construct left unmarked returns an op where
-its parent expects data.
+Getting this wrong is loud: a `#:construct` sub-field checks its result and
+errors (`X: (item …) expects a #:value construct`), and the YAML/JSON emitters
+refuse an op in value position, so an unmarked construct can't quietly render
+as `#<op …>`.
 
 `#:open? #t` lets unknown `(key value)` entries through into an `extra` local
 (an alist) instead of erroring — for generic forms whose key set isn't fixed.
@@ -413,6 +415,7 @@ Because every op carries its own `source` form and (optionally) a
 ```
 hexol ops     INVENTORY   # flat list of top-level ops with kinds + source forms
 hexol tree    INVENTORY   # full nested tree, box-drawn, descending compose-ops + when/case bodies
+                          #   --realize folds once (running effects) to show what constructs produce
 hexol explain PATH INVENTORY   # which ops touched a given path in the final state?
 ```
 

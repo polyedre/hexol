@@ -71,7 +71,7 @@
   #:use-module (ice-9 match)
   #:export (define-construct %expand-call construct-flag construct-map-entries
             construct-map-key construct-map-pair construct-map-splice
-            construct-op construct-label construct-field
+            construct-op construct-label construct-field construct-value
             register-construct! construct-schemas find-constructs))
 
 ;; ---------- schema registry ----------
@@ -303,12 +303,28 @@
                                                  (list-ref i 4) (list-ref i 5) (list-ref i 3)))
                                infos))
                 ;; impl prologue: default unset fields, then coerce.
+                ;; A deferred construct's prologue runs mid-fold like its
+                ;; fields do, so a failing #:default or #:coerce is named the
+                ;; same way. A value construct runs where it is written, where
+                ;; Guile already blames the right line.
+                (blame-in
+                  (lambda (fname form)
+                    (if value?
+                        form
+                        #`(construct-field '#,(datum->syntax #'name name-sym)
+                                           '#,(datum->syntax #'name fname)
+                                           (lambda () #,form)))))
                 (prologue
                   (append-map
                     (lambda (i)
-                      (let ((fid (cadr i)) (deflt (list-ref i 6)) (coerce (list-ref i 7)))
-                        (cons #`(#,fid (if (eq? #,fid '%hx-unset) #,deflt #,fid))
-                              (if coerce (list #`(#,fid (#,coerce #,fid))) '()))))
+                      (let ((fname (car i)) (fid (cadr i))
+                            (deflt (list-ref i 6)) (coerce (list-ref i 7)))
+                        (cons #`(#,fid (if (eq? #,fid '%hx-unset)
+                                           #,(blame-in fname deflt)
+                                           #,fid))
+                              (if coerce
+                                  (list #`(#,fid #,(blame-in fname #`(#,coerce #,fid))))
+                                  '()))))
                     infos))
                 (schema   `((name . ,name-sym) (head . ,head) (doc . ,doc)
                             (value? . ,value?)
@@ -358,7 +374,16 @@ the op's realized children, so introspection can descend after one fold."
                                          (current-author-loc (op-loc op)))
                             (let* ((r   (thunk))
                                    (ops (normalize-ops (if (op? r) (list r) r))))
-                              (set-op-realized-children! op ops)
+                              ;; First realization wins. One construct op fires
+                              ;; once per `hx-each` row, building a fresh set of
+                              ;; ops each time; overwriting would leave
+                              ;; introspection showing only the last row. The
+                              ;; sets are structurally the same modulo the row's
+                              ;; seed, and `show`/`explain` match by content
+                              ;; hash, so keeping the first is the stable
+                              ;; representative.
+                              (when (null? (op-realized-children op))
+                                (set-op-realized-children! op ops))
                               (fold apply-op state ops))))
                         label)))
     op))
@@ -378,6 +403,16 @@ the op's realized children, so introspection can descend after one fold."
                 (cons (format #f "~a: field (~a …)" name field) (or margs '()))
                 rest))
         (_ #f)))))
+
+;; A `#:construct` sub-field expects DATA back, so the sub-construct has to be
+;; a `#:value` one. Unmarked, it returns an op instead, which would silently
+;; embed `#<op …>` in the rendered state — name it here.
+(define (construct-value name field v)
+  "Return V, erroring if it is an op: a #:construct sub-field consumes a value."
+  (if (op? v)
+      (error (format #f "~a: (~a …) expects a #:value construct, got ~a — mark the sub-construct #:value"
+                     name field (short-value v)))
+      v))
 
 ;; Runtime expander every generated `name` transformer calls. Splits the call
 ;; into positional head args + `(key …)` entries, computes each field's value
@@ -431,7 +466,10 @@ the op's realized children, so introspection can descend after one fold."
                   #,(datum->syntax s (format #f "~a: field (~a …)" name fn))
                   #,@(eargs (car es))))
              ((eq? kind 'construct)
-              (let ((mk (lambda (e) #`(#,(ehead e) #,@(eargs e)))))
+              (let ((mk (lambda (e)
+                          #`(construct-value '#,(datum->syntax impl name)
+                                             '#,(datum->syntax impl fn)
+                                             (#,(ehead e) #,@(eargs e))))))
                 (if rep? #`(list #,@(map mk es)) (mk (car es)))))
              (else (let ((a (eargs (car es)))) (if (null? a) #'#t (car a)))))))
        ;; required

@@ -27,9 +27,16 @@ All notable changes to hexol are documented here. The format follows
 - Scope forms (`with-namespace`, `with-schema`, `in-year`, …) bind their
   parameter at fold time as well as at build time, so a field defaulting to
   `(current-k8s-namespace)` still sees the scope.
-- `hexol tree` and `hexol show` fold the inventory once so a construct's
-  produced ops are addressable; a construct's tree line now sits above the
-  resources it produces and carries its head args (`configmap app-config`).
+- A construct's tree line now sits above the resources it produces and carries
+  its head args (`configmap app-config`). Those produced ops only exist once
+  the inventory folds, so `hexol tree` shows them behind the new `--realize`
+  flag (implied by `-v`); plain `tree`/`ops` still never fold, and so still
+  never shell out or decrypt. `show` and `explain` fold anyway and address
+  them without a flag.
+- Constructs' content hashes changed (their source form is now the authored
+  call), so `explain`/`show` addresses noted from an older tree no longer
+  resolve — re-read them from `hexol tree`. Two textually identical construct
+  calls share a hash, as any two identical ops always have.
 
 ## [0.1.0] - 2026-09-03
 

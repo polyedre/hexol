@@ -47,12 +47,14 @@ effect **and** its source form, label, and children:
 <op> = (kind, source, effect : state -> state, label, children)
 ```
 
-Constructs discover their children only by running, so an op also carries the
-ops its effect produced (`op-realized-children`) — filled in on fire, excluded
-from the content hash, and what `tree` descends into after one trial fold.
-
 The fold runs `effect`; tooling (`explain`, `tree`, `ops`) reads `source`
-without executing anything. This is the price that buys back introspection —
+without executing anything — **loading an inventory has no side effects**, so
+`tree`/`ops` never shell out, curl, or decrypt.
+
+A construct discovers the ops it produces only by running, so an op also
+carries them (`op-realized-children`) — filled in on fire and excluded from the
+content hash. Seeing that layer therefore costs a fold, which is why it is
+opt-in: `hexol tree --realize`. This is the price that buys back introspection —
 without it the inventory would be an opaque black box. It is the property that
 separates this from Helm/Kustomize: **rendering is not opaque**, every effect
 is a labelled record, not a string substitution buried in a template.

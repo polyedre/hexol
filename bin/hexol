@@ -600,18 +600,26 @@
 
 ;; The children to show under OP. Declared children first; a deferred construct
 ;; has none until it has fired, and then reports what it actually produced (see
-;; `realize-ops!'). A produced op that is a bare composer (compose-ops leaves
-;; its label #f) would only print its kind again under the construct's own
-;; line, so its children stand in for it.
+;; `realize-ops!'). A produced op that would only repeat its parent's line —
+;; a bare composer (compose-ops leaves its label #f, so it prints its kind) or
+;; one carrying the very same label, as when a construct wraps a single op of
+;; its own name — is skipped in favour of its own children, or dropped outright
+;; when it is the lone child and has none (the parent's line already names it,
+;; and `show <parent>` reports the same delta).
 (define (display-children op)
   (let ((declared (op-children op)))
     (if (pair? declared)
         declared
-        (append-map (lambda (o)
-                      (if (and (not (op-label o)) (pair? (op-children o)))
-                          (op-children o)
-                          (list o)))
-                    (op-realized-children op)))))
+        (let ((realized (op-realized-children op)))
+          (append-map
+            (lambda (o)
+              (let ((kids (display-children o))
+                    (same? (equal? (op-label o) (op-label op))))
+                (cond
+                  ((and (pair? kids) (or (not (op-label o)) same?)) kids)
+                  ((and same? (null? (cdr realized))) '())
+                  (else (list o)))))
+            realized)))))
 
 (define (walk-op-children op bars)
   (let ((children (display-children op)))
@@ -634,25 +642,30 @@
      (walk-list (filter printable-source? (children-of form))
                 bars walk-source))))
 
+;; By default `tree` only LOADS the inventory — no fold, so nothing shells out
+;; and a deferred construct prints as one node with its head label. `--realize`
+;; (implied by `-v`, which has to fold to time anything) folds once and shows
+;; each construct's produced ops as children.
 (define (cmd-tree args)
   (call-with-values (lambda () (extract-verbose args))
-    (lambda (verbose? rest)
-      (let* ((inv (inventory-only "tree" rest))
-             (ops (load-ops inv))
-             ;; Fold before measuring hash widths: the fold is what gives
-             ;; deferred constructs their children, and they need addresses too.
-             (timings (and verbose? (make-hash-table))))
-        (if timings
-            ;; Times include children (a parent totals its subtree). Seeded
-            ;; with the empty query, like `render`.
-            (false-if-exception (resolve-with-timings ops '() timings))
-            (realize-ops! ops))
-        (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
-          (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
-          (when timings
-            (note ";; -v: fold time per op (inclusive of children)~%"))
-          (parameterize ((tree-timings timings))
-            (walk-list ops '() walk-op)))))))
+    (lambda (verbose? rest0)
+      (call-with-values (lambda () (extract-flag '("--realize") rest0))
+        (lambda (realize? rest)
+          (let* ((inv (inventory-only "tree" rest))
+                 (ops (load-ops inv))
+                 ;; Times include children (a parent totals its subtree).
+                 ;; Seeded with the empty query, like `render`.
+                 (timings (and verbose? (make-hash-table))))
+            ;; Fold before measuring hash widths: the fold is what gives
+            ;; deferred constructs their children, and they need addresses too.
+            (when (or verbose? realize?)
+              (realize-ops! ops timings))
+            (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
+              (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
+              (when timings
+                (note ";; -v: fold time per op (inclusive of children)~%"))
+              (parameterize ((tree-timings timings))
+                (walk-list ops '() walk-op)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; explain — every op that changed a path during the fold
@@ -699,14 +712,31 @@
                  ((not target) (loop rest arg))
                  (else (usage-error "explain: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
+;; Locate OP in the fire-order TRACE, returning (before . after) — the prior
+;; step's state and this step's — or #f if it never fired.
+;;
+;; Identity first, content hash second. The ops a deferred construct produces
+;; exist only inside the fold, so the op a caller matched by hash need not be
+;; the very object the trace holds (a construct that fires per `hx-each` row
+;; produces a fresh set each time); the hash is what "the same op" means to
+;; every other address in the CLI. The eq? pass runs first so the common case
+;; costs no hashing.
+(define (trace-step op trace)
+  (define (scan same?)
+    (let loop ((prev '((attributes))) (steps trace))
+      (cond
+        ((null? steps) #f)
+        ((same? (caar steps)) (cons prev (cdar steps)))
+        (else (loop (cdar steps) (cdr steps))))))
+  (or (scan (lambda (o) (eq? o op)))
+      (let ((h (op-content-hash op)))
+        (scan (lambda (o) (string=? (op-content-hash o) h))))))
+
 ;; The state paths OP changed when it fired — its delta's keys. Mirrors
 ;; show-delta's trace walk, but returns the paths instead of printing.
 (define (op-changed-paths op trace)
-  (let loop ((prev '((attributes))) (steps trace))
-    (cond
-      ((null? steps) '())
-      ((eq? (caar steps) op) (map car (state-diff prev (cdar steps) '())))
-      (else (loop (cdar steps) (cdr steps))))))
+  (let ((step (trace-step op trace)))
+    (if step (map car (state-diff (car step) (cdr step) '())) '())))
 
 ;; Print the explain trace for one PATH: its final value and every op that
 ;; changed it.
@@ -731,11 +761,13 @@
 ;; otherwise parsed as a PATH. A hash prefix wins over a same-spelled single-
 ;; segment path; qualify with a `.` (or full path) to force path mode.
 (define (do-explain inv target)
-  (let* ((ops (load-ops inv))
-         (op  (and (not (string-index target #\.))
-                   (let ((ms (hash-matches ops target))) (and (pair? ms) (car ms))))))
+  (let ((ops (load-ops inv)))
+    ;; Resolve BEFORE matching: `explain` folds anyway, and the fold is what
+    ;; gives a deferred construct's produced ops their addresses.
     (call-with-values (lambda () (resolve-with-trace ops '()))
       (lambda (final trace)
+        (let ((op (and (not (string-index target #\.))
+                       (let ((ms (hash-matches ops target))) (and (pair? ms) (car ms))))))
         (note ";; inventory: ~a~%" inv)
         (if op
             (let ((paths (op-changed-paths op trace)))
@@ -745,7 +777,7 @@
               (if (null? paths)
                   (note ";; (this op fired no leaf delta — it's a wrapper; explain its children)~%")
                   (for-each (lambda (path) (explain-path final trace path)) paths)))
-            (explain-path final trace (parse-path target)))))))
+            (explain-path final trace (parse-path target))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; lint — reads that precede the write they depend on (see hexol/lint.scm)
@@ -774,10 +806,21 @@
 
 ;; Fold OPS once, discarding the state, so every deferred construct records the
 ;; ops it produced (`op-realized-children') and introspection can descend into
-;; them. Failures are swallowed: a tree of an inventory that does not resolve is
-;; still worth printing, just without the realized layer.
-(define (realize-ops! ops)
-  (false-if-exception (resolve ops (list))))
+;; them. OPT-IN ONLY (`tree --realize`, `tree -v`): a fold runs real effects —
+;; helm/yq, curl, sops — and plain `tree`/`ops` must stay side-effect free.
+;; A failing fold is reported, not raised: the tree is still worth printing,
+;; just without the realized layer.
+(define* (realize-ops! ops #:optional (timings #f))
+  (catch #t
+    (lambda ()
+      (if timings (resolve-with-timings ops '() timings) (resolve ops '()))
+      #t)
+    (lambda (key . args)
+      (note ";; note: the fold failed, so produced ops are not shown: ~a~%"
+            (if (and (pair? args) (pair? (cdr args)) (string? (cadr args)))
+                (apply format #f (cadr args) (or (caddr args) '()))
+                key))
+      #f)))
 
 ;; Resolve a hash PREFIX against every op in the tree. Returns matching ops
 ;; (empty when none match, so callers can fall back to other addressing). Exits
@@ -817,17 +860,16 @@
                    keys)))
     (else (list (list path a b)))))
 
-;; Walk the fire-order trace to where OP fired (by eq?) and print the delta it
-;; introduced — `before` is the prior step's after-state. Wrappers
-;; (compose/when/case) fire after their children and show no delta; that's
-;; reported rather than left blank.
+;; Print the delta OP introduced where it fired in the trace — `before` is the
+;; prior step's after-state. Wrappers (compose/when/case) fire after their
+;; children and show no delta; that's reported rather than left blank.
 (define (show-delta op trace)
-  (let loop ((prev '((attributes))) (steps trace))
+  (let ((step (trace-step op trace)))
     (cond
-      ((null? steps)
+      ((not step)
        (note ";; state delta: this op did not fire in the resolve~%"))
-      ((eq? (caar steps) op)
-       (let ((diff (state-diff prev (cdar steps) '())))
+      (else
+       (let ((diff (state-diff (car step) (cdr step) '())))
          (if (null? diff)
              (note ";; state delta: none (wrapper/composite — see children)~%")
              (begin
@@ -840,8 +882,7 @@
                            (render-delta-value "+" o-green (caddr d))))
                  (if (> (length diff) 40) (take diff 40) diff))
                (when (> (length diff) 40)
-                 (note ";;   … and ~a more path(s)~%" (- (length diff) 40)))))))
-      (else (loop (cdar steps) (cdr steps))))))
+                 (note ";;   … and ~a more path(s)~%" (- (length diff) 40))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; source blob — `show` prints the op's raw source s-expression. pretty-print
@@ -888,10 +929,17 @@
         "\n"))))
 
 (define (do-show inv prefix)
-  (let* ((ops     (load-ops inv))
-         (_       (realize-ops! ops))   ; addresses inside deferred constructs
-         (matches (hash-matches ops prefix)))
-    (cond
+  ;; One fold, with the trace: it both realizes the ops a construct produces
+  ;; (so they are addressable) and is the trace the delta is read from. Folding
+  ;; twice would run every effect twice and leave the matched op unrelated to
+  ;; the ops the second fold produced.
+  (call-with-values (lambda () (let ((ops (load-ops inv)))
+                                 (call-with-values
+                                   (lambda () (resolve-with-trace ops '()))
+                                   (lambda (final trace) (values ops trace)))))
+   (lambda (ops trace)
+    (let ((matches (hash-matches ops prefix)))
+     (cond
       ((null? matches)
        (die "show: no op matches hash prefix ~s in ~a" prefix inv))
       (else
@@ -915,8 +963,7 @@
          (note ";; source:~%")
          (print-source-blob (op-source op))
          (newline)
-         (call-with-values (lambda () (resolve-with-trace ops '()))
-           (lambda (final trace) (show-delta op trace))))))))
+         (show-delta op trace))))))))
 
 (define (cmd-show args)
   (call-with-values (lambda () (extract-inventory "show" args))
@@ -1140,7 +1187,7 @@ Writes the inventory to stdout:  hexol import -f app.yaml > app.scm")
    "diff   [--only SPEC] [--explain] [-i INVENTORY]   (exit 0 clean, 1 drift, 2 error)"))
 (register-verb!
  (make-verb "tree" (cmd-is "tree") (delegating-runner cmd-tree)
-   "tree    [-v] [-i INVENTORY]"))
+   "tree    [-v] [--realize] [-i INVENTORY]"))
 (register-verb!
  (make-verb "explain" (cmd-is "explain") (delegating-runner cmd-explain)
    "explain PATH|HASH [-i INVENTORY]"))
@@ -1198,15 +1245,18 @@ Writes the inventory to stdout:  hexol import -f app.yaml > app.scm")
            (loop rest (substring arg 12) acc)
            (loop rest inv (cons arg acc)))))))
 
-;; Pull -v/--verbose out of ARGS wherever it appears, returning (values
-;; VERBOSE? REST) so a verb can opt in without `inventory-only` (which rejects
-;; stray args) tripping over the flag.
-(define (extract-verbose args)
-  (let loop ((args args) (v #f) (acc '()))
+;; Pull a valueless flag (any of NAMES) out of ARGS wherever it appears,
+;; returning (values PRESENT? REST) so a verb can opt in without
+;; `inventory-only` (which rejects stray args) tripping over the flag.
+(define (extract-flag names args)
+  (let loop ((args args) (found #f) (acc '()))
     (match args
-      (() (values v (reverse acc)))
-      (((or "-v" "--verbose") . rest) (loop rest #t acc))
-      ((arg . rest) (loop rest v (cons arg acc))))))
+      (() (values found (reverse acc)))
+      ((arg . rest) (if (member arg names)
+                        (loop rest #t acc)
+                        (loop rest found (cons arg acc)))))))
+
+(define (extract-verbose args) (extract-flag '("-v" "--verbose") args))
 
 ;; For verbs whose only input is the inventory (tree, ops): resolve from
 ;; -i/--inventory or $HEXOL_INVENTORY and reject any stray argument.

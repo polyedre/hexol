@@ -9,6 +9,7 @@
 
 (define-module (hexol json)
   #:use-module (json)
+  #:use-module ((hexol kernel) #:select (op? short-value))
   #:use-module ((hexol yaml) #:select (object-shape?))
   #:use-module (srfi srfi-1)
   #:export (sexp->json-string state->json-ready))
@@ -27,6 +28,11 @@
              (state->json-ready (cdr obj))))
     ((list? obj)
      (list->vector (map state->json-ready obj)))
+    ;; An op here is an unmarked `#:value` construct that leaked into a value
+    ;; slot; it would render as `#<op …>`. Same check as (hexol yaml).
+    ((op? obj)
+     (error (format #f "cannot render an op as a value: ~a — a construct used inside another construct's field must be marked #:value"
+                    (short-value obj))))
     (else obj)))
 
 ;; guile-json doesn't escape ASCII control chars; raw bytes (ANSI, NUL)
