@@ -11,17 +11,32 @@
 
 (define-module (hexol lint)
   #:use-module (hexol kernel)
+  #:use-module ((hexol secrets) #:select (secret-ref?))
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
   #:export (lint-ops))
 
 (define (alist? x) (and (list? x) (every pair? x)))
 
+;; #t when B differs from A only where A held a `secret-ref' marker.  Such a
+;; write is a substitution, not a mutation: an earlier read could never have
+;; observed anything but the opaque marker, so a terminal pass like
+;; `resolve-secret-refs' must not make every earlier read look stale.  The
+;; test is on the values, so any pass that only fills markers in is
+;; transparent while one that changes real data still counts as a write.
+(define (resolution-only? a b)
+  (cond ((equal? a b) #t)
+        ((secret-ref? a) #t)
+        ((and (pair? a) (pair? b))
+         (and (resolution-only? (car a) (car b))
+              (resolution-only? (cdr a) (cdr b))))
+        (else #f)))
+
 ;; Leaf paths whose value differs between state nodes A and B, under PATH.
 ;; Alists recurse key-by-key; anything else is compared whole.
 (define (changed-paths a b path)
   (cond
-    ((equal? a b) '())
+    ((resolution-only? a b) '())
     ((and (alist? a) (alist? b) (pair? a) (pair? b))
      (let ((keys (delete-duplicates (append (map car a) (map car b)) eq?)))
        (append-map (lambda (k)

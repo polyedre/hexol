@@ -5,6 +5,7 @@
 (use-modules (hexol kernel)
              (hexol surface)
              (hexol lint)
+             ((hexol secrets) #:select (secret-ref secret-ref?))
              (srfi srfi-1)
              (ice-9 format))
 
@@ -167,6 +168,26 @@
 (check "lint: predicate read before write warns" 1
        (lint-count (hx-ops (hx-when (get '(flag)) (hx-merge (hit yes)))
                            (hx-merge (flag #t)))))
+;; A terminal substitution pass (resolve-secret-refs) rewrites the whole
+;; state, but only inside secret-ref markers: earlier reads saw the marker,
+;; never a value the pass could change, so they are not stale.
+(define (subst-markers state)
+  (cond ((secret-ref? state) "plaintext")
+        ((pair? state) (cons (subst-markers (car state)) (subst-markers (cdr state))))
+        (else state)))
+(define resolve-refs-op
+  (make-op 'resolve-secret-refs '(resolve-secret-refs) subst-markers
+           "resolve-secret-refs"))
+(check "lint: secret substitution is not a stale write" 0
+       (lint-count (hx-ops (hx-merge (svc (tok ($ (secret-ref 'tok)))))
+                           (hx-merge (n ($ (length (get '(svc))))))
+                           resolve-refs-op)))
+(check "lint: real write under a marker's parent still warns" 1
+       (lint-count (hx-ops (hx-merge (svc (tok ($ (secret-ref 'tok)))))
+                           (hx-merge (n ($ (length (get '(svc))))))
+                           (hx-merge (svc (extra 1)))
+                           resolve-refs-op)))
+
 (check "lint: message names path and ops" #t
        (string-prefix? "path a.n read by op merge"
                        (car (lint-ops (hx-ops (hx-merge (m ($ (get '(a n)))))
