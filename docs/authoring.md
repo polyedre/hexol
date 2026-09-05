@@ -92,18 +92,38 @@ nothing else.
 - `(key ($ expr))` — computed:  `(mirror ($ (str "rpm." (attr 'dc))))`
 
 Unquoted symbols in value position are auto-quoted: `(encryption at-rest)`
-yields the symbol `at-rest`. The `$` marker is required only when a
-value's syntactic shape could be mistaken for a nested map (e.g. an
-arithmetic expression like `(* 1024 ...)`).
+yields the symbol `at-rest`. Nothing in a value position is *evaluated*, so
+**any computed value needs the `$` marker** — not just arithmetic. A
+parenthesised form without `$` is always read as a nested map, silently:
+
+```scheme
+(hx-merge (a (string-append "x" "y")))       ; => (a (string-append "x" "y"))  ← a map!
+(hx-merge (a ($ (string-append "x" "y"))))   ; => (a . "xy")                   ← what you meant
+```
+
+`,@` splicing does **not** work inside `hx-merge`: `(a ,@xs)` yields the map
+`(a (unquote-splicing . xs))`. Build the list in Scheme and pass it through
+`$` instead — `(a ($ xs))`. (`,@` *is* supported in a typed constructor's
+`#:list` field, e.g. `(deployment "d" (image "i") (args ,@flags))`.)
 
 > **Two surfaces, one rule each.** The auto-quoting above is the
 > *config-tree* layer (`hx-merge`/`hx-append`/`hx-when`/`hx-case`), where
-> symbol values pair naturally with the symbol-valued query attributes.
-> **Typed library constructors** (`(hexol k8s)`, the SQL column sugar, …)
-> use the opposite, evaluate-by-default rule: a record body of `(key value)`
-> entries where values are ordinary Scheme — `(deployment "api" (image "x")
-> (replicas (if prod? 3 1)))`. Which rule applies is always decided by the
-> form you're in. See [`extending.md`](extending.md) for `define-construct`.
+> nothing evaluates and `$` is how you compute. **Typed library constructors**
+> (`(hexol k8s)`, the SQL column sugar, …) use the opposite,
+> evaluate-by-default rule: a record body of `(key value)` entries where
+> values are ordinary Scheme, evaluated at load time.
+>
+> ```scheme
+> (hx-merge  (nginx (workers ($ (* 2 (attr 'cores))))))  ; config tree: $ to compute
+> (deployment "api" (image "x") (replicas (if prod? 3 1)))  ; construct: plain Scheme
+> ```
+>
+> The corollary is that `$`/`attr`/`get` are **fold**-time and a constructor
+> body is **load**-time, so `$` inside a constructor field is an error
+> (`$ used outside of merge value position`). Which rule applies is always
+> decided by the form you're in. See [`extending.md`](extending.md) for
+> `define-construct`, and "large inventories" below for how to vary a
+> constructor per environment.
 
 ## Helpers inside `$` and inside predicates
 
@@ -131,7 +151,7 @@ wherever you call it:
 
 ```scheme
 (hx-when (attrs (role web))
-  (load-inventory-file "examples/services/nginx.scm"))
+  (load-inventory-file "examples/kubernetes.scm"))
 ```
 
 Each fragment file is itself an `(hx-ops ...)` form evaluating to a list of
@@ -147,6 +167,66 @@ needed, since `hx-ops`/`hx-when` already flatten the returned list.
 
 See `examples/inventory.scm` for a worked split: it pulls in
 `examples/kubernetes.scm` via `load-inventory-file`, gated by an `hx-when`.
+
+### The loader's contract (as it behaves today)
+
+Three rules are easy to trip over, so state them plainly:
+
+1. **The last top-level form of an inventory file must evaluate to the list of
+   ops.** The loader reads every form, evaluates them in order, and returns
+   the value of the *last* one — anything else is a load error (`last form
+   must evaluate to a list of ops`). So `(appliers …)`, `(actions …)`,
+   `(renders-with …)` and every `define` go **before** the closing
+   `(hx-ops …)`, however naturally they read at the bottom of the file. A
+   helpers-only fragment must still end in a bare `(hx-ops)`.
+2. **Fragments share one namespace.** Every form is evaluated in the
+   `(hexol surface)` module, not in a module of its own, so a `define` in one
+   fragment is visible to every later fragment and to the parent — and a name
+   defined twice silently takes the last definition. Load order *is* the
+   dependency graph; there is no import declaration. Past ~10 fragments,
+   prefer real Guile modules (`define-module` + `#:export`, called from the
+   parent `hx-ops`) over a flat pile of `load-inventory-file` calls.
+3. **Relative paths resolve against `$PWD`, not against the including file.**
+   `(load-inventory-file "dcs/alpha.scm")` inside `envs/prod.scm` looks for
+   `./dcs/alpha.scm` relative to wherever you ran `hexol`. Either run the CLI
+   from the repo root (what every example assumes) or build the path yourself.
+
+## Large inventories: tables + generators
+
+Past a dozen apps, the layout that scales is **plain Scheme data tables plus
+pure generator functions** — not one fragment per app. Keep the data an
+operator edits in one place, and derive everything from it:
+
+```scheme
+;; 1. tables — the only thing you hand-edit. One row per app.
+(define apps '(("api"   #:team payments #:port 8080 #:deps ("ledger"))
+               ("ledger" #:team payments #:port 9000 #:deps ())))
+(define environments '((dev . ((replicas . 1))) (prod . ((replicas . 3)))))
+
+;; 2. generators — ordinary procedures, row -> list of ops. Load-time Scheme,
+;;    so the whole row is in scope and typed constructors work normally.
+(define (app-ops row env) (list (deployment (car row) …) (service (car row) …)))
+
+;; 3. fan out. `hx-each` owns the config-tree layer and gives you the
+;;    per-env nesting + attribute seed; `append-map` + a one-row `hx-each`
+;;    keeps that nesting while letting the body be a plain function of the env
+;;    (a constructor body cannot read `attr`/`get` — see "two value rules").
+(hx-ops
+  (append-map
+    (lambda (e)
+      (hx-each (list e) #:into envs                    ; one-row table
+        (append-map (lambda (row) (app-ops row e)) apps)))
+    environments))
+```
+
+Adding an app is then one table row. A column like `#:deps` can drive several
+outputs at once (config URLs *and* NetworkPolicy rules), so they cannot drift.
+Cross-cutting rules (labels, hardening) belong in a `transform-resources` pass
+over the accumulated resources, not in each generator.
+
+Caveat: nesting under `envs.<name>` means `render -o yaml|terraform` and the
+built-in appliers, which look at the *top-level* accumulators, see nothing —
+pass `--path envs.prod.kubernetes_resources`.
 
 ## Migrating: `hexol import`
 
@@ -273,20 +353,41 @@ the secrets (the same graceful skip the old per-file approach had).
 
 ### Managing the store: `hexol secret`
 
-You don't edit the `(secrets-store …)` form by hand. Every verb takes the
-inventory as its last argument; the mutating ones decrypt, change the
-plaintext, re-seal with sops, and rewrite **only** the store form's span in
-the file (everything else stays byte-for-byte identical):
+You don't edit the `(secrets-store …)` form by hand. The inventory comes from
+`-i/--inventory` (or `$HEXOL_INVENTORY`), like every other subcommand; the
+mutating verbs decrypt, change the plaintext, re-seal with sops, and rewrite
+**only** the affected span in the file (everything else stays byte-for-byte
+identical):
 
 ```sh
-hexol secret ls               inventory.scm   # list keys — no decrypt
-hexol secret get   db/password inventory.scm   # decrypt one secret to stdout
-hexol secret set   db/password inventory.scm   # add/replace; value from a 3rd arg or stdin
-hexol secret edit  db/password inventory.scm   # decrypt into $EDITOR; reseal on change
-hexol secret rm    db/password inventory.scm   # drop a key
-hexol secret rekey             inventory.scm   # re-seal to the current recipients
-hexol secret init              inventory.scm   # insert an empty (secrets-store (data)) form
+hexol secret ls    -i inventory.scm   # list keys — no decrypt
+hexol secret get   KEY -i inventory.scm   # decrypt one secret to stdout
+hexol secret set   KEY [VALUE] -i inventory.scm   # add/replace; VALUE omitted → stdin
+hexol secret edit  KEY -i inventory.scm   # decrypt into $EDITOR; reseal on change
+hexol secret edit  -i inventory.scm   # the whole store as one editable alist
+hexol secret rm    KEY -i inventory.scm   # drop a key
+hexol secret rekey -i inventory.scm   # re-seal to the current recipients
+hexol secret init  -i inventory.scm   # insert an empty (secrets-store (data)) form
 ```
+
+**What `KEY` is.** Not a name you invent: it is one of the ids `hexol secret
+ls` prints. An inline `(hx-secret "ENC[…]")` is keyed by its **full path in
+the resolved state**, so the keys look like state paths, not like
+`db/password`:
+
+```
+$ hexol secret ls -i examples/secrets.scm
+kubernetes_resources.app-secrets.stringData.API_TOKEN
+kubernetes_resources.app-secrets.stringData.DB_PASSWORD
+kubernetes_resources.tls-params.stringData.dhparam.pem
+;; 3 secrets · sealed 2026-06-21T13:41:25Z · recipients: age · 3 inline
+```
+
+Give an inline secret a stable id with `(hx-secret 'id "ENC[…]")` — then the
+id is the key and moving the value in the state doesn't rename it. Entries in
+the store's own `(data …)` block (the `(secret-ref 'k)` style shown above) are
+keyed by the symbol you wrote there, e.g. `db/password`. Run `ls` first and
+copy a key from it.
 
 Sealing reuses the `sops` creation rule from the nearest `.sops.yaml` found by
 walking up from the inventory's directory — so recipients (PGP keys, age
@@ -297,9 +398,9 @@ can decrypt the existing store; `ls` needs neither.
 Typical first-time flow for a fresh inventory:
 
 ```sh
-hexol secret init inventory.scm                          # add the empty form
-pass db/password | hexol secret set db/password inventory.scm   # seal a value from stdin
-hexol secret ls inventory.scm                            # confirm
+hexol secret init -i inventory.scm                       # add the empty form
+hexol secret ls   -i inventory.scm                       # see the keys your inventory declares
+pass db/password | hexol secret set db/password -i inventory.scm   # seal a value from stdin
 ```
 
 ## Discovering a library's constructs
@@ -307,11 +408,17 @@ hexol secret ls inventory.scm                            # confirm
 Every typed constructor (`deployment`, `app`, `varchar`, …) is a
 `define-construct`, and its schema — positional head, fields, which are
 required, their defaults, flags and one-line docs — is recorded when the
-module loads. `hexol doc` prints it: `hexol doc` alone lists every construct
-of the built-in libraries (name, module, one-line doc); `hexol doc app`
-prints `app`'s signature, a fields table and a minimal example built from its
-required fields; add `-i inventory.scm` to document whatever that inventory
-loads, its own `define-construct`s included. No need to read `k8s.scm`.
+module loads. `hexol doc` prints it: `hexol doc app` prints `app`'s signature, a fields
+table and a minimal example built from its required fields. No need to read
+`k8s.scm`.
+
+`hexol doc` with **no** `-i` lists only the constructs the CLI itself
+preloads — today `(hexol k8s)` and `(hexol sql)`. Everything else (terraform,
+your own `define-construct`s, any third-party library) shows up only when you
+pass an inventory that loads it: `hexol doc -i inventory.scm` lists exactly
+what *that* inventory registers, and nothing it doesn't load. Note the listing
+covers constructs only — plain procedures and macros (`expose`, `label-all`,
+`transform-resources`, `appliers`, …) never appear.
 
 ## Repository layout
 

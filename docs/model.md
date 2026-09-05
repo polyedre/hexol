@@ -53,6 +53,27 @@ without it the inventory would be an opaque black box. It is the property that
 separates this from Helm/Kustomize: **rendering is not opaque**, every effect
 is a labelled record, not a string substitution buried in a template.
 
+## Two value rules, one seam
+
+The surface has two layers with opposite rules, and the seam between them is
+the load-time / fold-time boundary:
+
+- **Config tree** (`hx-merge`/`hx-append`/`hx-when`/`hx-case`): nothing in
+  value position is evaluated. Symbols self-quote, and any parenthesised form
+  is a nested map — so *every* computed value takes the `$` marker, which
+  defers it to fold time where `attr`/`get` exist.
+- **Typed constructors** (`define-construct`: `(deployment …)`, `(varchar …)`,
+  …): the schema names each field, so values are ordinary Scheme, evaluated
+  at load time. No `$` — and no `attr`/`get`, which do not exist yet.
+
+```scheme
+(hx-merge (nginx (workers ($ (* 2 (attr 'cores))))))   ; fold time, needs $
+(deployment "api" (image "x") (replicas (if prod? 3 1)))  ; load time, plain Scheme
+```
+
+Consequence: a constructor body cannot depend on resolved state. Vary it in
+Scheme instead (see `authoring.md`, "large inventories").
+
 ## Why ordering is load-bearing
 
 A computed value (`($ (* 1024 (get '(nginx workers))))`) sees whatever state
