@@ -350,7 +350,12 @@ folds the op (or list of ops) it returns.  The produced ops are recorded as
 the op's realized children, so introspection can descend after one fold."
   (letrec ((op (make-op 'construct source
                         (lambda (state)
-                          (parameterize ((current-state state))
+                          ;; Re-bind the authored location too: the ops #:build
+                          ;; returns are made now, deep inside the fold, and
+                          ;; `explain' must still blame the line that wrote the
+                          ;; construct.
+                          (parameterize ((current-state state)
+                                         (current-author-loc (op-loc op)))
                             (let* ((r   (thunk))
                                    (ops (normalize-ops (if (op? r) (list r) r))))
                               (set-op-realized-children! op ops)
