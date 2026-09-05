@@ -20,10 +20,10 @@ ARG LIBYAML
 RUN apk add --no-cache guile guile-dev gcc musl-dev make pkgconf yaml yaml-dev curl
 WORKDIR /src
 # nyacc: pure Guile; provides `guild compile-ffi`.
-RUN curl -fsSL "https://download.savannah.gnu.org/releases/nyacc/nyacc-${NYACC}.tar.gz" | tar xz \
+RUN curl -fsSL --retry 5 --retry-all-errors "https://download-mirror.savannah.gnu.org/releases/nyacc/nyacc-${NYACC}.tar.gz" | tar xz \
  && cd "nyacc-${NYACC}" && ./configure --prefix=/usr && make && make install
 # guile-libyaml: generate the FFI bindings, compile, install into guile's site dirs.
-RUN curl -fsSL "https://github.com/mwette/guile-libyaml/archive/refs/tags/V${LIBYAML}.tar.gz" | tar xz \
+RUN curl -fsSL --retry 5 --retry-all-errors "https://github.com/mwette/guile-libyaml/archive/refs/tags/V${LIBYAML}.tar.gz" | tar xz \
  && cd "guile-libyaml-${LIBYAML}" \
  && GUILE_AUTO_COMPILE=0 guild compile-ffi --no-exec yaml/libyaml.ffi \
  && sed -i 's| "libyaml"| "/usr/lib/libyaml"|' yaml/libyaml.scm \
