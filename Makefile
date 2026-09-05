@@ -41,7 +41,7 @@ build:
 IMAGE ?= hexol
 OCI ?= $(shell command -v podman || command -v docker)
 image:
-	$(OCI) build -t $(IMAGE) .
+	$(OCI) build -f Containerfile -t $(IMAGE) .
 
 # Alternative: let Guix assemble the image from guix.scm (bigger image, but no
 # source build of guile-libyaml). Loads the tarball into $(OCI).

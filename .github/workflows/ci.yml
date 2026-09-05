@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the image
-        run: docker build -t hexol:ci .
+        run: docker build -f Containerfile -t hexol:ci .
       - name: Smoke-test it
         run: |
           docker run --rm hexol:ci --version
