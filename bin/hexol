@@ -817,9 +817,7 @@
       #t)
     (lambda (key . args)
       (note ";; note: the fold failed, so produced ops are not shown: ~a~%"
-            (if (and (pair? args) (pair? (cdr args)) (string? (cadr args)))
-                (apply format #f (cadr args) (or (caddr args) '()))
-                key))
+            (throw-message key args))
       #f)))
 
 ;; Resolve a hash PREFIX against every op in the tree. Returns matching ops
@@ -1405,6 +1403,17 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
 ;; message, followed by the innermost source location we can recover from the
 ;; captured stack. HEXOL_DEBUG=1 bypasses this for the full backtrace, and
 ;; --backtrace / HEXOL_BACKTRACE=1 prints the message *and* the backtrace.
+;; A throw's message as a plain string, for the places that REPORT an error
+;; without re-raising it. Matches the (scm-error) shape `report-error' prints,
+;; including the short `(throw key subr msg)' form that carries no message-args
+;; list; anything else falls back to the raw key and args.
+(define (throw-message key args)
+  (match args
+    ((subr (? string? msg) margs . _) (apply format #f msg (or margs '())))
+    ((subr (? string? msg))           msg)
+    ((? string? msg)                  msg)
+    (_ (format #f "~a: ~s" key args))))
+
 (define (report-error key args)
   (match args
     ;; Standard (scm-error) shape: (subr message message-args . _), subr may be

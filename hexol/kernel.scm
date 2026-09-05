@@ -132,8 +132,10 @@ declared, so it is excluded from `op-content-hash'."
 (define (relabel op label)
   "Return OP with its LABEL replaced, preserving kind, source, effect,
 children, and source location."
+  ;; A fresh realized box: the copy is its own op, and sharing the box would
+  ;; make one of them report ops the other produced.
   (%make-op (op-kind op) (op-source op) (op-effect op)
-            label (op-children op) (op-loc op) (op-realized op)))
+            label (op-children op) (op-loc op) (list (op-realized-children op))))
 
 ;; (stamp-loc form) evaluates form with current-author-loc bound to form's own
 ;; source location, so ops built while it runs are blamed on the authored line.
@@ -500,20 +502,34 @@ SOURCE is the authored form."
 ;; `get'/`attr' work in whatever it evaluates) and this op's own authored line
 ;; restored (so ops it builds deep inside the fold are still blamed on it);
 ;; whatever it returns — one op or a list of ops — is then folded.
+;; One op fires once per `for-each-into' row, rebuilding its ops each time, so
+;; realizations ACCUMULATE — otherwise only one row's ops would be addressable
+;; by `show'/`explain'. Deduplicated by content hash: rows that produce the same
+;; op contribute it once, and a row that produces a different one (a name read
+;; from the row's seed) adds it.
+(define (merge-realized have new)
+  (let loop ((xs new) (seen (map op-content-hash have)) (acc '()))
+    (if (null? xs)
+        (append have (reverse acc))
+        (let ((h (op-content-hash (car xs))))
+          (if (member h seen string=?)
+              (loop (cdr xs) seen acc)
+              (loop (cdr xs) (cons h seen) (cons (car xs) acc)))))))
+
 (define* (op:late kind source thunk #:optional (label #f))
   "Return an op of KIND that runs THUNK when it fires, with `current-state'
 and `current-author-loc' bound, then folds the op (or list of ops) THUNK
 returned.  Those ops are recorded as the op's realized children so
-introspection can descend after a fold; the FIRST realization is kept, since
-one op fires once per `for-each-into' row and each row rebuilds them."
+introspection can descend after a fold, accumulating across fires (one op
+fires once per `for-each-into' row) and deduplicated by content hash."
   (letrec ((op (make-op kind source
                         (lambda (state)
                           (parameterize ((current-state state)
                                          (current-author-loc (op-loc op)))
-                            (let* ((r   (thunk))
-                                   (ops (normalize-ops (if (op? r) (list r) r))))
-                              (when (null? (op-realized-children op))
-                                (set-op-realized-children! op ops))
+                            (let ((ops (let ((r (thunk)))
+                                         (normalize-ops (if (op? r) (list r) r)))))
+                              (set-op-realized-children!
+                                op (merge-realized (op-realized-children op) ops))
                               (fold apply-op state ops))))
                         label)))
     op))

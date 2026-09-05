@@ -7,13 +7,14 @@
 ;;;   (secret-ref 'key)        ;; a marker referencing a secret at a field
 ;;;   (resolve-secret-refs)    ;; op that decrypts + substitutes (render)
 ;;;
-;;; Marker + terminal op, not decrypt-in-place: resources are built at *load*
-;;; time (the quasiquote `,(secret-ref …)` runs then), but we shell out to
-;;; `sops` only at *render* time — never for `tree`/`ops`, which load but
-;;; never fold. So `secret-ref` bakes a cheap `<secret-ref>` marker into the
-;;; resource, and `resolve-secret-refs` (last in the inventory) walks the
-;;; resolved state swapping each marker for plaintext. It runs only inside
-;;; `resolve`, so `tree`/`ops` stay sops-free.
+;;; Marker + terminal op, not decrypt-in-place: we shell out to `sops` only at
+;;; *render* time — never for a plain `tree`/`ops`, which load but never fold.
+;;; So `secret-ref` bakes a cheap `<secret-ref>` marker into the resource, and
+;;; `resolve-secret-refs` (last in the inventory) walks the resolved state
+;;; swapping each marker for plaintext. It runs only inside `resolve`, so
+;;; `tree`/`ops` stay sops-free — with the two flags that explicitly ask for a
+;;; fold as the exception: `tree --realize` and `tree -v` resolve, and
+;;; therefore decrypt, like `render` does.
 ;;;
 ;;; One shared envelope: the whole store is ONE sops document — a single
 ;;; age-encrypted data key and one MAC cover every secret, so each added
@@ -351,8 +352,9 @@ ciphertext of its own."
 ciphertext (keyed by id or path), decrypts the store once, and substitutes the
 plaintext.  Place it last in the inventory — it must run after the resources
 that reference secrets.  A no-op when `secret-resolution-disabled' is set (so
-the secret tooling can read the marker layout), and sops-free for `tree'/`ops'
-since it only fires during `resolve'."
+the secret tooling can read the marker layout), and sops-free for a plain
+`tree'/`ops' since it only fires during `resolve' (which `tree --realize' and
+`tree -v' do run)."
   (make-op 'resolve-secret-refs '(resolve-secret-refs)
     (lambda (state)
       (if (secret-resolution-disabled)

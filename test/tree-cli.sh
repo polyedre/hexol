@@ -58,7 +58,7 @@ else
 fi
 
 # The hash of a produced op, as `tree --realize` prints it.
-child=$(printf '%s\n' "$out" | grep 'resource ConfigMap/cfg' | awk '{print $1}')
+child=$(printf '%s\n' "$out" | grep -E 'resource ConfigMap/cfg$' | awk '{print $1}')
 check "tree --realize prints an address for the produced op" \
       "$([ -n "$child" ] && echo yes || echo no)" "$out"
 
@@ -75,6 +75,24 @@ if [ -n "$child" ]; then
     *) check "explain <child> resolves the hash" no "$e" ;;
   esac
 fi
+
+out=$(hexol tree --realize -i "$inv" 2>/dev/null)
+case "$out" in
+  *"resource ConfigMap/cfg-late"*) check "hx-late resolves through (hexol) alone" yes ;;
+  *) check "hx-late resolves through (hexol) alone" no "$out" ;;
+esac
+
+# A short (throw key subr msg) carries no message-args list; formatting it
+# must not crash the note.
+out=$(hexol tree --realize -i test/fixtures/tree-throw.scm 2>&1)
+case "$out" in
+  *"the fold went wrong"*) check "a short throw form is reported, not crashed on" yes ;;
+  *) check "a short throw form is reported, not crashed on" no "$out" ;;
+esac
+case "$out" in
+  *"boom"*) check "the tree still prints after a failed fold" yes ;;
+  *) check "the tree still prints after a failed fold" no "$out" ;;
+esac
 
 echo
 if [ "$failures" -eq 0 ]; then

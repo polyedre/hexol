@@ -81,9 +81,15 @@ hx-when/hx-case predicate, or a construct field; errors otherwise."
   "Concatenate PARTS into a string, coercing each non-string part to its
 display form (a symbol or number needs no `symbol->string` / `number->string`).
   (str \"k8s-\" 'alpha5)        => \"k8s-alpha5\"
-  (str \"node-\" 3)           => \"node-3\""
+  (str \"node-\" 3)           => \"node-3\"
+A #f part is refused: it is almost always a `get'/`attr' on a path that isn't
+there yet, and \"#f\" would render into the manifest without a word."
   (string-concatenate
-   (map (lambda (p) (if (string? p) p (format #f "~a" p))) parts)))
+   (map (lambda (p)
+          (cond ((string? p) p)
+                ((not p) (error "str: got #f — a (get …)/(attr …) on a missing path?"))
+                (else (format #f "~a" p))))
+        parts)))
 
 (define (fmt template . args)
   "Fill the ~a/~s holes of format string TEMPLATE with ARGS, returning the
@@ -151,7 +157,7 @@ Usable inside (when …) as a cross-cutting transform."
 ;; a #:map field is read as nested keys, evaluated at fold time, and `,@`
 ;; splices a runtime alist.
 ;;
-;;   (label-all (labels (tier "web") (env ($ …ish)) ,@(common-labels)))
+;;   (label-all (labels (tier "web") (env (get '(cfg env))) ,@(common-labels)))
 ;;
 ;; `transform-resources` stays a plain procedure — it takes a procedure, not
 ;; data, so there is nothing for a schema to name.

@@ -54,7 +54,8 @@ without executing anything — **loading an inventory has no side effects**, so
 A construct discovers the ops it produces only by running, so an op also
 carries them (`op-realized-children`) — filled in on fire and excluded from the
 content hash. Seeing that layer therefore costs a fold, which is why it is
-opt-in: `hexol tree --realize`. This is the price that buys back introspection —
+opt-in: `hexol tree --realize` (and `tree -v`, which has to fold to time
+anything). Both run real effects, decryption included. This is the price that buys back introspection —
 without it the inventory would be an opaque black box. It is the property that
 separates this from Helm/Kustomize: **rendering is not opaque**, every effect
 is a labelled record, not a string substitution buried in a template.

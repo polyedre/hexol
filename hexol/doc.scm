@@ -51,12 +51,25 @@
           (map field-form (assq-ref s 'fields))))
 
 ;; A minimal valid call: every head param as a placeholder, every required
-;; field with a placeholder value.
+;; field with a placeholder value. A construct with no required fields would
+;; otherwise print a bare `(label-all)`, which teaches nothing — fall back to
+;; its map/list fields, the ones that carry the payload.
 (define (example s)
-  (format #f "(~a~{ ~a~}~{ ~a~})" (assq-ref s 'name) (head-placeholders s)
-          (map (lambda (f) (format #f "(~a ~a)" (assq-ref f 'name)
-                                   (string-upcase (symbol->string (assq-ref f 'name)))))
-               (filter (lambda (f) (assq-ref f 'required?)) (assq-ref s 'fields)))))
+  (let* ((fields   (assq-ref s 'fields))
+         (required (filter (lambda (f) (assq-ref f 'required?)) fields))
+         (shown    (if (null? required)
+                       (filter (lambda (f) (memq (assq-ref f 'kind) '(map list)))
+                               fields)
+                       required))
+         (slot     (lambda (f)
+                     (let ((n (assq-ref f 'name)))
+                       (case (assq-ref f 'kind)
+                         ((map)  (format #f "(~a (K V) …)" n))
+                         ((list) (format #f "(~a A B …)" n))
+                         (else   (format #f "(~a ~a)" n
+                                         (string-upcase (symbol->string n)))))))))
+    (format #f "(~a~{ ~a~}~{ ~a~})" (assq-ref s 'name) (head-placeholders s)
+            (map slot shown))))
 
 (define (pad s n) (string-pad-right s (max n (string-length s))))
 (define (widest strings) (apply max 0 (map string-length strings)))

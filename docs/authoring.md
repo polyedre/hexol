@@ -166,11 +166,31 @@ evaluated where written — it names the op before the fold, like a head arg.
 - `(get path)`  — read any path from the current fold state.
 - `(str part ...)` — concatenate parts into a string, coercing symbols and
   numbers (so no `symbol->string` / `string-append`): `(str "k8s-" (attr 'region))`.
+  A `#f` part is an error, not the text `"#f"` — it almost always means a
+  `get`/`attr` on a path that isn't there.
 - `(fmt template arg ...)` — fill a format string's `~a`/`~s` holes:
   `(fmt "https://api.~a:6443" (attr 'region))`.
 
 `attr`/`get` are bound during op evaluation, not at file load — that includes
 the fields of a typed constructor, which fire as part of the fold.
+
+**Reads inside `hx-each` are row-scoped.** Each row resolves in a *fresh*
+state seeded with that row's attributes, so `attr` sees the row and `get`
+sees only what the row's own body has written so far — not the outer
+inventory. A `(get '(cfg registry))` written for the top level returns `#f`
+inside a row:
+
+```scheme
+(hx-ops
+  (hx-merge (cfg (registry "ghcr.io/acme")))       ; outer state
+  (hx-each regions #:into region
+    (hx-merge (cfg (registry "ghcr.io/acme")))     ; the row needs its own copy
+    (deployment "api" (image (str (get '(cfg registry)) "/api")))))
+```
+
+Seed the row (from its table entry, or with an `hx-merge` at the top of the
+body) rather than reaching outwards. `hexol lint` reports these at their full
+outer path, and `str` now errors instead of writing `"#f"` into a manifest.
 
 An `hx-when` / `hx-case` predicate is just an expression evaluated against
 the current state, so `attr`/`get` work in it directly. `(attrs (k v) …)` is

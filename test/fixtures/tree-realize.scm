@@ -15,4 +15,9 @@
              (call-with-output-file marker (lambda (p) (display "fired" p)))
              state)
            "touch-marker")
-  (configmap "cfg" (namespace "demo") (data (K "v"))))
+  (configmap "cfg" (namespace "demo") (data (K "v")))
+  ;; `hx-late` must be reachable through `(use-modules (hexol))` alone — this
+  ;; file imports nothing else that exports it.
+  (hx-merge (cfg (suffix "late")))
+  (hx-late "late block"
+    (configmap (str "cfg-" (get '(cfg suffix))) (namespace "demo") (data (K "v")))))

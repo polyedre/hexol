@@ -178,6 +178,46 @@
          (list (length (op-realized-children op))
                (op-kind (car (op-realized-children op))))))
 
+;; label-all / annotate-all are constructs with one #:map field, so the set is
+;; read from state like any other field.
+(format #t "~%construct: label-all / annotate-all read state~%")
+(define computed-labels '((team . "payments")))
+(let* ((final (resolve (hx-ops
+                         (hx-merge (cfg (env "prod")))
+                         (resource '((apiVersion . "v1") (kind . "ConfigMap")
+                                     (metadata (name . "a"))))
+                         (resource '((apiVersion . "v1") (kind . "Secret")
+                                     (metadata (name . "b"))))
+                         (label-all (labels (env (get '(cfg env))) ,@computed-labels))
+                         (annotate-all (annotations (owner (get '(cfg env))))))
+                       '()))
+       (meta (lambda (i) (assq-ref (list-ref (state-get final '(kubernetes_resources)) i)
+                                   'metadata))))
+  (check "label-all stamps every resource, values read from state"
+         '(((env . "prod") (team . "payments")) ((env . "prod") (team . "payments")))
+         (list (assq-ref (meta 0) 'labels) (assq-ref (meta 1) 'labels)))
+  (check "annotate-all stamps every resource likewise"
+         '(((owner . "prod")) ((owner . "prod")))
+         (list (assq-ref (meta 0) 'annotations) (assq-ref (meta 1) 'annotations))))
+
+;; One construct op fires once per hx-each row; the ops each row produced must
+;; all stay addressable, deduplicated when rows produce the same op.
+(format #t "~%construct: realized children accumulate across rows~%")
+(define-construct rowop
+  #:head name
+  #:fields ((role #:default "?"))
+  ;; role in the SOURCE, so each row's op has its own content hash
+  #:build (op:set (list 'out) role (list 'rowop name role)))
+(let* ((op  (rowop "x" (role (attr 'role))))
+       (ops (hx-each '((r1 . ((role . "web"))) (r2 . ((role . "db")))
+                       (r3 . ((role . "web"))))
+                     #:into rows
+                     op)))
+  (resolve ops '())
+  (check "every distinct realization is kept, duplicates collapse"
+         '("web" "db")
+         (map (lambda (o) (caddr (op-source o))) (op-realized-children op))))
+
 (format #t "~%construct: fold-time field errors~%")
 (check "a failing field names the construct and the field"
        #t

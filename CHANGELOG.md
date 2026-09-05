@@ -21,7 +21,11 @@ All notable changes to hexol are documented here. The format follows
   the state bound. The escape hatch for the two surfaces field deferral does
   not reach — a construct's eager positional head args, and the schema-less
   `body`/`block` forms (`terraform-resource`, the ansible `task`).
-- `tree --realize` folds once and shows the ops each construct produced.
+- `tree --realize` folds once and shows the ops each construct produced (as
+  does `tree -v`); both therefore run real effects, sops decryption included.
+- The YAML and JSON emitters refuse an op in value position (`cannot render an
+  op as a value … must be marked #:value`) instead of writing `#<op …>` into a
+  manifest, and a `#:construct` sub-field rejects one up front.
 - `op:late` in `(hexol kernel)`: the primitive both of those are built on.
 
 ### Changed
