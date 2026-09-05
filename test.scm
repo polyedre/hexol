@@ -295,6 +295,18 @@
          '((a . 1) (b . 2)) out)
   (check "scope-ops children are the flattened ops" 2 (length (op-children op))))
 
+;; The scope parameter must be bound at FOLD time too, not only while the body
+;; ops are built — a deferred construct field reads it when its op fires.
+(let* ((seen #f)
+       (op (scope-ops 'scoped (current-test-scope "s") "scope "
+                      (make-op 'probe '(probe)
+                               (lambda (state)
+                                 (set! seen (current-test-scope))
+                                 state)))))
+  (apply-op op '())
+  (check "scope-ops binds its parameter during the fold" "s" seen)
+  (check "and unbinds it afterwards" #f (current-test-scope)))
+
 (format #t "~%yaml: scalar quoting~%")
 (let ((y (lambda (v) (call-with-output-string
                        (lambda (p) (emit-yaml-document p `((k . ,v))))))))

@@ -518,11 +518,19 @@ SOURCE is the authored form."
              #f
              ops)))
 
-;; Build-time scope: bind PARAM to VAL while the body's ops are *constructed*
-;; (baking the value into each op), then bundle them into a composing op of KIND
-;; labeled LABEL-PREFIX+VAL. Each body form is stamp-loc'd. The combinator
-;; behind k8s with-namespace, sql with-schema, ledger in-year/in-currency — i.e.
-;; compose-ops + parameterize + value-stamped label.
+;; Scope: bind PARAM to VAL while the body's ops are *constructed* AND again
+;; while they *fold*, then bundle them into a composing op of KIND labeled
+;; LABEL-PREFIX+VAL. Each body form is stamp-loc'd, and each body slot is an op
+;; or a list of ops (normalize-ops flattens one level, like hx-ops).
+;;
+;; Both bindings matter. Build time is what bakes the value into whatever the
+;; body computes eagerly (sql's `table` renders "public.users" then and there).
+;; Fold time is what a *deferred* construct field needs: `(namespace #:default
+;; (current-k8s-namespace))` is evaluated when the construct's op fires, long
+;; after the scope form returned, so the parameter has to still be bound.
+;;
+;; The combinator behind k8s with-namespace, sql with-schema, ledger
+;; in-year/in-currency — i.e. compose-ops + parameterize + value-stamped label.
 (define-syntax scope-ops
   (syntax-rules ()
     ((_ kind (param val) label-prefix body ...)
@@ -530,7 +538,8 @@ SOURCE is the authored form."
             (ops (parameterize ((param v))
                    (normalize-ops (list (stamp-loc body) ...)))))
        (make-op kind (list kind v)
-                (lambda (state) (fold apply-op state ops))
+                (lambda (state)
+                  (parameterize ((param v)) (fold apply-op state ops)))
                 (string-append label-prefix (format #f "~a" v))
                 ops)))))
 
