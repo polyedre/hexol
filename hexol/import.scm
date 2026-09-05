@@ -37,8 +37,7 @@
   #:use-module ((hexol yaml) #:select (object-shape?))
   #:autoload   (hexol k8s) (res)
   #:use-module (yaml libyaml)
-  #:use-module (system ffi-help-rt)
-  #:use-module (bytestructures guile)
+  #:use-module (nyacc foreign cdata)
   #:use-module ((system foreign) #:prefix ffi:)
   #:use-module (rnrs bytevectors)
   #:use-module (json)
@@ -73,42 +72,47 @@
 ;; in source order; a `null` value drops its key (there is no null in the
 ;; state model — an absent key renders the same as YAML's absence). Sequences
 ;; become lists; a null item becomes '() (renders `{}`).
+;; libyaml's node stack is a yaml_node_t* (1-based indices); compute the
+;; element address by hand and wrap it as a node pointer.
+(define (node-at stack index)
+  (make-cdata yaml_node_t*
+              (+ (ffi:pointer-address (cdata-ref stack))
+                 (* (1- index) (ctype-size yaml_node_t)))))
+
 (define (convert-tree root stack)
   (define (scalar node)
-    (let ((style (wrap-yaml_scalar_style_t (bytestructure-ref node 'data 'scalar 'style)))
-          (text  (ffi:pointer->string
-                   (ffi:make-pointer (bytestructure-ref node 'data 'scalar 'value)))))
+    (let ((style (cdata*-ref node 'data 'scalar 'style))
+          (text  (ffi:pointer->string (cdata*-ref node 'data 'scalar 'value))))
       (if (eq? style 'YAML_PLAIN_SCALAR_STYLE) (plain-scalar->scm text) text)))
   ;; Walk a libyaml stack (items or pairs) from TOP back to START, SIZE bytes
   ;; per slot, collecting (f slot-address) in order.
   (define (slots start top size f)
-    (let loop ((acc '()) (addr (- top size)))
-      (if (>= addr start)
+    (let loop ((acc '()) (addr (- (ffi:pointer-address top) size)))
+      (if (>= addr (ffi:pointer-address start))
           (loop (cons (f addr) acc) (- addr size))
           acc)))
-  (define (node-at index) (bytestructure-ref stack (1- index)))
   (define (convert node)
-    (case (wrap-yaml_node_type_t (bytestructure-ref node 'type))
+    (case (cdata*-ref node 'type)
       ((YAML_SCALAR_NODE) (scalar node))
       ((YAML_SEQUENCE_NODE)
        (map (lambda (v) (if (eq? v 'null) '() v))
-            (slots (bytestructure-ref node 'data 'sequence 'items 'start)
-                   (bytestructure-ref node 'data 'sequence 'items 'top)
-                   (bytestructure-descriptor-size yaml_node_item_t-desc)
+            (slots (cdata*-ref node 'data 'sequence 'items 'start)
+                   (cdata*-ref node 'data 'sequence 'items 'top)
+                   (ctype-size yaml_node_item_t)
                    (lambda (addr)
-                     (convert (node-at (bytestructure-ref (bytestructure int*-desc addr) '*)))))))
+                     (convert (node-at stack (cdata-ref (make-cdata (cpointer 'int) addr) '*)))))))
       ((YAML_MAPPING_NODE)
        (filter-map
          (lambda (kv) (and (not (eq? (cdr kv) 'null)) kv))
-         (slots (bytestructure-ref node 'data 'mapping 'pairs 'start)
-                (bytestructure-ref node 'data 'mapping 'pairs 'top)
-                (bytestructure-descriptor-size yaml_node_pair_t-desc)
+         (slots (cdata*-ref node 'data 'mapping 'pairs 'start)
+                (cdata*-ref node 'data 'mapping 'pairs 'top)
+                (ctype-size yaml_node_pair_t)
                 (lambda (addr)
-                  (let ((pair (bytestructure yaml_node_pair_t*-desc addr)))
+                  (let ((pair (make-cdata yaml_node_pair_t* addr)))
                     (cons (string->symbol
-                            (let ((k (convert (node-at (bytestructure-ref pair '* 'key)))))
+                            (let ((k (convert (node-at stack (cdata*-ref pair 'key)))))
                               (if (string? k) k (format #f "~a" k))))
-                          (convert (node-at (bytestructure-ref pair '* 'value)))))))))
+                          (convert (node-at stack (cdata*-ref pair 'value)))))))))
       (else (error "yaml: unexpected node type"))))
   (convert root))
 
@@ -116,29 +120,28 @@
   "Parse TEXT, a YAML stream, into a list of documents in stream order.
 Maps are symbol-keyed alists, sequences lists; plain scalars are typed
 (number / boolean), quoted and block scalars stay strings."
-  (let* ((parser  (make-yaml_parser_t))
-         (&parser (pointer-to parser))
+  (let* ((parser  (make-cdata yaml_parser_t))
+         (&parser (cdata& parser))
          (bv      (string->utf8 text)))
     (yaml_parser_initialize &parser)
     (yaml_parser_set_input_string &parser (ffi:bytevector->pointer bv) (bytevector-length bv))
     (let loop ((docs '()))
-      (let* ((document  (make-yaml_document_t))
-             (&document (pointer-to document)))
+      (let* ((document  (make-cdata yaml_document_t))
+             (&document (cdata& document)))
         (when (zero? (yaml_parser_load &parser &document))
-          (let ((problem (fh-object-ref parser 'problem))
-                (line    (fh-object-ref parser 'problem_mark 'line)))
+          (let ((problem (cdata-ref parser 'problem))
+                (line    (cdata-ref parser 'problem_mark 'line)))
             (yaml_parser_delete &parser)
             (error (format #f "yaml: line ~a: ~a" (1+ line)
-                           (if (zero? problem) "parse error"
-                               (ffi:pointer->string (ffi:make-pointer problem)))))))
+                           (if (NULL? problem) "parse error"
+                               (ffi:pointer->string problem))))))
         (let ((root (yaml_document_get_root_node &document)))
-          (if (zero? (fh-object-ref root))             ; NULL root: end of stream
+          (if (NULL? root)                             ; NULL root: end of stream
               (begin (yaml_document_delete &document)
                      (yaml_parser_delete &parser)
                      (reverse docs))
-              (let* ((stack (bytestructure yaml_node_t*-desc
-                                           (fh-object-ref document 'nodes 'start)))
-                     (tree  (convert-tree (fh-object-val root) stack)))
+              (let* ((stack (cdata-sel document 'nodes 'start))
+                     (tree  (convert-tree root stack)))
                 (yaml_document_delete &document)
                 (loop (cons tree docs)))))))))
 

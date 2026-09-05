@@ -50,7 +50,12 @@ jobs:
           sudo "$GUIX_BIN/guix" archive --authorize \
             < "$GUIX_PROFILE/share/guix/ci.guix.gnu.org.pub"
 
-          "$GUIX_BIN/guix" --version
+          # The 1.4.0 tarball is from 2022 and ships the old guile-libyaml
+          # (ffi-help-rt API); (hexol import) targets the current one (nyacc
+          # cdata), so bring Guix up to date before resolving manifest.scm.
+          sudo "$GUIX_BIN/guix" pull
+          GUIX_BIN=/root/.config/guix/current/bin
+          sudo "$GUIX_BIN/guix" --version
 
           # examples/terraform.scm reads an SSH public key from ~/.ssh at render
           # time. The suite runs as root below, so give root a throwaway key —
