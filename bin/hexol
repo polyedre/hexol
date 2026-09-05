@@ -72,6 +72,7 @@
              (srfi srfi-1)
              (srfi srfi-9)
              (ice-9 match)
+             (ice-9 regex)
              (ice-9 pretty-print)
              (ice-9 format)
              (ice-9 textual-ports)
@@ -1357,9 +1358,19 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
 ;; the blame line a user wants.
 (define (interesting-file? f)
   (not (or (string-prefix? "ice-9/" f)
+           (string-prefix? "hexol/" f)
+           (string-prefix? "bin/" f)
            (string-prefix? "system/" f)
            (string-prefix? "srfi/" f)
            (string-prefix? "language/" f))))
+
+;; #t when the error message already begins with a FILE:LINE blame prefix
+;; (the loader's annotation) — the "at …" frame line would just repeat it.
+(define (message-located? key args)
+  (match args
+    ((subr (? string? msg) margs . _)
+     (and (string-match "^[^ ]+\\.scm:[0-9?]+: " (apply format #f msg (or margs '()))) #t))
+    (_ #f)))
 
 (define (backtrace-wanted? args)
   (or (getenv "HEXOL_BACKTRACE") (and (member "--backtrace" args) #t)))
@@ -1379,7 +1390,8 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
                 (apply exit rest)
                 (begin
                   (report-error key rest)
-                  (let ((loc (stack-location stack)))
+                  (let ((loc (and (not (message-located? key rest))
+                                  (stack-location stack))))
                     (when loc
                       (format (current-error-port) "~a~%" (e-dim (format #f "  at ~a" loc)))))
                   (when bt?

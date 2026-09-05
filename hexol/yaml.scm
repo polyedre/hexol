@@ -14,16 +14,21 @@
 (define-module (hexol yaml)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 format)
+  #:use-module (ice-9 regex)
   #:export (emit-yaml-document emit-yaml-stream object-shape?))
 
 (define (object-shape? obj)
   "Return #t if OBJ should render as a YAML map: a non-empty list whose
 every element is a (symbol . X) pair with distinct keys.  A string key
-such as requests.cpu counts too — hand-written and imported alists carry them.
-Anything else is treated as a sequence."
+such as requests.cpu counts too — hand-written and imported alists carry
+them — but only in a dotted pair whose cdr is not a list, so a list of
+string lists like ((\"sh\" \"-c\" \"x\")) stays a sequence.  String and symbol
+keys do not mix.  Anything else is treated as a sequence."
   (and (pair? obj)
        (list? obj)
-       (every (lambda (e) (and (pair? e) (or (symbol? (car e)) (string? (car e))))) obj)
+       (or (every (lambda (e) (and (pair? e) (symbol? (car e)))) obj)
+           (every (lambda (e) (and (pair? e) (string? (car e)) (not (list? (cdr e)))))
+                  obj))
        (let ((keys (map car obj)))
          (= (length keys) (length (delete-duplicates keys equal?))))))
 
@@ -37,17 +42,16 @@ Anything else is treated as a sequence."
 (define yaml-reserved-words
   '("true" "false" "null" "yes" "no" "on" "off" "y" "n" "~"))
 
+(define exponent-rx
+  (make-regexp "^[+-]?[0-9]+(\\.[0-9]*)?[eE][+-]?[0-9]+$"))
+
 (define (numeric-looking? s)
   ;; `string->number' RAISES on some numeric spellings (e.g. an out-of-range
-  ;; exponent, "266437e999999999"), so guard it; and treat a string built only
-  ;; of number characters as numeric anyway, so it still gets quoted rather
-  ;; than emitted bare for a YAML parser to coerce.
-  (or (false-if-exception (string->number s))
-      (and (string-any char-numeric? s)
-           (string-every (lambda (c)
-                           (or (char-numeric? c)
-                               (memv c '(#\+ #\- #\. #\e #\E))))
-                         s))))
+  ;; exponent, "266437e999999999"), so guard it — and match that exponent
+  ;; shape explicitly, since the raise means string->number answers nothing.
+  ;; Anything else ("1.2.3", "8080-8090") is not a number and stays bare.
+  (or (and (false-if-exception (string->number s)) #t)
+      (and (regexp-exec exponent-rx s) #t)))
 
 (define (needs-quote? s)
   ;; Quote when the string could be misread as another YAML type or holds

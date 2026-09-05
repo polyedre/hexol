@@ -219,12 +219,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                           (privileged #f) (capabilities '()) (host-port #f) (protocol #f)
                           (security-context '()))
   (let ((resources (normalize-resources resources))
-        ;; explicit container securityContext first, then the `privileged'
-        ;; flag and `capabilities' sugar (which stay authoritative)
-        (sec-ctx   (append security-context
-                           (if privileged '((privileged . #t)) '())
-                           (if (pair? capabilities)
-                               `((capabilities (add ,@capabilities))) '()))))
+        ;; explicit container securityContext, with the `privileged' flag and
+        ;; `capabilities' sugar merged over it (they stay authoritative) —
+        ;; merged, not appended, so an explicit `privileged' is not duplicated
+        (sec-ctx   (deep-merge
+                     security-context
+                     (append (if privileged '((privileged . #t)) '())
+                             (if (pair? capabilities)
+                                 `((capabilities (add ,@capabilities))) '())))))
     `((name . ,name)
       (image . ,image)
       ,@(if (null? command) '() `((command ,@command)))

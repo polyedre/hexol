@@ -32,6 +32,16 @@ case "$err" in
   *) check "fold-time error names the authored op line" no; printf '       got: %s\n' "$err" ;;
 esac
 
+# Nested apply-op layers must annotate the message only once.
+err=$(hexol render -i test/fixtures/nested-loc.scm 2>&1 >/dev/null)
+n=$(printf '%s\n' "$err" | head -1 | command grep -o "nested-loc\.scm:[0-9]*:" | wc -l)
+if [ "$n" = 1 ]; then check "nested ops annotate the line exactly once" yes
+else check "nested ops annotate the line exactly once" no; printf '       got: %s\n' "$err"; fi
+case "$err" in
+  *"  at "*) check "no redundant 'at' line when the message is located" no ;;
+  *) check "no redundant 'at' line when the message is located" yes ;;
+esac
+
 err=$(hexol render -i test/fixtures/leaked-list.scm 2>&1 >/dev/null)
 case "$err" in
   *"expected an op"*) check "leaked list explains the splice" yes ;;

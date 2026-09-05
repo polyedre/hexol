@@ -305,7 +305,20 @@
   (check "plain numeric string is quoted" #t
          (and (string-contains (y "42") "\"42\"") #t))
   (check "plain word is not quoted" #t
-         (and (string-contains (y "hello") "k: hello") #t)))
+         (and (string-contains (y "hello") "k: hello") #t))
+  ;; a dotted version-like string is not a number — must stay bare
+  (check "dotted version string is not quoted" #t
+         (and (string-contains (y "1.2.3") "k: 1.2.3") #t))
+  (check "port range is not quoted" #t
+         (and (string-contains (y "8080-8090") "k: 8080-8090") #t)))
+
+(format #t "~%yaml: map vs sequence~%")
+(check "list of string lists is a sequence" #f
+       (object-shape? '(("sh" "-c" "x") ("sleep" "1"))))
+(check "dotted string keys are a map" #t
+       (object-shape? '(("requests.cpu" . "8"))))
+(check "symbol-keyed alist is a map" #t
+       (object-shape? '((a . 1) (b 2))))
 
 (format #t "~%~a~%"
         (if (zero? failures)

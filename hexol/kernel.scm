@@ -221,18 +221,26 @@ being collected (`resolve-with-access').  A no-op otherwise."
 ;; so an error from inside an inventory form names the form that caused it —
 ;; Guile's own frames for `eval'd code carry no file/line. Pre-unwind (a throw
 ;; handler, not a catch) so the original stack is still live for --backtrace.
+(define %location-annotated? (make-fluid #f))
+
 (define (%with-location path line thunk)
   (let ((annotated? #f))
     (with-throw-handler #t
       thunk
       (lambda (key . args)
-        (unless annotated?
+        ;; Nested %with-location layers each see the same throw; only the
+        ;; innermost may annotate, else the message grows one FILE:LINE per
+        ;; enclosing op.
+        (unless (or annotated? (fluid-ref %location-annotated?))
           (set! annotated? #t)
+          (fluid-set! %location-annotated? #t)
           (match args
             ;; Standard (scm-error) shape: (subr message message-args . rest).
             ((subr (? string? msg) margs . rest)
              (apply throw key subr (string-append "~a: " msg)
-                    (cons (format #f "~a:~a" path (or line '?)) (or margs '()))
+                    (cons (format #f "~a:~a" path
+                                  (if (procedure? line) (line) (or line '?)))
+                          (or margs '()))
                     rest))
             (_ #f)))))))
 
@@ -680,7 +688,9 @@ be blamed on the authored line, and errors are re-raised naming FILE:LINE."
     (set-port-filename! port path)
     (read-enable 'positions)
     (let loop ((last #f) (seen-any? #f))
-      (let ((form (%with-location path (+ 1 (port-line port))
+      ;; LINE as a thunk: read the position at failure time, after the
+      ;; reader has skipped whitespace onto the offending form.
+      (let ((form (%with-location path (lambda () (+ 1 (port-line port)))
                                   (lambda () (read port)))))
         (if (eof-object? form)
             (begin
