@@ -317,7 +317,7 @@ metadata.labels."
 ;;     schema to defer:
 ;;       (hx-late "db"
 ;;         (terraform-resource "aws_db_instance" "main"
-;;           (body (instance_class (get '(db class))))))
+;;           (instance_class (get '(db class)))))
 ;;
 ;; Body slots splice and stamp like `hx-ops`, and the ops it builds show up
 ;; under `hexol tree --realize` like a construct's do. LABEL is evaluated where

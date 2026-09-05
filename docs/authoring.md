@@ -152,8 +152,8 @@ the fold state bound:
 ;; 2. the schema-less body surface
 (hx-late "db instance"
   (terraform-resource "aws_db_instance" "main"
-    (body (instance_class (get '(db class)))
-          (allocated_storage (get '(db size-gb))))))
+    (instance_class (get '(db class)))
+    (allocated_storage (get '(db size-gb)))))
 ```
 
 Body slots splice and stamp like `hx-ops` (an op, a list of ops, or `'()`),
