@@ -26,7 +26,7 @@ RUN curl -fsSL --retry 5 --retry-all-errors "https://download-mirror.savannah.gn
 RUN curl -fsSL --retry 5 --retry-all-errors "https://github.com/mwette/guile-libyaml/archive/refs/tags/V${LIBYAML}.tar.gz" | tar xz \
  && cd "guile-libyaml-${LIBYAML}" \
  && GUILE_AUTO_COMPILE=0 guild compile-ffi --no-exec yaml/libyaml.ffi \
- && sed -i 's| "libyaml"| "/usr/lib/libyaml"|' yaml/libyaml.scm \
+ && sed -i 's| "libyaml"| "/usr/lib/libyaml-0.so.2"|' yaml/libyaml.scm \
  && site=/usr/share/guile/site/3.0 ccache=/usr/lib/guile/3.0/site-ccache \
  && for f in yaml.scm yaml/*.scm; do \
       mkdir -p "$site/$(dirname $f)" "$ccache/$(dirname $f)"; \
