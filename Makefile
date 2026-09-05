@@ -32,6 +32,7 @@ test:
 	$(GUILE) -L . test/apply-mode.scm
 	GUILE=$(GUILE) ./test/diff-cli.sh
 	GUILE=$(GUILE) ./test/render-buffer.sh
+	GUILE=$(GUILE) ./test/errors.sh
 
 test-examples:
 	GUILE=$(GUILE) ./test/examples.sh

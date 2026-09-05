@@ -24,6 +24,7 @@
 ;;;                                                  JSON -> an inventory (stdout)
 ;;;
 ;;; Inventory is -i/--inventory (or $HEXOL_INVENTORY), never a positional.
+;;; `--backtrace` (or $HEXOL_BACKTRACE=1) adds the Guile backtrace to an error.
 ;;; `hexol --version` / `hexol version` prints the release ((hexol version)).
 ;;;
 ;;; render formats (-o / --output): sexp (default), json, yaml, terraform, ansible,
@@ -73,7 +74,11 @@
              (ice-9 match)
              (ice-9 pretty-print)
              (ice-9 format)
-             (ice-9 textual-ports))
+             (ice-9 textual-ports)
+             ;; frame-source: the innermost blame line in the error handler
+             (system vm frame)
+             ((system vm program) #:select (source:file source:line-for-user
+                                            source:column source:line)))
 
 ;; ---------------------------------------------------------------------------
 ;; shared helpers
@@ -1318,7 +1323,9 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
 ;; Turn a raised error into one clean stderr line, not a Guile backtrace — the
 ;; common case being a typo or mistake in the inventory being edited. Most Guile
 ;; errors arrive as (subr message message-args . _); we print the filled-in
-;; message. HEXOL_DEBUG=1 bypasses this for the full backtrace.
+;; message, followed by the innermost source location we can recover from the
+;; captured stack. HEXOL_DEBUG=1 bypasses this for the full backtrace, and
+;; --backtrace / HEXOL_BACKTRACE=1 prints the message *and* the backtrace.
 (define (report-error key args)
   (match args
     ;; Standard (scm-error) shape: (subr message message-args . _), subr may be
@@ -1331,14 +1338,58 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
     (_ (format (current-error-port) "~a~%"
                (e-red (format #f "hexol: ~a: ~s" key args))))))
 
+;; The innermost frame with real source info, as "file:line:col" — the closest
+;; thing to a blame line for errors raised inside compiled modules. Inventory
+;; forms are `eval'd and carry no frame source; the loader annotates those
+;; itself (see `load-inventory-file'). #f when nothing is known.
+(define (stack-location stack)
+  (and stack
+       (let loop ((i 0))
+         (and (< i (stack-length stack))
+              (let ((src (frame-source (stack-ref stack i))))
+                (if (and src (source:file src) (source:line src)
+                         (interesting-file? (source:file src)))
+                    (format #f "~a:~a:~a" (source:file src)
+                            (source:line-for-user src) (source:column src))
+                    (loop (+ i 1))))))))
+
+;; Guile's own runtime frames (boot-9, the evaluator, srfi shims) are never
+;; the blame line a user wants.
+(define (interesting-file? f)
+  (not (or (string-prefix? "ice-9/" f)
+           (string-prefix? "system/" f)
+           (string-prefix? "srfi/" f)
+           (string-prefix? "language/" f))))
+
+(define (backtrace-wanted? args)
+  (or (getenv "HEXOL_BACKTRACE") (and (member "--backtrace" args) #t)))
+
 (define (main args)
-  (if (getenv "HEXOL_DEBUG")
-      (dispatch args)
-      (catch #t
-        (lambda () (dispatch args))
-        ;; `exit` (from die/usage-error) raises 'quit — let it through with its
-        ;; own status; everything else is unexpected.
-        (lambda (key . rest)
-          (if (eq? key 'quit)
-              (apply exit rest)
-              (begin (report-error key rest) (exit 1)))))))
+  (let ((bt?   (backtrace-wanted? args))
+        (args  (filter (lambda (a) (not (string=? a "--backtrace"))) args))
+        (stack #f))
+    (if (getenv "HEXOL_DEBUG")
+        (dispatch args)
+        (catch #t
+          (lambda () (dispatch args))
+          ;; `exit` (from die/usage-error) raises 'quit — let it through with its
+          ;; own status; everything else is unexpected.
+          (lambda (key . rest)
+            (if (eq? key 'quit)
+                (apply exit rest)
+                (begin
+                  (report-error key rest)
+                  (let ((loc (stack-location stack)))
+                    (when loc
+                      (format (current-error-port) "~a~%" (e-dim (format #f "  at ~a" loc)))))
+                  (when bt?
+                    (display-backtrace stack (current-error-port)))
+                  (unless bt?
+                    (format (current-error-port) "~a~%"
+                            (e-dim "  (re-run with --backtrace for the full Guile backtrace)")))
+                  (exit 1))))
+          ;; Pre-unwind: the stack is only live here, before the handler above
+          ;; runs, so capture it now for the location line and --backtrace.
+          (lambda (key . rest)
+            (unless (eq? key 'quit)
+              (set! stack (make-stack #t 3))))))))

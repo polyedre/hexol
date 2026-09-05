@@ -10,6 +10,7 @@
 (define-module (hexol kernel)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-9 gnu)
   #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
   #:export (;; ops
@@ -17,6 +18,7 @@
             current-author-loc stamp-loc relabel
             op-content-hash op-short-hash fnv1a-64
             apply-op resolve normalize-ops compose-ops scope-ops for-each-into
+            short-value
             op:merge op:set op:append op:when op:case
             ;; state helpers
             state-get state-set state-append state-delete deep-merge
@@ -63,6 +65,26 @@
   ;; ops, all blamed on the public-app call). #f if unknown. From
   ;; current-author-loc.
   (loc      op-loc))
+
+;; One-line printer. Without it an op prints its whole source form and child
+;; tree — an error mentioning a top-level op could dump hundreds of kilobytes.
+(set-record-type-printer!
+ <op>
+ (lambda (op port)
+   (format port "#<op ~a~a~a>"
+           (op-kind op)
+           (if (op-label op) (format #f " ~s" (op-label op)) "")
+           (let ((loc (op-loc op)))
+             (if loc (format #f " ~a:~a" (car loc) (cdr loc)) "")))))
+
+;; A value rendered short enough to sit inside a one-line error message.
+(define* (short-value x #:optional (limit 60))
+  "Return X written as a string, truncated to LIMIT characters with an
+ellipsis.  Used by error messages so a big structure can't flood stderr."
+  (let ((s (format #f "~s" x)))
+    (if (> (string-length s) limit)
+        (string-append (substring s 0 limit) "…")
+        s)))
 
 ;; (file . line) of the authored form currently evaluating, bound by the
 ;; body-taking macros (inventory/when/case/with-namespace). make-op snapshots
@@ -195,19 +217,49 @@ being collected (`resolve-with-access').  A no-op otherwise."
   (let ((box (current-reads)))
     (when box (set-car! box (cons (full-path path) (car box))))))
 
+;; Re-raise anything THUNK throws with "FILE:LINE: " prepended to its message,
+;; so an error from inside an inventory form names the form that caused it —
+;; Guile's own frames for `eval'd code carry no file/line. Pre-unwind (a throw
+;; handler, not a catch) so the original stack is still live for --backtrace.
+(define (%with-location path line thunk)
+  (let ((annotated? #f))
+    (with-throw-handler #t
+      thunk
+      (lambda (key . args)
+        (unless annotated?
+          (set! annotated? #t)
+          (match args
+            ;; Standard (scm-error) shape: (subr message message-args . rest).
+            ((subr (? string? msg) margs . rest)
+             (apply throw key subr (string-append "~a: " msg)
+                    (cons (format #f "~a:~a" path (or line '?)) (or margs '()))
+                    rest))
+            (_ #f)))))))
+
 (define (apply-op op state)
   "Apply OP's effect to STATE and return the new state.  When
 `current-trace' is bound to a box, records the (op . after-state) pair; when
 `current-access' is bound to a box, records (op reads after-state); when
 `current-timings' is bound to a hash table, accumulates OP's elapsed
 real-time (inclusive of children) keyed by op identity."
+  (unless (op? op)
+    (error (format #f "expected an op, got ~a — did you forget to splice a list of ops?"
+                   (short-value op))))
   (let* ((timings   (current-timings))
          (start     (and timings (get-internal-real-time)))
          (log       (current-access))
          (reads     (and log (list '())))
-         (new-state (if reads
-                        (parameterize ((current-reads reads)) ((op-effect op) state))
-                        ((op-effect op) state))))
+         (loc       (op-loc op))
+         (fire      (lambda ()
+                      (if reads
+                          (parameterize ((current-reads reads)) ((op-effect op) state))
+                          ((op-effect op) state))))
+         ;; Blame resolve-time failures on the authored line of the op that
+         ;; was firing — the fold is many closures deep by then, and Guile's
+         ;; own frames name none of the inventory.
+         (new-state (if loc
+                        (%with-location (car loc) (cdr loc) fire)
+                        (fire))))
     (when timings
       (hashq-set! timings op
                   (+ (- (get-internal-real-time) start)
@@ -416,7 +468,28 @@ SOURCE is the authored form."
 (define (normalize-ops xs)
   "Flatten a body list one level: each element of XS is an op or a list of ops
 (including the empty list, so a conditional arm may contribute nothing)."
-  (concatenate (map (lambda (x) (if (op? x) (list x) x)) xs)))
+  (concatenate
+   (map (lambda (x)
+          (cond
+            ((op? x) (list x))
+            ;; A flat list of ops splices; anything else (a nested list, a
+            ;; stray value) would only fail later, deep in the fold, with an
+            ;; unreadable struct error — name it here instead.
+            ((and (list? x) (every op? x)) x)
+            (else
+             (error (format #f "expected an op, got ~a — did you forget to splice a list of ops?~a"
+                            (short-value x) (nearby-loc x))))))
+        xs)))
+
+;; Best-effort " (in FILE:LINE)" suffix for an error about X: if X is (or
+;; contains) an op, blame that op's authored location.
+(define (nearby-loc x)
+  (let* ((op  (let first-op ((x x))
+                (cond ((op? x) x)
+                      ((pair? x) (or (first-op (car x)) (first-op (cdr x))))
+                      (else #f))))
+         (loc (and op (op-loc op))))
+    (if loc (format #f " (in ~a:~a)" (car loc) (cdr loc)) "")))
 
 (define (compose-ops kind source ops*)
   "Bundle OPS into a single op of KIND whose effect folds them in order and
@@ -586,12 +659,19 @@ precedence over inventory actions.  A no-op when no collector is bound."
 
 ;; ---------- loader ----------
 
+(define (%source-line form)
+  "1-based source line of FORM as read, or #f.  Source properties count
+lines from 0; editors count from 1."
+  (and (pair? form)
+       (let ((l (assq-ref (source-properties form) 'line)))
+         (and l (+ l 1)))))
+
 (define (load-inventory-file path)
   "Read every top-level form in the file at PATH, evaluate them in order in
 the (hexol surface) module (falling back to (hexol kernel)), and return the
 value of the last form, which must be a list of ops.  Earlier forms may be
 `define's of helper procedures.  Source positions are attached so ops can
-be blamed on the authored line."
+be blamed on the authored line, and errors are re-raised naming FILE:LINE."
   (let* ((module (or (resolve-module '(hexol surface) #:ensure #f)
                      (resolve-module '(hexol kernel))))
          (port   (open-input-file path)))
@@ -600,13 +680,17 @@ be blamed on the authored line."
     (set-port-filename! port path)
     (read-enable 'positions)
     (let loop ((last #f) (seen-any? #f))
-      (let ((form (read port)))
+      (let ((form (%with-location path (+ 1 (port-line port))
+                                  (lambda () (read port)))))
         (if (eof-object? form)
             (begin
               (close-port port)
               (unless seen-any?
                 (error "empty inventory file:" path))
               (unless (list? last)
-                (error "last form must evaluate to a list of ops:" path))
+                (error (format #f "~a: last form must evaluate to a list of ops, got ~a"
+                               path (short-value last))))
               last)
-            (loop (eval form module) #t))))))
+            (loop (%with-location path (%source-line form)
+                                  (lambda () (eval form module)))
+                  #t))))))
