@@ -6,6 +6,7 @@
              (hexol surface)
              (hexol lint)
              ((hexol secrets) #:select (secret-ref secret-ref?))
+             (hexol yaml)
              (srfi srfi-1)
              (ice-9 format))
 
@@ -280,6 +281,18 @@
           (op-content-hash
            (parameterize ((current-author-loc '("b.scm" . 99)))
              (make-op 'merge '(set foo) identity "set foo"))))))
+
+(format #t "~%yaml: scalar quoting~%")
+(let ((y (lambda (v) (call-with-output-string
+                       (lambda (p) (emit-yaml-document p `((k . ,v))))))))
+  ;; string->number raises on an out-of-range exponent; the emitter must not
+  ;; die, and the string must still be quoted so YAML does not read a number.
+  (check "out-of-range exponent string stays a quoted string" #t
+         (and (string-contains (y "266437e999999999") "\"266437e999999999\"") #t))
+  (check "plain numeric string is quoted" #t
+         (and (string-contains (y "42") "\"42\"") #t))
+  (check "plain word is not quoted" #t
+         (and (string-contains (y "hello") "k: hello") #t)))
 
 (format #t "~%~a~%"
         (if (zero? failures)

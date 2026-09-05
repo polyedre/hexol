@@ -55,7 +55,9 @@
 (define (string->bool s) (string=? s "true"))
 
 (define (try-number s)
-  (and (> (string-length s) 0) (string->number s)))
+  ;; `string->number' raises on out-of-range spellings ("266437e999999999");
+  ;; such a scalar stays a string.
+  (and (> (string-length s) 0) (false-if-exception (string->number s))))
 
 (define (scalar->scm s)
   (cond ((not (string? s)) s)

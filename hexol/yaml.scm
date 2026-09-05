@@ -36,11 +36,23 @@ treated as a sequence."
 (define yaml-reserved-words
   '("true" "false" "null" "yes" "no" "on" "off" "y" "n" "~"))
 
+(define (numeric-looking? s)
+  ;; `string->number' RAISES on some numeric spellings (e.g. an out-of-range
+  ;; exponent, "266437e999999999"), so guard it; and treat a string built only
+  ;; of number characters as numeric anyway, so it still gets quoted rather
+  ;; than emitted bare for a YAML parser to coerce.
+  (or (false-if-exception (string->number s))
+      (and (string-any char-numeric? s)
+           (string-every (lambda (c)
+                           (or (char-numeric? c)
+                               (memv c '(#\+ #\- #\. #\e #\E))))
+                         s))))
+
 (define (needs-quote? s)
   ;; Quote when the string could be misread as another YAML type or holds
   ;; structural characters.
   (or (string=? s "")
-      (string->number s)
+      (numeric-looking? s)
       (member (string-downcase s) yaml-reserved-words)
       (string-any (lambda (c) (memv c '(#\: #\# #\{ #\} #\[ #\] #\, #\& #\*
                                         #\? #\| #\< #\> #\= #\! #\% #\@ #\` #\"

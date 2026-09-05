@@ -65,7 +65,11 @@
     ((member s '("" "~" "null" "Null" "NULL"))    'null)
     ((member s '("true" "True" "TRUE"))           #t)
     ((member s '("false" "False" "FALSE"))        #f)
-    ((regexp-exec number-rx s)                    (string->number s))
+    ;; `string->number' raises on out-of-range spellings ("266437e999999999")
+    ;; that number-rx still matches; those stay strings.
+    ((and (regexp-exec number-rx s)
+          (false-if-exception (string->number s)))
+     => (lambda (n) n))
     (else s)))
 
 ;; libyaml node -> (hexol yaml) value. Mappings become symbol-keyed alists
