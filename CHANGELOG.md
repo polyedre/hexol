@@ -12,7 +12,18 @@ All notable changes to hexol are documented here. The format follows
 - `import` verb: turn existing manifests/config into an inventory.
 - `lint` verb: static checks over an inventory.
 - `--validate` flag: schema-check the resolved state before rendering.
+- `ansible-applier`: `hexol apply` on an `(ansible_plays)` inventory writes the
+  playbook + inventory JSON and runs `ansible-playbook`. Flags `apply` does not
+  own pass through to the tool (`hexol apply -i x.scm --list-tasks --limit h`).
 - `explain` reports the fix location for ops generated under `hx-each`.
+
+### Changed
+- Ansible library: play bodies are entry lists. `tasks`/`as`/`each`/`only`/
+  `handlers` share one grammar — `("Name" (module (arg val) …) #:keyword val …)`
+  declares a task, a symbol-headed entry is a Scheme expression whose tasks
+  splice in; bare module names resolve to `ansible.builtin`. Replaces the
+  `task`/`handler` record macros and the `as` procedure. `examples/ansible.scm`
+  rewritten as one declaration list per host.
 
 ## [0.1.0] - 2026-09-03
 

@@ -341,8 +341,8 @@ hexol/
   ledger.scm        # (hexol ledger)   — personal-ledger writing UX + ledger-cli render
   sql.scm           # (hexol sql)      — table/column/constraint/index DSL + SQL DDL render
   doc.scm           # (hexol doc)      — `hexol doc`: formats the define-construct schema registry
-  ansible.scm       # (hexol ansible)  — inventory.yml bridge + state helpers, task/handler
-                    #                    (macros over block/body) / as, `play` sink op
+  ansible.scm       # (hexol ansible)  — inventory.yml bridge + state helpers, play-body
+                    #                    forms (tasks/as/each/only/handlers), `play` sink op
   secrets.scm       # (hexol secrets)  — inline sops-backed store: (secrets-store …),
                     #                    (secret-ref 'k), (resolve-secret-refs) render op
   secret-tool.scm   # (hexol secret-tool) — engine behind `hexol secret`: position-aware

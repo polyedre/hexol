@@ -13,7 +13,7 @@ help:
 	@echo
 	@echo "everything else is the CLI — ./bin/hexol --help:"
 	@echo "  ./bin/hexol render [-o sexp|json|yaml|terraform|ansible] [--query K=V,…] [--path P] [-i INVENTORY]"
-	@echo "  ./bin/hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY]"
+	@echo "  ./bin/hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY] [TOOL-FLAGS...]"
 	@echo "  ./bin/hexol diff [--only SPEC] [--explain] [-i INVENTORY]"
 	@echo "  ./bin/hexol tree [-i INVENTORY]"
 	@echo "  ./bin/hexol explain [--query K=V,…] PATH|HASH [-i INVENTORY]"

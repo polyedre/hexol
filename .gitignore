@@ -5,7 +5,6 @@ openrc
 .terraform/
 *.tfstate
 *.tfstate.*
-deploy/apply.log
 tfplan
 
 # Real, sops-sealed secrets for examples/homelab.scm — never commit.

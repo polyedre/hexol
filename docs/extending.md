@@ -76,7 +76,7 @@ because the form head tells you which you're in:
   Scheme** (`(image "x")`, `(replicas (if prod? 3 1))`, `(uuid (ref …))`);
   strings are quoted, references and arithmetic are natural. No `$`.
 
-The schema-less escapes (`terraform-resource`, the ansible `task`,
+The schema-less escapes (`terraform-resource`, ansible module args,
 `custom-resource`'s `spec`) are also evaluate-by-default, but keep an explicit
 `(block …)` nesting marker: with evaluated values and no per-field schema,
 nothing else can tell a nested block from an attribute whose value is a call.
@@ -221,6 +221,10 @@ introspection tools descend through it transparently.
   Appliers without one (terraform) ignore it and stream their plan. Checks
   (`wait-for`, `check`) no-op under plan/diff; `report` and
   `kubeconform-check` run in every mode.
+  Flags `hexol apply` does not own (the first unknown `-x` and everything
+  after) reach the appliers as `(applier-args)`, a list of strings; a
+  tool-wrapping applier appends them to its command line (`ansible-applier`
+  does).
 
 ## Worked example: the Terraform target
 

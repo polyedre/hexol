@@ -3,6 +3,7 @@
 (add-to-load-path (dirname (current-filename)))
 
 (use-modules (hexol kernel)
+             (hexol ansible)
              (hexol surface)
              (hexol lint)
              (srfi srfi-1)
@@ -259,6 +260,18 @@
           (op-content-hash
            (parameterize ((current-author-loc '("b.scm" . 99)))
              (make-op 'merge '(set foo) identity "set foo"))))))
+
+(format #t "~%ansible: play-body entry grammar~%")
+(check "task: name, builtin module, trailing keyword"
+       '((name . "Install nginx") (ansible.builtin.apt (name . "nginx") (state . "present")) (notify . "Reload nginx"))
+       (task "Install nginx" (apt (name "nginx") (state "present")) #:notify "Reload nginx"))
+(check "tasks: each/only/as splice, dotted module kept, non-root become_user"
+       '(((name . "ufw 80") (community.general.ufw (port . "80")) (become . #t) (become_user . "deploy"))
+         ((name . "ufw 443") (community.general.ufw (port . "443")) (become . #t) (become_user . "deploy")))
+       (tasks (as deploy
+                (each (p '(80 443))
+                  ((fmt "ufw ~a" p) (community.general.ufw (port (number->string p)))))
+                (only #f ("never" (command (cmd "true")))))))
 
 (format #t "~%~a~%"
         (if (zero? failures)

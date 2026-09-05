@@ -12,7 +12,7 @@
 ;;;
 ;;;   hexol render [-o FMT] [--path P]    [-i INV]   resolve + emit (default)
 ;;;                [--validate]                      (yaml: pipe to kubeconform)
-;;;   hexol apply [--only SPEC] [--dry-run] [-i INV] run the appliers (plan)
+;;;   hexol apply [--only SPEC] [--dry-run] [-i INV] [TOOL-FLAGS…] run the appliers
 ;;;   hexol diff [--only SPEC] [--explain] [-i INV]  drift: 0 clean, 1 drift, 2 error
 ;;;   hexol tree [-v]                     [-i INV]   op tree, indented
 ;;;                                                  (-v: + per-op fold time)
@@ -64,7 +64,7 @@
              (hexol json)
              (hexol construct)
              (hexol doc)
-             ((hexol apply) #:select (current-diff-explainer))
+             ((hexol apply) #:select (current-diff-explainer applier-args))
              ((hexol sh) #:select (which-cmd))
              (ice-9 popen)
              (hexol version)
@@ -351,7 +351,9 @@
 ;; `render` makes artifacts; `apply` pushes them.
 ;; ---------------------------------------------------------------------------
 ;;
-;;   hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY]
+;;   hexol apply [--only SPEC] [--dry-run] [--list] [-i INVENTORY] [TOOL-FLAGS…]
+;; Flags hexol doesn't own (the first `-x' it doesn't know and all that follows)
+;; reach the appliers via `applier-args' — `hexol apply --list-tasks --limit web1'.
 ;;   hexol diff  [--only SPEC] [--explain]         [-i INVENTORY]
 ;;
 ;; Resolve once, then run the `applies-with` appliers in registration order,
@@ -384,7 +386,10 @@
           ((arg . rest)
            (cond
              ((string-prefix? "--only=" arg) (loop rest (flag-value "--only=" arg) mode list?))
-             ((string-prefix? "-" arg) (usage-error "apply: unknown flag ~a" arg))
+             ;; first foreign flag: it and everything after go to the appliers
+             ((string-prefix? "-" arg)
+              (parameterize ((applier-args args))
+                (do-apply (inventory-or-default "apply" inv) only mode list? #f)))
              (else (usage-error "apply: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
 (define (cmd-diff args)

@@ -97,6 +97,28 @@
        (string? (error-message (lambda () ((kubectl-applier) k8s-state 'diff)))))
 (unsetenv "FAKE_DIFF_EXIT")
 
+(format #t "~%apply: ansible applier~%")
+(define ans-state
+  '((ansible_plays (web1 (hosts . "web1") (tasks ((name . "x")))))))
+(define ans-inv
+  '((hosts (web1 (vars (ip . "10.0.0.1"))))
+    (groups (all (hosts web1) (vars (tz . "UTC"))) (web (hosts web1)))))
+(define ans-dir (string-append tmp "/hexol-test-ans-" (number->string (getpid))))
+(reset-log!)
+(run-quiet (lambda () ((ansible-applier #:workdir ans-dir #:inventory ans-inv) ans-state 'apply)))
+(expect "apply -> ansible-playbook -i inventory playbook" #t
+        (logged? (string-append "-i " ans-dir "/inventory.json " ans-dir "/playbook.json")))
+(expect "inventory written in ansible shape" #t
+        (number? (string-contains (call-with-input-file (string-append ans-dir "/inventory.json") get-string-all)
+                         "\"children\":{\"web\":{\"hosts\":{\"web1\":{}}")))
+(reset-log!)
+(parameterize ((applier-args '("--list-tasks" "--limit" "web1")))
+  (run-quiet (lambda () ((ansible-applier #:workdir ans-dir #:inventory "inv.yml") ans-state 'plan))))
+(expect "plan + passthrough flags" #t (logged? "-i inv.yml"))
+(expect "plan -> --check --diff, then applier-args" #t (logged? "--check --diff --list-tasks --limit web1"))
+(expect "diff refused" #t
+        (string? (error-message (lambda () ((ansible-applier #:inventory "i") ans-state 'diff)))))
+
 (format #t "~%apply: kubectl explained diff (structural, via kubectl get)~%")
 (define live-json (string-append tmp "/hexol-test-live-" (number->string (getpid)) ".json"))
 (call-with-output-file live-json

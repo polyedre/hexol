@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# test/fixtures/bin/ansible-playbook — PATH shim; logs argv to $FAKE_LOG.
+echo "ansible-playbook $*" >> "${FAKE_LOG:-/dev/null}"
+exit 0

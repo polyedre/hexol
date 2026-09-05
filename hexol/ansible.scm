@@ -5,8 +5,8 @@
 ;;; (examples/ansible.scm).
 ;;;
 ;;; Vocabulary only: loads inventory.yml into a state alist, gives role
-;;; authors read helpers (host-attr, group-hosts, …), task sugar (task,
-;;; handler, as), and one sink op — `play` — appending an assembled play into
+;;; authors read helpers (host-attr, group-hosts, …), play-body forms (tasks,
+;;; as, each, only, handlers), and one sink op — `play` — appending an assembled play into
 ;;; the `(ansible_plays)` accumulator (Ansible analogue of
 ;;; `(kubernetes_resources)`).
 ;;;
@@ -38,10 +38,8 @@
             all-hosts group-hosts group-var-of
             effective-host-var
             state-ref
-            ;; task constructors
-            task handler
-            ;; task transformers
-            as
+            ;; play bodies
+            tasks task handlers as each only
             ;; play sink
             play))
 
@@ -208,60 +206,97 @@ a path (list of symbols) into a nested var."
   (let ((vars (host-attrs host-name state)))
     (and (pair? vars) (assq key vars) #t)))
 
-;; ---------- task constructors ----------
+;; ---------- task bodies ----------
 ;;
-;; `task`/`handler` are macros over the shared `block`/`body` surface (same
-;; one terraform-resource uses): each entry is an attribute `(key <expr>)`
-;; (evaluated Scheme) or a nested module dict `(block <module> <entry>…)`. A
-;; task reads like its YAML, no quasiquote/dotted pairs:
+;; A play body is a list of *entries*, one grammar shared by every body form
+;; (`tasks`, `as`, `each`, `only`, `handlers`):
 ;;
-;;   (task
-;;     (name "Install nginx")
-;;     (block ansible.builtin.apt (name "nginx") (state "present"))
-;;     (become #t)
-;;     (notify "Reload nginx"))
+;;   ("Install nginx" (apt (name "nginx") (state "present")) #:notify "Reload nginx")
+;;     a task: NAME, the module dict, then task-level keywords, in YAML order.
+;;     NAME is a string or an expression like (fmt …). A module symbol without a
+;;     dot is `ansible.builtin.<module>`; dotted names are taken as written.
+;;     Module args use the shared `body` surface (nested dict: `(block k …)`).
 ;;
-;; `%check-task` raises early on a missing `name` (Ansible accepts nameless
-;; tasks but they're miserable to debug).
+;;   (map apt packages)   (user-tasks h u)   (if … …)
+;;     anything whose head is a symbol is a Scheme expression yielding a task
+;;     or a task list, spliced in place.
+;;
+;; A bare variable as NAME reads as an expression call — write `(str www)`.
+;;
+;; Body forms:
+;;   (tasks entry …)             flat task list
+;;   (as root entry …)           become scope (become_user for non-root); nests
+;;   (each (p ports) entry …)    entries once per element, p bound
+;;   (only (var h 'backup) entry …)   '() when the test is false
+;;   (handlers entry …)          same as `tasks`, for a play's handler list
+;;   (task entry)                one task, outside a body
 
-(define (%check-task tag alist)
-  (unless (assq 'name alist)
-    (error tag "missing `name` key in:" alist))
-  alist)
+(define (%module sym)
+  (let ((n (symbol->string sym)))
+    (if (string-index n #\.) sym (symbol-append 'ansible.builtin. sym))))
+
+(define (%splice x)
+  ;; a task alist (caar is the `name` symbol) or a list of them
+  (if (or (null? x) (pair? (caar x))) x (list x)))
+
+;; (%task-kws NAME MODULE-ALIST (acc …) kw val …) — collect trailing keywords
+(define-syntax %task-kws
+  (lambda (x)
+    (syntax-case x ()
+      ((_ nm mod (kv ...) kw val rest ...)
+       (keyword? (syntax->datum #'kw))
+       (with-syntax ((k (datum->syntax #'kw (keyword->symbol (syntax->datum #'kw)))))
+         #'(%task-kws nm mod (kv ... (k . val)) rest ...)))
+      ((_ nm mod ((k . v) ...))
+       #'(cons* (cons 'name nm) mod (list (cons 'k v) ...))))))
+
+(define-syntax %entry
+  (lambda (x)
+    (syntax-case x ()
+      ((_ (head . rest))
+       (identifier? #'head)
+       #'(%splice (head . rest)))
+      ((_ (nm (module arg ...) kw ...))
+       #'(list (%task-kws nm (cons (%module 'module) (body arg ...)) () kw ...))))))
+
+(define-syntax tasks
+  (syntax-rules ()
+    ((_ entry ...) (append (%entry entry) ...))))
+
+(define-syntax handlers
+  (syntax-rules ()
+    ((_ entry ...) (tasks entry ...))))
 
 (define-syntax task
   (syntax-rules ()
-    ((_ entry ...) (%check-task 'task (body entry ...)))))
+    ((_ nm (module arg ...) kw ...)
+     (%task-kws nm (cons (%module 'module) (body arg ...)) () kw ...))))
 
-(define-syntax handler
+(define-syntax each
   (syntax-rules ()
-    ((_ entry ...) (%check-task 'handler (body entry ...)))))
+    ((_ (v lst) entry ...) (append-map (lambda (v) (tasks entry ...)) lst))))
 
-;; ---------- task transformers ----------
-;;
-;; `(as user tasks)` defaults `become: #t` (and `become_user: <user>` for
-;; non-root) on each task not already declaring `become`. A Scheme-level
-;; scope replacing Ansible's `block: become:`. Nests — innermost `as` wins:
-;;
-;;   (as 'root
-;;     (list
-;;       (task ...)                                   ; runs as root
-;;       (as 'www-data (list (task ...)))))           ; runs as www-data
+(define-syntax only
+  (syntax-rules ()
+    ((_ test entry ...) (if test (tasks entry ...) '()))))
 
-(define (as user tasks)
-  "Wrap TASKS so each one that doesn't already declare `become' runs as
-USER: defaulting `become: #t' and, for a non-root USER, `become_user:
-USER'.  A Scheme-level scope replacing Ansible's `block:'; nests with the
-innermost `as' winning."
+;; `(as root entry …)`: a Scheme-level scope replacing Ansible's `block:
+;; become:`. Each task not already declaring `become` gets `become: #t` and,
+;; for a non-root user, `become_user`. Nests — innermost `as` wins. USER is a
+;; bare symbol or an expression.
+(define-syntax as
+  (lambda (x)
+    (syntax-case x ()
+      ((_ user entry ...) (identifier? #'user) #'(%as 'user (tasks entry ...)))
+      ((_ user entry ...)                      #'(%as user (tasks entry ...))))))
+
+(define (%as user tasks)
   (let ((user-str (if (symbol? user) (symbol->string user) user)))
     (map (lambda (t)
            (cond
              ((assq 'become t) t)
-             ((or (eq? user 'root) (equal? user-str "root"))
-              (append t '((become . #t))))
-             (else
-              (append t `((become . #t)
-                          (become_user . ,user-str))))))
+             ((equal? user-str "root") (append t '((become . #t))))
+             (else (append t `((become . #t) (become_user . ,user-str))))))
          tasks)))
 
 (define (effective-host-var host-name key state)

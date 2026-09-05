@@ -63,6 +63,7 @@
   #:use-module (hexol kernel)
   #:use-module ((hexol terraform) #:select (emit-terraform-json))
   #:use-module ((hexol yaml) #:select (emit-yaml-stream))
+  #:use-module ((hexol json) #:select (sexp->json-string))
   #:use-module (hexol sh)
   #:use-module ((hexol diff) #:select (structural-diff json->state))
   #:use-module (ice-9 popen)
@@ -73,10 +74,15 @@
   ;; accessor so an inventory's report lambdas can reach in without importing
   ;; (hexol kernel).
   #:re-export (state-get)
-  #:export (terraform-applier kubectl-applier terraform-destroyer
+  #:export (terraform-applier kubectl-applier ansible-applier terraform-destroyer
             terraform-output-reporter terraform-validator talos-config-applier
             appliers actions wait-for check report kubeconform-check cmd sh-ok?
-            mode-of current-diff-explainer render-manifests))
+            mode-of current-diff-explainer render-manifests applier-args))
+
+;; Extra CLI arguments for the appliers: `hexol apply' hands every flag it
+;; doesn't own (e.g. `--list-tasks --limit web1') to the appliers through this
+;; parameter; a tool-wrapping applier appends them to its command line.
+(define applier-args (make-parameter '()))
 
 ;; Normalise an applier's second argument to a mode symbol: the runner passes
 ;; `apply'/`plan'/`diff'; a legacy caller may still pass DRY? (#t → plan, #f →
@@ -507,6 +513,57 @@ its own `hexol' verb."
     (if drift?
         'drift
         (log ";; apply[kubernetes]: no drift~%"))))
+
+;; ---------- ansible ----------
+
+;; Ansible inventory JSON from the (hexol ansible) state shape
+;; ((hosts (h (vars …)) …) (groups (g (hosts …) (vars …)) …)): host vars under
+;; all.hosts, every other group under all.children with bare host names.
+(define (inventory->ansible inv)
+  (let ((groups (or (assq-ref inv 'groups) '())))
+    `((all
+       (hosts . ,(map (lambda (h) (cons (car h) (or (assq-ref (cdr h) 'vars) '())))
+                      (or (assq-ref inv 'hosts) '())))
+       (vars  . ,(or (assq-ref (assq-ref groups 'all) 'vars) '()))
+       (children
+        . ,(filter-map
+            (lambda (g)
+              (and (not (eq? (car g) 'all))
+                   (cons (car g)
+                         `((hosts . ,(map (lambda (h) (cons h '()))
+                                          (or (assq-ref (cdr g) 'hosts) '())))
+                           (vars  . ,(or (assq-ref (cdr g) 'vars) '()))))))
+            groups))))))
+
+(define* (ansible-applier #:key (workdir "deploy") (binary "ansible-playbook")
+                          (playbook-file "playbook.json") (inventory #f)
+                          (pre '()) (post '()))
+  "Return an applier for (ansible_plays): write WORKDIR/PLAYBOOK-FILE (a
+playbook is valid JSON) and run `BINARY -i INVENTORY PLAYBOOK …'.  INVENTORY
+is a path to an existing inventory, or the (hexol ansible) state alist the
+plays were built from — written to WORKDIR/inventory.json.  Under `plan' adds
+`--check --diff'.  `diff' is refused: ansible has no drift exit code.  Extra
+`hexol apply' flags (`applier-args', e.g. `--list-tasks --limit web1') go on
+the command line as given."
+  (lambda (state mode)
+    (run-checks (as-checks pre) state mode)
+    (let* ((plays (or (state-get state '(ansible_plays))
+                      (error "apply[ansible]: no (ansible_plays) in state")))
+           (pb    (string-append workdir "/" playbook-file))
+           (inv   (cond ((string? inventory) inventory)
+                        (inventory (string-append workdir "/inventory.json"))
+                        (else (error "apply[ansible]: #:inventory required (path or state alist)")))))
+      (when (eq? (mode-of mode) 'diff)
+        (error "apply[ansible]: no drift detection; use `hexol apply --dry-run'"))
+      (unless (file-exists? workdir) (mkdir workdir))
+      (write-file pb (sexp->json-string (map cdr plays)))
+      (unless (string? inventory)
+        (write-file inv (sexp->json-string (inventory->ansible inventory))))
+      (log ";; apply[ansible]: wrote ~a~%" pb)
+      (apply run* (find-binary binary) "-i" inv pb
+             (append (if (eq? (mode-of mode) 'plan) '("--check" "--diff") '())
+                     (applier-args)))
+      (run-checks (as-checks post) state mode))))
 
 (define* (kubectl-applier #:key (binary "kubectl") (kubeconfig #f)
                           (server-side #t) (passes 2) (pre '()) (post '()))

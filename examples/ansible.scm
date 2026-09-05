@@ -1,43 +1,34 @@
 ;;; examples/ansible.scm — provision a small fleet, in Scheme.
 ;;;
-;;; One self-contained consumer of (hexol ansible): inlined inventory, one
-;;; role, fanned over the fleet (one play per host in `all`) into the
-;;; `(ansible_plays)` sink. Render it:
+;;; One consumer of (hexol ansible): an inlined inventory, then one play per
+;;; host — a list of task declarations, read top to bottom like the playbook
+;;; it renders. Render it:
 ;;;
-;;;   hexol render -o ansible examples/ansible.scm   # the playbook (JSON)
-;;;   hexol tree              examples/ansible.scm   # plays -> their tasks
+;;;   hexol render -o ansible -i examples/ansible.scm   # the playbook (JSON)
+;;;   hexol tree              -i examples/ansible.scm   # plays -> their tasks
+;;;   hexol apply -i examples/ansible.scm --list-tasks --limit web1.acme.example
+;;;     writes deploy/{playbook,inventory}.json and runs ansible-playbook on
+;;;     them; flags hexol doesn't own pass through (--dry-run = --check --diff).
 ;;;
-;;; The point: what inventory-as-a-program buys over role YAML. Each item is
-;;; plain Scheme here, but a dedicated Ansible feature (or no equivalent) there:
+;;; A task is `("Name" (module (arg value) …) #:keyword value …)`. Control flow
+;;; is the body forms: `each` fans an entry over data, `only` gates it, `as`
+;;; scopes `become:`. Any entry with a symbol head is a Scheme expression
+;;; whose tasks splice in — so a helper (`apt`, `user-tasks`) drops in where
+;;; repetition earns it. What this buys over role YAML, each shown once:
 ;;;
-;;;   • Loops -> explicit named tasks. `(map …)` emits one greppable task per
-;;;     package / user / port / peer; `loop:` hides them behind `item.*`.
-;;;   • Decisions at render time. Expired user -> state=absent via `cond`, not
-;;;     a `when:` string; a missing IP aborts *rendering*, not the run.
-;;;   • Templates are Scheme. /etc/hosts, pg_hba.conf built by string fns over
-;;;     cross-host data — no Jinja, no `.j2`.
-;;;   • Cross-host facts are data. DB firewall opens 5432 per web IP via
-;;;     `(group-hosts 'web …)` — no `hostvars[item]`.
-;;;   • Sub-roles are functions; `include_tasks:` -> a call. `become:` scope
-;;;     is `(as 'user …)`, which nests.
+;;;   • Loops -> explicit named tasks: `each` emits one greppable task per
+;;;     package / sysctl / port; `loop:` hides them behind `item.*`.
+;;;   • Decisions at render time: an expired user renders `state: absent`
+;;;     (no `when:` string); a missing IP aborts *rendering*, not the run.
+;;;   • Templates are Scheme strings over cross-host data (/etc/hosts,
+;;;     pg_hba.conf) — no Jinja, no `hostvars[item]`.
 ;;;   • Honest: host-only facts (binary already there?) keep `register:`+`when:`.
-;;;
-;;; Modules: apt, copy, file, lineinfile, cron, systemd, command, stat,
-;;; get_url, unarchive, wait_for, assert, git, hostname,
-;;; ansible.posix.{sysctl,authorized_key}, community.general.{timezone,
-;;; locale_gen,ufw}.
 
 (use-modules (hexol ansible)
+             (hexol apply)
              (srfi srfi-1))
 
-;; Alias for joining task lists. (`append` works — surface ops are hx-prefixed
-;; and don't shadow it — but `cat` keeps these joins terse.)
-(define (cat . lists) (concatenate lists))
-
-;; ---------- the fleet (inlined inventory) ----------
-;;
-;; Shape the helpers read: hosts carry vars, groups carry membership + group
-;; vars, `all` lists every host.
+;; ---------- the fleet ----------
 
 (define inv
   '((hosts
@@ -70,324 +61,174 @@
      (cache (hosts cache1.acme.example)
             (vars (service . "redis") (open_ports 6379))))))
 
-;; ---------- thin task sugar ----------
-
-(define* (apt-install pkg #:key (state "present"))
-  (task
-    (name (fmt "apt: ~a (~a)" pkg state))
-    (block ansible.builtin.apt (name pkg) (state state))))
-
-(define* (copy-content name dest content #:key (mode "0644")
-                       (owner "root") (group "root") (notify #f))
-  (let ((t (task
-             (name name)
-             (block ansible.builtin.copy
-               (dest dest) (content content)
-               (mode mode) (owner owner) (group group)))))
-    (if notify (cat t (list (cons 'notify notify))) t)))
-
-(define* (svc name #:key (state "started") (enabled #t))
-  (task
-    (name (fmt "service: ~a -> ~a" name state))
-    (block ansible.builtin.systemd
-      (name name) (state state) (enabled enabled))))
-
-(define (short-name host-name)
-  (car (string-split (str host-name) #\.)))
-
-;; ---------- base: every host ----------
-
 (define sysctls
   '(("net.core.somaxconn"      . "1024")
     ("net.ipv4.tcp_syncookies" . "1")
     ("vm.swappiness"           . "10")))
 
-(define (etc-hosts-content state)
-  ;; One map over every host's IPs — Jinja's {% for h in groups['all'] %}
-  ;; with nested {% if hostvars[h]... %}.
+;; ---------- sugar ----------
+
+;; `(var h 'service)` — host var, falling back through groups to `all`; a path
+;; like `'(ip v4)` reads a nested host var.
+(define (var h key)
+  (if (pair? key) (host-attr h key inv) (effective-host-var h key inv)))
+
+(define (short h) (car (string-split (str h) #\.)))
+
+(define (apt pkg)
+  (task (fmt "apt: ~a (present)" pkg) (apt (name pkg) (state "present"))))
+
+(define (svc name)
+  (task (fmt "service: ~a -> started" name) (systemd (name name) (state "started") (enabled #t))))
+
+;; ---------- cross-host templates (computed once, from `inv`) ----------
+
+(define etc-hosts
   (string-append
    "# Managed by hexol — do not edit.\n127.0.0.1 localhost\n\n"
    (string-concatenate
     (map (lambda (h)
-           (let ((v4 (host-attr h '(ip v4) state))
-                 (v6 (host-attr h '(ip v6) state)))
-             ;; ~a coerces the host symbol — no symbol->string needed.
-             (string-append
-              (if v4 (fmt "~16a ~a ~a\n" v4 h (short-name h)) "")
-              (if v6 (fmt "~16a ~a ~a\n" v6 h (short-name h)) ""))))
-         (all-hosts state)))))
+           (string-concatenate
+            (filter-map (lambda (ip) (and ip (fmt "~16a ~a ~a\n" ip h (short h))))
+                        (list (var h '(ip v4)) (var h '(ip v6))))))
+         (all-hosts inv)))))
 
-(define (sshd-directive key val)
-  (task
-    (name (fmt "sshd: ~a ~a" key val))
-    (block ansible.builtin.lineinfile
-      (path   "/etc/ssh/sshd_config")
-      (regexp (fmt "^#?~a" key))
-      (line   (fmt "~a ~a" key val)))
-    (notify "Restart sshd")))
-
-(define (base-tasks host-name state)
-  (let ((packages (group-var-of 'all 'base_packages state))
-        (tz       (group-var-of 'all 'timezone state))
-        (locale   (group-var-of 'all 'locale state))
-        (sshd     (group-var-of 'all 'sshd state)))
-    (as 'root
-     (cat
-      ;; one named task per base package
-      (map apt-install packages)
-      (list
-       (task (name (fmt "Set hostname ~a" host-name))
-             (block ansible.builtin.hostname (name (str host-name))))
-       (task (name (fmt "timezone ~a" tz))
-             (block community.general.timezone (name tz)))
-       (task (name (fmt "locale ~a" locale))
-             (block community.general.locale_gen (name locale) (state "present")))
-       (copy-content "Configure /etc/hosts" "/etc/hosts" (etc-hosts-content state)))
-      ;; one sysctl task per tunable
-      (map (lambda (kv)
-             (task (name (fmt "sysctl ~a=~a" (car kv) (cdr kv)))
-                   (block ansible.posix.sysctl
-                     (name (car kv)) (value (cdr kv)) (sysctl_set #t))))
-           sysctls)
-      ;; sshd hardening: one lineinfile per directive
-      (map (lambda (d) (sshd-directive (car d) (cdr d))) sshd)))))
-
-;; ---------- users: loop + render-time-state win ----------
-
-(define epoch-2025 1735689600)  ; 2025-01-01; expiring before this -> removed
-
-(define (user-state u)
-  (let ((exp (assq-ref u 'expires)))
-    (if (and exp (< exp epoch-2025)) "absent" "present")))
-
-(define (user-account-task host-name u)
-  (let ((name   (assq-ref u 'name))
-        (groups (assq-ref u 'groups))
-        (target (user-state u)))
-    (task
-      (name (fmt "user ~a -> ~a" name target))
-      (block ansible.builtin.user
-        (name name) (state target) (shell "/bin/bash")
-        (groups groups) (append #t)
-        (password (fmt "{{ lookup('password', 'secrets/~a/~a') | password_hash('sha512') }}"
-                          host-name name)))
-      (no_log #t))))
-
-(define (ssh-dir-task name)
-  (task (name (fmt "~a: .ssh dir" name))
-        (block ansible.builtin.file
-          (path (fmt "/home/~a/.ssh" name)) (state "directory")
-          (owner name) (group name) (mode "0700"))))
-
-(define (authkey-task name)
-  (task (name (fmt "~a: authorized_key" name))
-        (block ansible.posix.authorized_key
-          (user name) (state "present")
-          (key (fmt "{{ lookup('file', 'keys/~a.pub') }}" name)))))
-
-(define (user-tasks host-name state)
-  (let ((users (or (host-attr host-name 'app_users state) '())))
-    (as 'root
-     (append-map
-      (lambda (u)
-        (let ((name   (assq-ref u 'name))
-              (target (user-state u)))
-          ;; present users get .ssh dir + authorized_key
-          (cons (user-account-task host-name u)
-                (if (string=? target "present")
-                    (list (ssh-dir-task name) (authkey-task name))
-                    '()))))
-      users))))
-
-;; ---------- role-specific tasks (dispatch on service) ----------
-
-(define (nginx-vhost host-name)
-  (fmt (string-append "server {\n    listen 80;\n    server_name ~a;\n"
-                      "    root /var/www/~a;\n"
-                      "    location / { try_files $uri $uri/ =404; }\n}\n")
-       host-name (short-name host-name)))
-
-(define (pg-hba-content state)
-  ;; Each web node's IPv4 reaches Postgres — cross-host data, one line per
-  ;; peer, at render time.
+(define pg-hba
   (string-append
    "# Managed by hexol.\nlocal   all   all                      peer\n"
    (string-concatenate
-    (map (lambda (h)
-           (let ((ip (host-attr h '(ip v4) state)))
-             (if ip (fmt "host    all   all   ~a/32   scram-sha-256   # ~a\n" ip h) "")))
-         (group-hosts 'web state)))))
+    (map (lambda (h) (fmt "host    all   all   ~a/32   scram-sha-256   # ~a\n" (var h '(ip v4)) h))
+         (group-hosts 'web inv)))))
 
-(define (web-tasks host-name state)
-  (as 'root
-   (cat
-    (list
-     (apt-install "nginx")
-     (task (name (fmt "/var/www/~a" (short-name host-name)))
-           (block ansible.builtin.file
-             (path (fmt "/var/www/~a" (short-name host-name)))
-             (state "directory") (owner "www-data") (group "www-data"))))
-    ;; deploy as the unprivileged deploy user — nested become scope (inner
-    ;; `as` stamps become_user; outer `as 'root` restores it).
-    (as 'deploy
-     (list (task (name "Deploy app (git)")
-                 (block ansible.builtin.git
-                   (repo "https://git.acme.example/acme/web.git")
-                   (dest (fmt "/var/www/~a" (short-name host-name)))
-                   (version "main")))))
-    (list
-     (copy-content "nginx vhost" "/etc/nginx/sites-enabled/default"
-                   (nginx-vhost host-name) #:notify "Reload nginx")
-     (svc "nginx")))))
+(define web-ips (map (lambda (h) (var h '(ip v4))) (group-hosts 'web inv)))
 
-(define (db-tasks host-name state)
-  (as 'root
-   (cat
-    (list
-     (apt-install "postgresql")
-     (copy-content "pg_hba.conf" "/etc/postgresql/16/main/pg_hba.conf"
-                   (pg-hba-content state) #:mode "0640"
-                   #:owner "postgres" #:group "postgres"
-                   #:notify "Restart postgresql")
-     (svc "postgresql"))
-    ;; nightly backup cron only where backup: true
-    (if (host-attr host-name 'backup state)
-        (list (task (name "cron: nightly pg_dump")
-                    (block ansible.builtin.cron
-                      (name "nightly-backup") (minute "30") (hour "2")
-                      (job  "pg_dumpall | gzip > /var/backups/pg-$(date +\\%F).sql.gz")
-                      (user "postgres"))))
-        '()))))
+;; ---------- users: render-time state ----------
 
-(define (cache-tasks host-name state)
-  (as 'root
-   (list
-    (apt-install "redis-server")
-    (copy-content "redis maxmemory" "/etc/redis/redis.conf.d/maxmemory.conf"
-                  "maxmemory 256mb\nmaxmemory-policy allkeys-lru\n"
-                  #:notify "Restart redis")
-    (svc "redis-server"))))
+(define (user-tasks h u)
+  (let* ((name  (assq-ref u 'name))
+         (exp   (assq-ref u 'expires))
+         (state (if (and exp (< exp 1735689600)) "absent" "present")))  ; expired before 2025-01-01
+    (tasks
+     ((fmt "user ~a -> ~a" name state)
+      (user (name name) (state state) (shell "/bin/bash")
+            (groups (assq-ref u 'groups)) (append #t)
+            (password (fmt "{{ lookup('password', 'secrets/~a/~a') | password_hash('sha512') }}" h name)))
+      #:no_log #t)
+     (only (string=? state "present")
+       ((fmt "~a: .ssh dir" name)
+        (file (path (fmt "/home/~a/.ssh" name)) (state "directory")
+              (owner name) (group name) (mode "0700")))
+       ((fmt "~a: authorized_key" name)
+        (ansible.posix.authorized_key (user name) (state "present")
+                                      (key (fmt "{{ lookup('file', 'keys/~a.pub') }}" name))))))))
 
-(define (service-tasks host-name state)
-  (let ((service (effective-host-var host-name 'service state)))
-    (cond
-      ((equal? service "nginx")      (web-tasks host-name state))
-      ((equal? service "postgresql") (db-tasks host-name state))
-      ((equal? service "redis")      (cache-tasks host-name state))
-      (else '()))))
+;; ---------- one play per host ----------
 
-;; ---------- firewall: one ufw task per exposed port ----------
+(define (host-play h)
+  (let ((service (var h 'service))
+        (ports   (or (var h 'open_ports) '()))
+        (www     (fmt "/var/www/~a" (short h))))
+    ;; Render-time guard: a missing IP fails here, not three hosts into the run.
+    (unless (var h '(ip v4)) (error "ansible-fleet: host has no ip.v4:" h))
+    (play h
+      (tasks
+       (as root
+         ;; -- base --
+         (map apt (var h 'base_packages))
+         ((fmt "Set hostname ~a" h)          (hostname (name (str h))))
+         ((fmt "timezone ~a" (var h 'timezone)) (community.general.timezone (name (var h 'timezone))))
+         ((fmt "locale ~a" (var h 'locale))  (community.general.locale_gen (name (var h 'locale)) (state "present")))
+         ("Configure /etc/hosts" (copy (dest "/etc/hosts") (content etc-hosts)
+                                       (mode "0644") (owner "root") (group "root")))
+         (each (kv sysctls)
+           ((fmt "sysctl ~a=~a" (car kv) (cdr kv))
+            (ansible.posix.sysctl (name (car kv)) (value (cdr kv)) (sysctl_set #t))))
+         (each (d (var h 'sshd))
+           ((fmt "sshd: ~a ~a" (car d) (cdr d))
+            (lineinfile (path "/etc/ssh/sshd_config")
+                        (regexp (fmt "^#?~a" (car d)))
+                        (line (fmt "~a ~a" (car d) (cdr d))))
+            #:notify "Restart sshd"))
 
-(define (firewall-tasks host-name state)
-  (let ((ports   (or (effective-host-var host-name 'open_ports state) '()))
-        (service (effective-host-var host-name 'service state)))
-    (as 'root
-     (cat
-      (list
-       (task (name "ufw: default deny incoming")
-             (block community.general.ufw (direction "incoming") (policy "deny")))
-       (task (name "ufw: allow OpenSSH")
-             (block community.general.ufw (rule "allow") (name "OpenSSH"))))
-      (append-map
-       (lambda (p)
-         (if (and (equal? service "postgresql") (eqv? p 5432))
-             ;; cross-host: one rule per web IP
-             (map (lambda (ip)
-                    (task (name (fmt "ufw: allow postgres from ~a" ip))
-                          (block community.general.ufw
-                            (rule "allow") (port "5432") (proto "tcp") (src ip))))
-                  (filter-map (lambda (h) (host-attr h '(ip v4) state))
-                              (group-hosts 'web state)))
-             (list (task (name (fmt "ufw: allow ~a/tcp" p))
-                         (block community.general.ufw
-                           (rule "allow") (port (number->string p)) (proto "tcp"))))))
-       ports)
-      (list
-       (task (name "ufw: enable")
-             (block community.general.ufw (state "enabled"))))))))
+         ;; -- users --
+         (each (u (or (var h 'app_users) '())) (user-tasks h u))
 
-;; ---------- node_exporter: honest apply-time logic ----------
+         ;; -- service --
+         (only (equal? service "nginx")
+           (apt "nginx")
+           ((str www) (file (path www) (state "directory") (owner "www-data") (group "www-data")))
+           (as deploy   ; nested become scope: deploy as the unprivileged user
+             ("Deploy app (git)" (git (repo "https://git.acme.example/acme/web.git") (dest www) (version "main"))))
+           ("nginx vhost"
+            (copy (dest "/etc/nginx/sites-enabled/default")
+                  (content (fmt "server {\n    listen 80;\n    server_name ~a;\n    root ~a;\n    location / { try_files $uri $uri/ =404; }\n}\n" h www))
+                  (mode "0644") (owner "root") (group "root"))
+            #:notify "Reload nginx")
+           (svc "nginx"))
+         (only (equal? service "postgresql")
+           (apt "postgresql")
+           ("pg_hba.conf"
+            (copy (dest "/etc/postgresql/16/main/pg_hba.conf") (content pg-hba)
+                  (mode "0640") (owner "postgres") (group "postgres"))
+            #:notify "Restart postgresql")
+           (svc "postgresql")
+           (only (var h 'backup)
+             ("cron: nightly pg_dump"
+              (cron (name "nightly-backup") (minute "30") (hour "2")
+                    (job "pg_dumpall | gzip > /var/backups/pg-$(date +\\%F).sql.gz")
+                    (user "postgres")))))
+         (only (equal? service "redis")
+           (apt "redis-server")
+           ("redis maxmemory"
+            (copy (dest "/etc/redis/redis.conf.d/maxmemory.conf")
+                  (content "maxmemory 256mb\nmaxmemory-policy allkeys-lru\n")
+                  (mode "0644") (owner "root") (group "root"))
+            #:notify "Restart redis")
+           (svc "redis-server"))
 
-(define (metrics-tasks)
-  (as 'root
-   (list
-    (task (name "stat node_exporter")
-          (block ansible.builtin.stat (path "/usr/local/bin/node_exporter"))
-          (register "ne_bin"))
-    (task (name "Download node_exporter")
-          (when "not ne_bin.stat.exists")
-          (block ansible.builtin.get_url
-            (url "https://dl.acme.example/node_exporter-1.8.2.tar.gz")
-            (dest "/tmp/node_exporter.tar.gz")
-            (checksum "sha256:0e0e0e0e")))
-    (task (name "Unpack node_exporter")
-          (when "not ne_bin.stat.exists")
-          (block ansible.builtin.unarchive
-            (src "/tmp/node_exporter.tar.gz") (dest "/usr/local/bin")
-            (remote_src #t) (extra_opts (list "--strip-components=1"))))
-    (svc "node_exporter"))))
+         ;; -- firewall --
+         ("ufw: default deny incoming" (community.general.ufw (direction "incoming") (policy "deny")))
+         ("ufw: allow OpenSSH"         (community.general.ufw (rule "allow") (name "OpenSSH")))
+         (each (p ports)
+           (only (eqv? p 5432)   ; cross-host: postgres reachable from each web IP only
+             (each (ip web-ips)
+               ((fmt "ufw: allow postgres from ~a" ip)
+                (community.general.ufw (rule "allow") (port "5432") (proto "tcp") (src ip)))))
+           (only (not (eqv? p 5432))
+             ((fmt "ufw: allow ~a/tcp" p)
+              (community.general.ufw (rule "allow") (port (number->string p)) (proto "tcp")))))
+         ("ufw: enable" (community.general.ufw (state "enabled")))
 
-;; ---------- post-checks: register + assert + wait_for ----------
+         ;; -- node_exporter: honest apply-time logic --
+         ("stat node_exporter" (stat (path "/usr/local/bin/node_exporter")) #:register "ne_bin")
+         ("Download node_exporter"
+          (get_url (url "https://dl.acme.example/node_exporter-1.8.2.tar.gz")
+                   (dest "/tmp/node_exporter.tar.gz")
+                   (checksum "sha256:0e0e0e0e"))
+          #:when "not ne_bin.stat.exists")
+         ("Unpack node_exporter"
+          (unarchive (src "/tmp/node_exporter.tar.gz") (dest "/usr/local/bin")
+                     (remote_src #t) (extra_opts (list "--strip-components=1")))
+          #:when "not ne_bin.stat.exists")
+         (svc "node_exporter"))
 
-(define (check-tasks host-name state)
-  (let* ((ports (or (effective-host-var host-name 'open_ports state) '()))
-         (first-port (and (pair? ports) (car ports))))
-    (cat
-     (list
-      (task (name "Check deploy user")
-            (block ansible.builtin.command (cmd "id deploy"))
-            (register "id_deploy") (changed_when #f) (failed_when #f))
-      (task (name "Assert deploy user present")
-            (block ansible.builtin.assert
-              (that (list "id_deploy.rc == 0"))
-              (fail_msg "deploy user is missing"))))
-     (if first-port
-         (list (task (name (fmt "Wait for port ~a" first-port))
-                     (block ansible.builtin.wait_for
-                       (host "127.0.0.1") (port first-port) (timeout 30))))
-         '()))))
+       ;; -- post-checks (unprivileged) --
+       ("Check deploy user" (command (cmd "id deploy"))
+        #:register "id_deploy" #:changed_when #f #:failed_when #f)
+       ("Assert deploy user present"
+        (assert (that (list "id_deploy.rc == 0")) (fail_msg "deploy user is missing")))
+       (only (pair? ports)
+         ((fmt "Wait for port ~a" (car ports))
+          (wait_for (host "127.0.0.1") (port (car ports)) (timeout 30)))))
 
-;; ---------- handlers ----------
+      (as root
+        (handlers
+         ("Restart sshd"       (service (name "ssh") (state "restarted")))
+         ("Reload nginx"       (service (name "nginx") (state "reloaded")))
+         ("Restart postgresql" (service (name "postgresql") (state "restarted")))
+         ("Restart redis"      (service (name "redis-server") (state "restarted"))))))))
 
-(define handlers
-  (as 'root
-   (list
-    (handler (name "Restart sshd")
-             (block ansible.builtin.service (name "ssh") (state "restarted")))
-    (handler (name "Reload nginx")
-             (block ansible.builtin.service (name "nginx") (state "reloaded")))
-    (handler (name "Restart postgresql")
-             (block ansible.builtin.service (name "postgresql") (state "restarted")))
-    (handler (name "Restart redis")
-             (block ansible.builtin.service (name "redis-server") (state "restarted"))))))
+(appliers
+  ("ansible" (ansible-applier #:inventory inv)))
 
-;; ---------- role entrypoint ----------
-
-(define (role-impl host-name state)
-  ;; Render-time guard: catch a missing IP *here*, not three hosts into the run.
-  (unless (host-attr host-name '(ip v4) state)
-    (error "ansible-fleet: host has no ip.v4:" host-name))
-  (cons
-   (cat
-    (base-tasks     host-name state)
-    (user-tasks     host-name state)
-    (service-tasks  host-name state)
-    (firewall-tasks host-name state)
-    (metrics-tasks)
-    (check-tasks    host-name state))
-   handlers))
-
-;; ---------- assemble: one play per host in `all` ----------
-;;
-;; Fanning the role over a group is this example's structure, not a library
-;; primitive — each `play` keys itself by host, so no isolation needed: just
-;; `compose-ops` + `map`, one `play` op per host.
-
-(define (fleet group)
-  (compose-ops 'fleet `(fleet ,group)
-    (map (lambda (h)
-           (let ((rendered (role-impl h inv)))
-             (play h (car rendered) (cdr rendered))))
-         (group-hosts group inv))))
-
-(hx-ops (fleet 'all))
+(hx-ops (map host-play (all-hosts inv)))
