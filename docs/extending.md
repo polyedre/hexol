@@ -96,7 +96,7 @@ gave, minus the hand-quoted alists its argument values used to collapse into.
   #:fields ((image     #:required)              ; missing → compile error
             (port      #:default 8080)          ; default value (library scope)
             (replicas  #:default 1)
-            (env       #:map)                   ; free-form nested alist
+            (env       #:map)                   ; free-form nested alist; ,@xs splices
             (env-from  #:list)                  ; (k a b …) → (list a b …); ,@xs splices
             (resources #:coerce normalize-resources)  ; wrap the value in (P …)
             (privileged #:flag))                ; (privileged) → #t, absent → #f
@@ -104,7 +104,8 @@ gave, minus the hand-quoted alists its argument values used to collapse into.
 ```
 
 Field kinds: plain scalar, `#:flag` (valueless `(x)` ≡ `#t`), `#:list`,
-`#:map` (free-form, string keys allowed for file-shaped data), and
+`#:map` (free-form; keys are symbols — a string key like `"nginx.conf"` or
+`"requests.cpu"` is coerced with `string->symbol`), and
 `#:construct C` (each entry expands to `(C . args)`; with `#:repeated`, the
 occurrences collect into a list — this is how RBAC `(rule …)` works). `#:build`
 sees the head params and every field bound as locals and may return a plain
@@ -121,6 +122,21 @@ raw-alist escape:
 (deployment "api" (image "x:1")
   (env ,@base-env (FOO "1")))      ; base-env (a runtime list) ++ one literal entry
 ```
+
+A `#:map` field takes the same markers: `,@e` splices an evaluated alist of
+`(key . value)` pairs, `,e` inserts one such pair, and both mix freely with
+literal `(k v)` entries — so a computed ConfigMap or a computed label set needs
+no raw-alist escape either:
+
+```scheme
+(configmap "app-config"
+  (data (MODE "fast")                ; literal entry
+        ,@(read-settings)            ; an alist computed at runtime
+        ,(cons 'BUILD build-id)))    ; one computed pair
+```
+
+Anything else behind `,@`/`,` in a map field is an error naming the construct
+and the field, rather than a stray `unquote-splicing:` key in the output.
 
 **This is not just for library authors.** `define-construct` (and
 `construct-map-entries`) are re-exported from every target library, so an

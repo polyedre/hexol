@@ -18,13 +18,14 @@
 
 (define (object-shape? obj)
   "Return #t if OBJ should render as a YAML map: a non-empty list whose
-every element is a (symbol . X) pair with distinct keys.  Anything else is
-treated as a sequence."
+every element is a (symbol . X) pair with distinct keys.  A string key
+such as requests.cpu counts too — hand-written and imported alists carry them.
+Anything else is treated as a sequence."
   (and (pair? obj)
        (list? obj)
-       (every (lambda (e) (and (pair? e) (symbol? (car e)))) obj)
+       (every (lambda (e) (and (pair? e) (or (symbol? (car e)) (string? (car e))))) obj)
        (let ((keys (map car obj)))
-         (= (length keys) (length (delete-duplicates keys eq?))))))
+         (= (length keys) (length (delete-duplicates keys equal?))))))
 
 (define (scalar? x)
   (or (string? x) (number? x) (boolean? x) (symbol? x) (null? x)))
@@ -79,7 +80,7 @@ treated as a sequence."
                      x))
     (else (format #f "~a" x))))
 
-(define (key->yaml k) (symbol->string k))
+(define (key->yaml k) (if (string? k) k (symbol->string k)))
 (define (indent n) (make-string n #\space))
 
 ;; Multiline string as a YAML block scalar (`|`).

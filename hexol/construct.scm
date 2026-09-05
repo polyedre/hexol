@@ -31,8 +31,14 @@
 ;;;                                  so a computed list of entries needs no
 ;;;                                  raw-alist escape: (env ,@extra-env (FOO "1"))
 ;;;   map    : (key (k v) …)      -> a free-form nested alist (#:map field):
-;;;                                  keys auto-quoted to symbols, values
-;;;                                  evaluated; string keys allowed ("nginx.conf").
+;;;                                  keys auto-quoted to symbols (a string key
+;;;                                  such as "nginx.conf" is coerced with
+;;;                                  string->symbol), values evaluated.
+;;;            (key (k v) ,@e ,p)   -> `,@e` splices an evaluated alist and `,p`
+;;;                                  one evaluated (key . value) pair, as in a
+;;;                                  #:list field — so a computed map (a
+;;;                                  ConfigMap's data, per-app labels) needs no
+;;;                                  raw-alist escape.
 ;;;   sub    : (key . args)       -> (subname . args) — args handed to another
 ;;;            #:repeated           define-construct (#:construct subname); a
 ;;;                                  #:repeated field collects each occurrence
@@ -47,6 +53,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 match)
   #:export (define-construct %expand-call construct-flag construct-map-entries
+            construct-map-key construct-map-pair construct-map-splice
             register-construct! construct-schemas find-constructs))
 
 ;; ---------- schema registry ----------
@@ -121,19 +128,46 @@
 
 ;; ---------- free-form map block reader ----------
 ;;
-;; `(construct-map-entries (k v) …)` builds a nested alist for a #:map field:
-;; keys auto-quote to symbols (or stay strings, e.g. "nginx.conf"), values
-;; evaluated; `(block k …)` recurses. The one place a typed constructor admits
-;; free-form data, so it deliberately reuses the schema-less rule (explicit
-;; `block` for depth).
+;; `(construct-map-entries CTX (k v) …)` builds a nested alist for a #:map
+;; field: keys auto-quote to symbols, values evaluated; `(block k …)` recurses.
+;; Map keys are ALWAYS symbols — a string key ("nginx.conf", "requests.cpu") is
+;; coerced with string->symbol, since the emitters key on symbols.
+;;
+;; Like a #:list field, a map field also takes computed entries:
+;;   ,@e   splices an evaluated alist of (key . value) pairs
+;;   ,e    inserts one evaluated (key . value) pair
+;; so `(data (MODE "fast") ,@computed)` needs no raw-alist escape. CTX is a
+;; string naming the construct and field, used in error messages.
+(define (construct-map-key ctx k)
+  (cond ((symbol? k) k)
+        ((string? k) (string->symbol k))
+        (else (error (format #f "~a: map key must be a symbol or string, got ~s"
+                             ctx k)))))
+
+(define (construct-map-pair ctx x)
+  (if (pair? x)
+      (cons (construct-map-key ctx (car x)) (cdr x))
+      (error (format #f "~a: ,expr in a map field must be a (key . value) pair, got ~s"
+                     ctx x))))
+
+(define (construct-map-splice ctx x)
+  (cond ((null? x) '())
+        ((and (list? x) (every pair? x)) (map (lambda (e) (construct-map-pair ctx e)) x))
+        (else (error (format #f "~a: ,@expr in a map field must be an alist of (key . value) pairs, got ~s"
+                             ctx x)))))
+
 (define-syntax construct-map-entries
-  (syntax-rules (block)
-    ((_) '())
-    ((_ (block k entry ...) rest ...)
-     (cons (cons 'k (construct-map-entries entry ...))
-           (construct-map-entries rest ...)))
-    ((_ (k v) rest ...)
-     (cons (cons (quote k) v) (construct-map-entries rest ...)))))
+  (syntax-rules (block unquote unquote-splicing)
+    ((_ ctx) '())
+    ((_ ctx (unquote-splicing e) rest ...)
+     (append (construct-map-splice ctx e) (construct-map-entries ctx rest ...)))
+    ((_ ctx (unquote e) rest ...)
+     (cons (construct-map-pair ctx e) (construct-map-entries ctx rest ...)))
+    ((_ ctx (block k entry ...) rest ...)
+     (cons (cons (construct-map-key ctx 'k) (construct-map-entries ctx entry ...))
+           (construct-map-entries ctx rest ...)))
+    ((_ ctx (k v) rest ...)
+     (cons (cons (construct-map-key ctx 'k) v) (construct-map-entries ctx rest ...)))))
 
 ;; ---------- the define-construct macro ----------
 ;;
@@ -145,7 +179,8 @@
 ;;   #:flag             boolean; `(k)` → #t, `(k v)` → v, absent → #f
 ;;   #:list             `(k a b …)` → (list a b …); a lone `(k)` → '();
 ;;                      `,@e` in arg position splices a runtime list
-;;   #:map              `(k (sub v) …)` → free-form alist via construct-map-entries
+;;   #:map              `(k (sub v) …)` → free-form alist via construct-map-entries;
+;;                      `,@e` splices an evaluated alist, `,p` one (key . value)
 ;;   #:construct C      `(k . args)` → (C . args); with #:repeated, collect a list
 ;;   #:default E        value when the field is absent (else #f, or '() for list/map)
 ;;   #:coerce P         wrap the resolved value in (P …)
@@ -300,7 +335,10 @@
                                     ((unquote-splicing e) #'e)
                                     (_ #`(list #,a))))
                                 (eargs (car es)))))
-             ((eq? kind 'map)  #`(construct-map-entries #,@(eargs (car es))))
+             ((eq? kind 'map)
+              #`(construct-map-entries
+                  #,(datum->syntax s (format #f "~a: field (~a …)" name fn))
+                  #,@(eargs (car es))))
              ((eq? kind 'construct)
               (let ((mk (lambda (e) #`(#,(ehead e) #,@(eargs e)))))
                 (if rep? #`(list #,@(map mk es)) (mk (car es)))))

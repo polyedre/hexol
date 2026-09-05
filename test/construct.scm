@@ -33,9 +33,26 @@
        (widget "min" (image "i") (port (+ 1 2))))
 (check "flag with explicit value"
        #t (list-ref (widget "x" (image "i") (debug #t)) 3))
-(check "string key in #:map (file-shaped)"
-       '(("nginx.conf" . "data"))
+(check "string key in #:map coerces to a symbol (file-shaped)"
+       `((,(string->symbol "nginx.conf") . "data"))
        (list-ref (widget "x" (image "i") (env ("nginx.conf" "data"))) 5))
+
+;; ---- ,@ / , in a #:map field ----
+(define computed-env '((A . "1") ("b.c" . "2")))
+(check ",@ splices an evaluated alist into a #:map field, keys coerced"
+       `((MODE . "fast") (A . "1") (,(string->symbol "b.c") . "2") (Z . "9"))
+       (list-ref (widget "x" (image "i")
+                         (env (MODE "fast") ,@computed-env ,(cons 'Z "9"))) 5))
+(check ",@ of '() contributes nothing"
+       '((MODE . "fast"))
+       (list-ref (widget "x" (image "i") (env (MODE "fast") ,@'())) 5))
+(check "non-alist ,@ raises naming construct and field"
+       #t
+       (catch #t
+         (lambda () (widget "x" (image "i") (env ,@"nope")) #f)
+         (lambda (k . a)
+           (and (string-contains (format #f "~a" a) "widget: field (env")
+                #t))))
 
 ;; ---- coerce ----
 (define (double x) (if (number? x) (* 2 x) x))
