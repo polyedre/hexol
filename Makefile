@@ -30,6 +30,7 @@ test:
 	$(GUILE) -L . test/import.scm
 	$(GUILE) -L . test/apply-mode.scm
 	GUILE=$(GUILE) ./test/diff-cli.sh
+	GUILE=$(GUILE) ./test/render-buffer.sh
 
 test-examples:
 	GUILE=$(GUILE) ./test/examples.sh

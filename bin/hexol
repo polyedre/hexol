@@ -259,7 +259,9 @@
               (e-dim (format #f ";; ~a lines — drill in with `--path KEY`, or see the op tree: hexol tree ~a"
                              lines inv))))))
 
-(define (emit-json obj) (display (sexp->json-string obj)) (newline))
+(define* (emit-json obj #:key (pretty #f))
+  (display (sexp->json-string obj #:pretty pretty))
+  (newline))
 
 (define (emit-yaml obj)
   (if (sequence-of-maps? obj)
@@ -279,7 +281,8 @@
              (usage-error "render: --validate needs -o yaml (kubeconform checks manifests)"))
            (if validate?
                (validate-render (lambda () (do-render (inventory-or-default "render" inv) fmt path)))
-               (do-render (inventory-or-default "render" inv) fmt path)))
+               (buffered-render
+                (lambda () (do-render (inventory-or-default "render" inv) fmt path)))))
           (((or "-o" "--output") f . rest) (loop rest f path validate?))
           (("--path" p . rest) (loop rest fmt (parse-path p) validate?))
           (("--validate" . rest) (loop rest fmt path #t))
@@ -319,6 +322,17 @@
 (define (format-list renderers)
   (string-join (append builtin-formats (map renderer-name renderers)) " | "))
 
+;; Render is all-or-nothing on stdout: a renderer that dies halfway (a value
+;; the emitter can't serialize, a `renders-with' proc that raises) must not
+;; leave a truncated stream behind for `hexol render … | kubectl apply -f -'.
+;; So collect the whole thing in a string port first and write it out only
+;; once THUNK has returned. `--validate' gets the same guarantee for free —
+;; `validate-render' already buffers.
+(define (buffered-render thunk)
+  (let ((text (with-output-to-string thunk)))
+    (display text)
+    (force-output)))
+
 (define (do-render inv fmt path)
   (call-with-values (lambda () (load-ops+collected current-renderers inv))
     (lambda (ops renderers)
@@ -342,7 +356,8 @@
                ((string=? fmt "json") (emit-json target))
                ((string=? fmt "yaml") (emit-yaml target))
                ((string=? fmt "terraform") (emit-tf target))
-               ((string=? fmt "ansible") (emit-json target))  ; a playbook is valid JSON
+               ;; a playbook is valid JSON — pretty, like terraform's config
+               ((string=? fmt "ansible") (emit-json target #:pretty #t))
                (else (usage-error "render: unknown output format ~s (~a)"
                                   fmt (format-list renderers)))))))))))
 

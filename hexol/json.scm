@@ -47,5 +47,6 @@
                        (else (string c)))
                      acc)))))))
 
-(define (sexp->json-string obj)
-  (escape-control-chars (scm->json-string (state->json-ready obj))))
+(define* (sexp->json-string obj #:key (pretty #f))
+  (escape-control-chars
+   (scm->json-string (state->json-ready obj) #:pretty pretty)))
