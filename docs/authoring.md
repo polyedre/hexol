@@ -327,7 +327,9 @@ hexol/
   construct.scm     # (hexol construct)— define-construct: schema-driven record-body
                     #                   constructor engine every typed target library uses
   k8s.scm           # (hexol k8s)     — deployment/service/ingress/configmap/secret/
-                    #                   daemonset/custom-resource/service-monitor sugar,
+                    #                   daemonset/stateful-set/job/cron-job/hpa/pdb/
+                    #                   network-policy/resource-quota/limit-range/
+                    #                   custom-resource/service-monitor sugar,
                     #                   service-account + cluster-rbac, expose (derive a
                     #                   Service from a workload), with-namespace scope,
                     #                   `res` compact limits, app/public-app,

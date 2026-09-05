@@ -27,6 +27,7 @@ test:
 	$(GUILE) -L . test.scm
 	$(GUILE) -L . test/construct.scm
 	$(GUILE) -L . test/k8s-res.scm
+	$(GUILE) -L . test/k8s-constructs.scm
 	$(GUILE) -L . test/import.scm
 	$(GUILE) -L . test/apply-mode.scm
 	GUILE=$(GUILE) ./test/diff-cli.sh

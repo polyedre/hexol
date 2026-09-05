@@ -14,6 +14,14 @@
 ;;;   (secret     "sec" (data (K "v") …))            -> Secret
 ;;;   (storage-class "fast" (provisioner "…") …)     -> StorageClass
 ;;;   (persistent-volume-claim "data" (size "5Gi"))  -> PersistentVolumeClaim
+;;;   (stateful-set "db" (image "…") (storage "10Gi")) -> StatefulSet
+;;;   (job "migrate" (image "…") (command "…"))      -> Job
+;;;   (cron-job "rotate" (schedule "0 3 * * *") …)   -> CronJob
+;;;   (horizontal-pod-autoscaler "api" (max-replicas 10) …) -> HPA
+;;;   (pod-disruption-budget "api" (min-available 1)) -> PodDisruptionBudget
+;;;   (network-policy "deny" (default-deny))         -> NetworkPolicy
+;;;   (resource-quota "q" (hard (pods "50")))        -> ResourceQuota
+;;;   (limit-range "lr" (limits …))                  -> LimitRange
 ;;;   (gateway-class "cilium" (controller-name "…")) -> GatewayClass
 ;;;   (gateway "edge" (gateway-class-name "…") (listener …)) -> Gateway
 ;;;   (http-route "app" (parent-name "edge") (backend-service "…") …) -> HTTPRoute
@@ -25,6 +33,7 @@
 ;;;   (cm  "name")               configMap source
 ;;;   (sec "name")               secret source
 ;;;   (pvc "name")               PersistentVolumeClaim source
+;;;   (claim "data")             StatefulSet volumeClaimTemplate source
 ;;;   (host-path "/p")           hostPath source
 ;;;   (mount <source> "/path" [#:read-only #t])   volume mount: source + path
 ;;;     (env-from (cm "api-config"))            ; whole-source env injection
@@ -62,10 +71,13 @@
             ;; resource sugar
             deployment daemonset service ingress configmap secret
             storage-class persistent-volume-claim
+            stateful-set job cron-job
+            horizontal-pod-autoscaler pod-disruption-budget
+            network-policy resource-quota limit-range
             gateway-class gateway listener http-route
             custom-resource service-monitor
             ;; volume / env source refs
-            cm sec pvc mount host-path
+            cm sec pvc claim mount host-path
             ;; RBAC
             service-account role role-binding
             cluster-role cluster-role-binding cluster-rbac
@@ -165,11 +177,14 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
    #\-))
 
 (define (volume-name kind ident)
-  (if (eq? kind 'hostPath)
-      (string-append "host-" (sanitize-name ident))
-      (string-append (symbol->string kind) "-" ident)))
+  (cond ((eq? kind 'hostPath) (string-append "host-" (sanitize-name ident)))
+        ;; a StatefulSet volumeClaimTemplate is named directly: the template's
+        ;; metadata.name IS the volume name, so no prefix.
+        ((eq? kind 'claim) ident)
+        (else (string-append (symbol->string kind) "-" ident))))
 
 (define (volume-entries refs)
+  ;; `claim` refs are backed by a volumeClaimTemplate, not a pod volume.
   (map (lambda (ref)
          (let ((kind (car ref)) (n (cadr ref)))
            (cond ((eq? kind 'configMap)
@@ -181,7 +196,7 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
                  ((eq? kind 'hostPath)
                   `((name . ,(volume-name kind n)) (hostPath (path . ,n))))
                  (else (error "unknown volume kind:" kind)))))
-       refs))
+       (filter (lambda (ref) (not (eq? (car ref) 'claim))) refs)))
 
 ;; A mount tuple is (kind ident mountPath [read-only?]); the optional 4th
 ;; element marks the mount read-only.
@@ -215,28 +230,47 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
       ,@(if (null? resources) '() `((resources ,@resources)))
       ,@(if (null? sec-ctx) '() `((securityContext ,@sec-ctx))))))
 
+(define* (pod-template-alist #:key name image (port 0) (env '()) (env-from '()) (volumes '())
+                             (resources '()) (privileged #f) (args '()) (command '())
+                             (service-account #f) (host-network #f) (host-pid #f)
+                             (labels '()) (capabilities '()) (host-port #f) (protocol #f)
+                             (restart-policy #f))
+  "The pod template shared by every workload kind (Deployment, DaemonSet,
+StatefulSet, Job, CronJob): `(metadata …) (spec …)` with one container."
+  `((metadata (labels (app . ,name) ,@labels))
+    (spec ,@(if service-account `((serviceAccountName . ,service-account)) '())
+          ,@(if host-network '((hostNetwork . #t)) '())
+          ,@(if host-pid '((hostPID . #t)) '())
+          ,@(if restart-policy `((restartPolicy . ,restart-policy)) '())
+          (containers ,(container-alist #:name name #:image image #:port port
+                                        #:args args #:command command
+                                        #:env env #:env-from env-from #:volumes volumes
+                                        #:resources resources #:privileged privileged
+                                        #:capabilities capabilities
+                                        #:host-port host-port #:protocol protocol))
+          ,@(let ((vs (volume-entries volumes)))
+              (if (null? vs) '() `((volumes ,@vs)))))))
+
 (define* (workload-alist #:key kind name image (port 0) (replicas #f)
                          (namespace (current-k8s-namespace)) (env '()) (env-from '()) (volumes '())
                          (resources '()) (privileged #f) (args '()) (command '())
                          (service-account #f) (host-network #f) (host-pid #f)
-                         (labels '()) (capabilities '()) (host-port #f) (protocol #f))
+                         (labels '()) (capabilities '()) (host-port #f) (protocol #f)
+                         (spec-extra '()))
   `((apiVersion . "apps/v1")
     (kind . ,kind)
     (metadata ,@(k8s-metadata name namespace labels))
     (spec ,@(if replicas `((replicas . ,replicas)) '())
           (selector (matchLabels (app . ,name)))
-          (template
-            (metadata (labels (app . ,name) ,@labels))
-            (spec ,@(if service-account `((serviceAccountName . ,service-account)) '())
-                  ,@(if host-network `((hostNetwork . #t)) '())
-                  ,@(if host-pid `((hostPID . #t)) '())
-                  (containers ,(container-alist #:name name #:image image #:port port
-                                                #:args args #:command command
-                                                #:env env #:env-from env-from #:volumes volumes
-                                                #:resources resources #:privileged privileged
-                                                #:capabilities capabilities
-                                                #:host-port host-port #:protocol protocol))
-                  ,@(if (null? volumes) '() `((volumes ,@(volume-entries volumes)))))))))
+          ,@spec-extra
+          (template ,@(pod-template-alist
+                        #:name name #:image image #:port port #:env env #:env-from env-from
+                        #:volumes volumes #:resources resources #:privileged privileged
+                        #:args args #:command command #:service-account service-account
+                        #:host-network host-network #:host-pid host-pid #:labels labels
+                        #:capabilities capabilities #:host-port host-port
+                        #:protocol protocol)))))
+
 
 ;; ---------------------------------------------------------------------------
 ;; volume / env source refs
@@ -249,6 +283,7 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
 (define (cm name)  (list 'configMap name))
 (define (sec name) (list 'secret name))
 (define (pvc name) (list 'pvc name))
+(define (claim name) (list 'claim name))  ; a StatefulSet volumeClaimTemplate
 (define (host-path path) (list 'hostPath path))
 (define* (mount source path #:key (read-only #f))
   (append source (list path read-only)))
@@ -456,6 +491,259 @@ alist.  Each side is \"req\" or \"req-lim\"; `*' or empty omits a bound."
             #:name name #:namespace namespace #:labels labels
             #:spec `((selector (matchLabels (app . ,name)))
                      (endpoints ((port . ,port) (path . ,path) (interval . ,interval))))))
+
+;; ---------------------------------------------------------------------------
+;; batch / stateful workloads
+;; ---------------------------------------------------------------------------
+
+(define-construct stateful-set
+  #:head name
+  #:doc "a StatefulSet with one container and an optional volumeClaimTemplate"
+  #:fields ((image #:required #:doc "container image ref")
+            (port #:default 0 #:doc "containerPort (0: none)")
+            (replicas #:default 1 #:doc "pod replicas")
+            (service-name #:default name #:doc "spec.serviceName (governing headless Service)")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (privileged #:flag #:doc "privileged securityContext")
+            (args #:list #:doc "container args")
+            (command #:list #:doc "container command (entrypoint override)")
+            (service-account #:default #f #:doc "serviceAccountName")
+            (storage #:default #f #:doc "size of the generated volumeClaimTemplate (\"10Gi\")")
+            (claim-name #:default "data" #:doc "name of the generated claim (and its volume)")
+            (mount-path #:default "/data" #:doc "where the generated claim mounts")
+            (storage-class #:default #f #:doc "storageClassName of the generated claim")
+            (access-mode #:default "ReadWriteOnce" #:doc "access mode of the generated claim")
+            (volume-claim-templates #:list #:doc "extra raw volumeClaimTemplate alists")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (let* ((mounts (if storage
+                             (append volumes (list (mount (claim claim-name) mount-path)))
+                             volumes))
+                 (generated (if storage
+                                (list `((metadata (name . ,claim-name))
+                                        (spec (accessModes ,access-mode)
+                                              ,@(if storage-class
+                                                    `((storageClassName . ,storage-class)) '())
+                                              (resources (requests (storage . ,storage))))))
+                                '()))
+                 (claims (append generated volume-claim-templates)))
+            (resource
+              (workload-alist #:kind "StatefulSet" #:name name #:image image #:port port
+                              #:replicas replicas #:namespace namespace #:env env
+                              #:env-from env-from #:volumes mounts #:resources resources
+                              #:privileged privileged #:args args #:command command
+                              #:service-account service-account #:labels labels
+                              #:spec-extra
+                              `((serviceName . ,service-name)
+                                ,@(if (null? claims) '() `((volumeClaimTemplates ,@claims))))))))
+
+;; The pod spec shared by Job and CronJob (a Job spec body, minus apiVersion).
+(define* (job-spec-alist #:key name image (env '()) (env-from '()) (volumes '())
+                         (resources '()) (privileged #f) (args '()) (command '())
+                         (service-account #f) (labels '()) (restart-policy "OnFailure")
+                         (backoff-limit 6) (completions #f) (parallelism #f)
+                         (active-deadline-seconds #f) (ttl-seconds-after-finished #f))
+  `((backoffLimit . ,backoff-limit)
+    ,@(if completions `((completions . ,completions)) '())
+    ,@(if parallelism `((parallelism . ,parallelism)) '())
+    ,@(if active-deadline-seconds `((activeDeadlineSeconds . ,active-deadline-seconds)) '())
+    ,@(if ttl-seconds-after-finished
+          `((ttlSecondsAfterFinished . ,ttl-seconds-after-finished)) '())
+    (template ,@(pod-template-alist #:name name #:image image #:env env #:env-from env-from
+                                    #:volumes volumes #:resources resources
+                                    #:privileged privileged #:args args #:command command
+                                    #:service-account service-account #:labels labels
+                                    #:restart-policy restart-policy))))
+
+(define-construct job
+  #:head name
+  #:doc "a Job running one container to completion"
+  #:fields ((image #:required #:doc "container image ref")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (command #:list #:doc "container command (entrypoint override)")
+            (args #:list #:doc "container args")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (service-account #:default #f #:doc "serviceAccountName")
+            (restart-policy #:default "OnFailure" #:doc "OnFailure/Never")
+            (backoff-limit #:default 6 #:doc "retries before the Job fails")
+            (completions #:default #f #:doc "spec.completions")
+            (parallelism #:default #f #:doc "spec.parallelism")
+            (active-deadline-seconds #:default #f #:doc "spec.activeDeadlineSeconds")
+            (ttl-seconds-after-finished #:default #f #:doc "delete the Job this long after it ends")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (resource
+            `((apiVersion . "batch/v1")
+              (kind . "Job")
+              (metadata ,@(k8s-metadata name namespace labels))
+              (spec ,@(job-spec-alist #:name name #:image image #:env env #:env-from env-from
+                                      #:volumes volumes #:resources resources
+                                      #:args args #:command command
+                                      #:service-account service-account #:labels labels
+                                      #:restart-policy restart-policy
+                                      #:backoff-limit backoff-limit
+                                      #:completions completions #:parallelism parallelism
+                                      #:active-deadline-seconds active-deadline-seconds
+                                      #:ttl-seconds-after-finished ttl-seconds-after-finished)))))
+
+(define-construct cron-job
+  #:head name
+  #:doc "a CronJob running one container on SCHEDULE"
+  #:fields ((schedule #:required #:doc "cron expression (\"0 3 * * *\")")
+            (image #:required #:doc "container image ref")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (command #:list #:doc "container command (entrypoint override)")
+            (args #:list #:doc "container args")
+            (env #:list #:doc "env vars, (NAME \"value\") pairs")
+            (env-from #:list #:doc "envFrom sources (configmap/secret names)")
+            (volumes #:list #:doc "volume specs (mounted in the container)")
+            (resources #:default '() #:doc "requests/limits alist; `res' parses \"cpu/mem\"")
+            (service-account #:default #f #:doc "serviceAccountName")
+            (concurrency-policy #:default "Forbid" #:doc "Allow/Forbid/Replace")
+            (suspend #:flag #:doc "spec.suspend: true")
+            (starting-deadline-seconds #:default #f #:doc "spec.startingDeadlineSeconds")
+            (successful-jobs-history #:default 3 #:doc "successfulJobsHistoryLimit")
+            (failed-jobs-history #:default 1 #:doc "failedJobsHistoryLimit")
+            (restart-policy #:default "OnFailure" #:doc "OnFailure/Never")
+            (backoff-limit #:default 6 #:doc "retries before one run fails")
+            (time-zone #:default #f #:doc "spec.timeZone")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (resource
+            `((apiVersion . "batch/v1")
+              (kind . "CronJob")
+              (metadata ,@(k8s-metadata name namespace labels))
+              (spec (schedule . ,schedule)
+                    ,@(if time-zone `((timeZone . ,time-zone)) '())
+                    (concurrencyPolicy . ,concurrency-policy)
+                    ,@(if suspend '((suspend . #t)) '())
+                    ,@(if starting-deadline-seconds
+                          `((startingDeadlineSeconds . ,starting-deadline-seconds)) '())
+                    (successfulJobsHistoryLimit . ,successful-jobs-history)
+                    (failedJobsHistoryLimit . ,failed-jobs-history)
+                    (jobTemplate
+                      (spec ,@(job-spec-alist #:name name #:image image #:env env
+                                              #:env-from env-from #:volumes volumes
+                                              #:resources resources #:args args
+                                              #:command command
+                                              #:service-account service-account
+                                              #:labels labels
+                                              #:restart-policy restart-policy
+                                              #:backoff-limit backoff-limit)))))))
+
+;; ---------------------------------------------------------------------------
+;; scaling / availability / policy
+;; ---------------------------------------------------------------------------
+
+(define-construct horizontal-pod-autoscaler
+  #:head name
+  #:doc "an HPA scaling a workload on cpu/memory utilization"
+  #:fields ((max-replicas #:required #:doc "spec.maxReplicas")
+            (min-replicas #:default 1 #:doc "spec.minReplicas")
+            (target-kind #:default "Deployment" #:doc "scaleTargetRef.kind")
+            (target-name #:default name #:doc "scaleTargetRef.name (defaults to NAME)")
+            (target-api-version #:default "apps/v1" #:doc "scaleTargetRef.apiVersion")
+            (cpu-utilization #:default #f #:doc "target average CPU percent")
+            (memory-utilization #:default #f #:doc "target average memory percent")
+            (behavior #:map #:doc "spec.behavior (raw)")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (let ((metric (lambda (kind pct)
+                          `((type . "Resource")
+                            (resource (name . ,kind)
+                                      (target (type . "Utilization")
+                                              (averageUtilization . ,pct)))))))
+            (resource
+              `((apiVersion . "autoscaling/v2")
+                (kind . "HorizontalPodAutoscaler")
+                (metadata ,@(k8s-metadata name namespace labels))
+                (spec (scaleTargetRef (apiVersion . ,target-api-version)
+                                      (kind . ,target-kind) (name . ,target-name))
+                      (minReplicas . ,min-replicas)
+                      (maxReplicas . ,max-replicas)
+                      ,@(let ((ms (filter pair?
+                                          (list (and cpu-utilization (metric "cpu" cpu-utilization))
+                                                (and memory-utilization
+                                                     (metric "memory" memory-utilization))))))
+                          (if (null? ms) '() `((metrics ,@ms))))
+                      ,@(if (null? behavior) '() `((behavior ,@behavior))))))))
+
+(define-construct pod-disruption-budget
+  #:head name
+  #:doc "a PodDisruptionBudget over app=NAME (min-available defaults to 1)"
+  #:fields ((min-available #:default #f #:doc "spec.minAvailable (count or \"50%\")")
+            (max-unavailable #:default #f #:doc "spec.maxUnavailable (count or \"50%\")")
+            (selector #:map #:doc "selector.matchLabels (defaults to (app . NAME))")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (begin
+            (when (and min-available max-unavailable)
+              (error "pod-disruption-budget: set min-available OR max-unavailable, not both:" name))
+            (resource
+              `((apiVersion . "policy/v1")
+                (kind . "PodDisruptionBudget")
+                (metadata ,@(k8s-metadata name namespace labels))
+                (spec ,@(if max-unavailable
+                            `((maxUnavailable . ,max-unavailable))
+                            `((minAvailable . ,(or min-available 1))))
+                      (selector (matchLabels ,@(if (null? selector)
+                                                   `((app . ,name))
+                                                   selector))))))))
+
+(define-construct network-policy
+  #:head name
+  #:doc "a NetworkPolicy; (default-deny) denies all ingress+egress"
+  #:fields ((pod-selector #:map #:doc "spec.podSelector.matchLabels (empty: all pods)")
+            (policy-types #:list #:doc "Ingress and/or Egress (default: whichever rules are given)")
+            (ingress #:list #:doc "raw ingress rule alists")
+            (egress #:list #:doc "raw egress rule alists")
+            (default-deny #:flag #:doc "deny all ingress and egress (no rules)")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (let ((types (cond ((pair? policy-types) policy-types)
+                             (default-deny '("Ingress" "Egress"))
+                             (else (filter string?
+                                           (list (and (pair? ingress) "Ingress")
+                                                 (and (pair? egress) "Egress")))))))
+            (resource
+              `((apiVersion . "networking.k8s.io/v1")
+                (kind . "NetworkPolicy")
+                (metadata ,@(k8s-metadata name namespace labels))
+                (spec (podSelector ,@(if (null? pod-selector) '()
+                                         `((matchLabels ,@pod-selector))))
+                      ,@(if (null? types) '() `((policyTypes ,@types)))
+                      ,@(if (or default-deny (null? ingress)) '() `((ingress ,@ingress)))
+                      ,@(if (or default-deny (null? egress))  '() `((egress ,@egress))))))))
+
+(define-construct resource-quota
+  #:head name
+  #:doc "a ResourceQuota"
+  #:fields ((hard #:map #:doc "hard limits, e.g. (requests.cpu \"8\") (pods \"50\")")
+            (scopes #:list #:doc "spec.scopes")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (resource
+            `((apiVersion . "v1")
+              (kind . "ResourceQuota")
+              (metadata ,@(k8s-metadata name namespace labels))
+              (spec (hard ,@hard)
+                    ,@(if (null? scopes) '() `((scopes ,@scopes)))))))
+
+(define-construct limit-range
+  #:head name
+  #:doc "a LimitRange from raw limit alists"
+  #:fields ((limits #:list #:doc "raw limit alists, e.g. ((type . \"Container\") (default (cpu . \"500m\")))")
+            (namespace #:default (current-k8s-namespace) #:doc "target namespace (with-namespace scope)")
+            (labels #:map #:doc "extra metadata.labels"))
+  #:build (resource
+            `((apiVersion . "v1")
+              (kind . "LimitRange")
+              (metadata ,@(k8s-metadata name namespace labels))
+              (spec (limits ,@limits)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Gateway API
