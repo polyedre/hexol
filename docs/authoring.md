@@ -128,28 +128,25 @@ parenthesised form without `$` is always read as a nested map, silently:
 >                   (replicas (get '(cfg replicas))))
 > ```
 >
-> Two things stay eager. The **positional head args** (`"api"` above) are
-> evaluated where you write them — they name the op before the fold starts.
-> And a **value construct** (`hexol doc` says so: the SQL column types, the
-> k8s `listener` and `rule`) returns data for the construct around it, so it
-> evaluates where written — which, inside a deferred field, is already fold
-> time. See [`extending.md`](extending.md) for `define-construct`.
+> The **positional head args** (`"api"` above) evaluate at fold time too, so a
+> name can come from state: `(custom-resource (str "vault-" (get '(env name)))
+> …)`. Before the fold the op is labeled by its construct name alone
+> (`custom-resource`); `hexol tree` folds once and shows the resolved label
+> (`custom-resource vault-prod`). One thing stays eager: a **value construct**
+> (`hexol doc` says so: the SQL column types, the k8s `listener` and `rule`)
+> returns data for the construct around it, so it evaluates where written —
+> which, inside a deferred field, is already fold time. See
+> [`extending.md`](extending.md) for `define-construct`.
 
 ## `hx-late` — when a whole form has to wait
 
-Two surfaces are still load-time, because neither has a per-field schema to
-defer: a construct's **positional head args**, and the schema-less
-`body`/`block` forms (`terraform-resource`, `terraform-settings`,
-`terraform-provider`, the ansible `task`). Wrap either in `(hx-late LABEL
-body …)` — one op, labeled LABEL, whose body is *built* when it fires, with
-the fold state bound:
+One surface is still load-time, because it has no per-field schema to defer:
+the schema-less `body`/`block` forms (`terraform-resource`,
+`terraform-settings`, `terraform-provider`, the ansible `task`). Wrap the form
+in `(hx-late LABEL body …)` — one op, labeled LABEL, whose body is *built*
+when it fires, with the fold state bound:
 
 ```scheme
-;; 1. a name computed from state (head args are eager)
-(hx-late "vault CR"
-  (custom-resource (str "vault-" (get '(env name))) (api "v1") (kind "Vault")))
-
-;; 2. the schema-less body surface
 (hx-late "db instance"
   (terraform-resource "aws_db_instance" "main"
     (instance_class (get '(db class)))
@@ -157,8 +154,9 @@ the fold state bound:
 ```
 
 Body slots splice and stamp like `hx-ops` (an op, a list of ops, or `'()`),
-and `hexol tree --realize` shows what it built underneath it. LABEL itself is
-evaluated where written — it names the op before the fold, like a head arg.
+and `hexol tree` shows what it built underneath it. LABEL itself is evaluated
+where written — it is the op's name, which `tree --no-fold` prints without
+folding.
 
 ## Helpers inside `$` and inside predicates
 

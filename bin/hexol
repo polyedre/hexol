@@ -16,7 +16,7 @@
 ;;;   hexol diff [--only SPEC] [--explain] [-i INV]  drift: 0 clean, 1 drift, 2 error
 ;;;   hexol tree [-v]                     [-i INV]   op tree, indented
 ;;;                                                  (-v: + per-op fold time)
-;;;   hexol explain PATH|HASH             [-i INV]   ops that touched PATH
+;;;   hexol explain PATH|HASH [-o FMT] [--diff CMD] [-i INV]   ops that touched PATH
 ;;;                                                  (or every path an op changed)
 ;;;   hexol lint                          [-i INV]   warn on $ reads that precede
 ;;;                                                  the write they depend on
@@ -323,7 +323,7 @@
          (unless (eqv? code 0) (exit code)))))))
 
 ;; Full format list for error messages: built-ins plus `renders-with` names.
-(define builtin-formats '("sexp" "json" "yaml" "terraform" "ansible"))
+(define builtin-formats '("sexp" "json" "pretty-json" "yaml" "terraform" "ansible"))
 
 (define (format-list renderers)
   (string-join (append builtin-formats (map renderer-name renderers)) " | "))
@@ -353,19 +353,28 @@
            (let ((target (render-target fmt state path)))
              (when (and path (not target))
                (die "render: path not found: ~a" path))
-             (cond
-               ((string=? fmt "sexp")
-                (let ((text (call-with-output-string
-                              (lambda (p) (pretty-print target p)))))
-                  (display text)
-                  (unless path (size-hint inv text))))
-               ((string=? fmt "json") (emit-json target))
-               ((string=? fmt "yaml") (emit-yaml target))
-               ((string=? fmt "terraform") (emit-tf target))
-               ;; a playbook is valid JSON — pretty, like terraform's config
-               ((string=? fmt "ansible") (emit-json target #:pretty #t))
-               (else (usage-error "render: unknown output format ~s (~a)"
-                                  fmt (format-list renderers)))))))))))
+             (if (and (string=? fmt "sexp") (not path))
+                 (let ((text (call-with-output-string
+                               (lambda (p) (pretty-print target p)))))
+                   (display text)
+                   (size-hint inv text))
+                 (emit-value "render" fmt target renderers)))))))))
+
+;; Write VAL to stdout in FMT — a generic format, or a renderer registered by
+;; the inventory (which then receives VAL in place of the whole state).
+(define (emit-value verb fmt val renderers)
+  (let ((custom (find (lambda (r) (string=? (renderer-name r) fmt)) renderers)))
+    (cond
+      (custom ((renderer-proc custom) val))
+      ((string=? fmt "sexp") (pretty-print val))
+      ((string=? fmt "json") (emit-json val))
+      ((string=? fmt "pretty-json") (emit-json val #:pretty #t))
+      ((string=? fmt "yaml") (emit-yaml val))
+      ((string=? fmt "terraform") (emit-tf val))
+      ;; a playbook is valid JSON — pretty, like terraform's config
+      ((string=? fmt "ansible") (emit-json val #:pretty #t))
+      (else (usage-error "~a: unknown output format ~s (~a)"
+                         verb fmt (format-list renderers))))))
 
 ;; ---------------------------------------------------------------------------
 ;; apply — run the inventory's appliers against ONE resolved state, in order.
@@ -587,7 +596,7 @@
   (format #t "~a  ~a~a~%"
           (paint-hash (op-content-hash op))
           (time-cell op)
-          (line bars last? (label-paint (or (op-label op) (symbol->string (op-kind op))))))
+          (line bars last? (label-paint (op-display-label op))))
   (walk-op-children op (concatenate (list bars (list (not last?))))))
 
 (define (walk-source form bars last?)
@@ -614,7 +623,7 @@
           (append-map
             (lambda (o)
               (let ((kids (display-children o))
-                    (same? (equal? (op-label o) (op-label op))))
+                    (same? (equal? (op-display-label o) (op-display-label op))))
                 (cond
                   ((and (pair? kids) (or (not (op-label o)) same?)) kids)
                   ((and same? (null? (cdr realized))) '())
@@ -642,15 +651,17 @@
      (walk-list (filter printable-source? (children-of form))
                 bars walk-source))))
 
-;; By default `tree` only LOADS the inventory — no fold, so nothing shells out
-;; and a deferred construct prints as one node with its head label. `--realize`
-;; (implied by `-v`, which has to fold to time anything) folds once and shows
-;; each construct's produced ops as children.
+;; `tree` folds once by default: the fold is what gives a deferred construct
+;; its head-arg label ("gateway-class acme-octavia") and the ops it produced,
+;; shown as its children. The fold runs real effects (curl, sops, helm) — the
+;; same ones `render` runs. `--no-fold` only LOADS the inventory: nothing
+;; shells out, constructs print by name alone, without children. `-v` always
+;; folds (it has to, to time anything).
 (define (cmd-tree args)
   (call-with-values (lambda () (extract-verbose args))
     (lambda (verbose? rest0)
-      (call-with-values (lambda () (extract-flag '("--realize") rest0))
-        (lambda (realize? rest)
+      (call-with-values (lambda () (extract-flag '("--no-fold") rest0))
+        (lambda (no-fold? rest)
           (let* ((inv (inventory-only "tree" rest))
                  (ops (load-ops inv))
                  ;; Times include children (a parent totals its subtree).
@@ -658,7 +669,7 @@
                  (timings (and verbose? (make-hash-table))))
             ;; Fold before measuring hash widths: the fold is what gives
             ;; deferred constructs their children, and they need addresses too.
-            (when (or verbose? realize?)
+            (when (or verbose? (not no-fold?))
               (realize-ops! ops timings))
             (parameterize ((current-uniq (make-uniq-len (map op-content-hash (tree-op-list ops)))))
               (note ";; inventory: ~a (~a top-level ops)~%" inv (length ops))
@@ -672,7 +683,7 @@
 ;; ---------------------------------------------------------------------------
 
 (define (leaf? op) (null? (op-children op)))
-(define (op-display op) (or (op-label op) (symbol->string (op-kind op))))
+(define (op-display op) (op-display-label op))
 
 ;; (file . line) -> "file:line", or a hint when unknown.
 (define (loc->string loc)
@@ -702,18 +713,25 @@
   ;; prefix (see do-explain). Inventory is -i/env.
   (call-with-values (lambda () (extract-inventory "explain" args))
     (lambda (inv rest)
-      (let loop ((args rest) (target #f))
+      (let loop ((args rest) (target #f) (fmt "sexp")
+                 (differ (getenv "HEXOL_DIFF")))
         (match args
           (()
            (unless target (usage-error "explain: missing PATH or HASH"))
-           (do-explain (inventory-or-default "explain" inv) target))
+           (do-explain (inventory-or-default "explain" inv) target fmt differ))
+          (((or "-o" "--output") f . rest) (loop rest target f differ))
+          (("--diff" d . rest) (loop rest target fmt d))
           ((arg . rest)
-           (cond ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
-                 ((not target) (loop rest arg))
+           (cond ((string-prefix? "--output=" arg) (loop rest target (flag-value "--output=" arg) differ))
+                 ((string-prefix? "--diff=" arg) (loop rest target fmt (flag-value "--diff=" arg)))
+                 ((string-prefix? "-" arg) (usage-error "explain: unknown flag ~a" arg))
+                 ((not target) (loop rest arg fmt differ))
                  (else (usage-error "explain: unexpected argument ~a (inventory is -i/--inventory)" arg)))))))))
 
-;; Locate OP in the fire-order TRACE, returning (before . after) — the prior
-;; step's state and this step's — or #f if it never fired.
+;; Locate OP in the fire-order TRACE, returning (before . after) — the state
+;; before it (or any of its descendants) fired and the state after it fired —
+;; or #f if it never fired. Children fire before their wrapper, so for a
+;; composition this spans the whole subtree: the composition reads as one op.
 ;;
 ;; Identity first, content hash second. The ops a deferred construct produces
 ;; exist only inside the fold, so the op a caller matched by hash need not be
@@ -722,21 +740,90 @@
 ;; every other address in the CLI. The eq? pass runs first so the common case
 ;; costs no hashing.
 (define (trace-step op trace)
+  (define subtree (tree-op-list (list op)))
   (define (scan same?)
-    (let loop ((prev '((attributes))) (steps trace))
+    (let loop ((prev '((attributes))) (steps trace) (before #f) (after #f))
       (cond
-        ((null? steps) #f)
-        ((same? (caar steps)) (cons prev (cdar steps)))
-        (else (loop (cdar steps) (cdr steps))))))
-  (or (scan (lambda (o) (eq? o op)))
-      (let ((h (op-content-hash op)))
-        (scan (lambda (o) (string=? (op-content-hash o) h))))))
+        ((null? steps) (and before (cons before after)))
+        ((any (lambda (o) (same? o (caar steps))) subtree)
+         (loop (cdar steps) (cdr steps) (or before prev) (cdar steps)))
+        (else (loop (cdar steps) (cdr steps) before after)))))
+  (or (scan eq?)
+      (scan (lambda (a b) (string=? (op-content-hash a) (op-content-hash b))))))
 
-;; The state paths OP changed when it fired — its delta's keys. Mirrors
-;; show-delta's trace walk, but returns the paths instead of printing.
-(define (op-changed-paths op trace)
+;; Explain OP as one step: every state path it changed, with the value before
+;; it (and its whole subtree) fired and after. A composition reads as a single
+;; op — its leaves' individual steps are `explain <path>` territory.
+(define (explain-op op trace fmt renderers differ)
+  ;; The value at a changed path is spilled under DIR as files, then before/
+  ;; after are diffed: a list of maps becomes one file per element named by
+  ;; its identity (ns/Kind/name for k8s resources), so the file names say
+  ;; which resources changed; anything else is one file named by the path.
+  ;; Extension follows FMT so a syntax-aware differ (difftastic) picks the
+  ;; language.
+  (define ext (or (assoc-ref '(("sexp" . "scm") ("terraform" . "tf.json") ("ansible" . "json") ("pretty-json" . "json")) fmt)
+                  fmt))
+  (define files '())                    ; relative paths spilled, either side
+  (define (element-name x i)
+    (let ((kind (and (object-shape? x) (assq-ref x 'kind)))
+          (name (and (object-shape? x) (and=> (assq-ref x 'metadata) (lambda (m) (assq-ref m 'name)))))
+          (ns   (and (object-shape? x) (and=> (assq-ref x 'metadata) (lambda (m) (assq-ref m 'namespace))))))
+      (cond ((and kind name ns) (format #f "~a/~a/~a" ns kind name))
+            ((and kind name) (format #f "~a/~a" kind name))
+            (else (number->string i)))))
+  (define (mkdir-p path)                ; every parent of PATH
+    (let loop ((parts (string-split path #\/)) (acc ""))
+      (when (pair? (cdr parts))
+        (let ((dir (string-append acc (car parts))))
+          (unless (or (string-null? dir) (file-exists? dir)) (mkdir dir))
+          (loop (cdr parts) (string-append dir "/"))))))
+  (define (write! dir rel val)
+    (unless (member rel files) (set! files (cons rel files)))
+    (mkdir-p (string-append dir "/" rel))
+    (with-output-to-file (string-append dir "/" rel)
+      (lambda () (emit-value "explain" fmt val renderers))))
+  (define (spill! dir path val dir?)
+    (let ((base (path->string path)))
+      (if dir?
+          (begin
+            (mkdir (string-append dir "/" base)) ; keep an empty dir on the empty side
+            (for-each (lambda (x i) (write! dir (format #f "~a/~a.~a" base (element-name x i) ext) x))
+                      val (iota (length val))))
+          (write! dir (string-append base "." ext) val))))
   (let ((step (trace-step op trace)))
-    (if step (map car (state-diff (car step) (cdr step) '())) '())))
+    (note ";; op:        ~a  ~a~%" (op-short-hash op hash-width) (op-display op))
+    (note ";; at:        ~a~%" (loc->string (op-loc op)))
+    (if (not step)
+        (note ";; (this op did not fire in the resolve)~%")
+        (let* ((diff (state-diff (car step) (cdr step) '()))
+               (tmp  (format #f "~a/hexol-~a" (or (getenv "TMPDIR") "/tmp") (getpid)))
+               (before (string-append tmp "/before"))
+               (after  (string-append tmp "/after")))
+          (note ";; ~a path~p this op changed:~%~%" (length diff) (length diff))
+          (mkdir tmp) (mkdir before) (mkdir after)
+          (for-each (lambda (d)
+                      ;; a list that is/was empty still diffs per element
+                      (let ((dir? (or (sequence-of-maps? (cadr d)) (sequence-of-maps? (caddr d)))))
+                        (spill! before (car d) (cadr d) dir?)
+                        (spill! after  (car d) (caddr d) dir?)))
+                    diff)
+          (force-output)
+          ;; ponytail: differ is a shell string so `--diff "difft --color always"`
+          ;; works; exit status ignored (diff returns 1 on difference). No
+          ;; differ given: unified diff per file, headers (paths, timestamps)
+          ;; dropped in favour of the bare file name.
+          (if differ
+              (system (format #f "cd ~a && ~a before after" tmp differ))
+              (for-each
+                (lambda (rel)
+                  (format #t "~a~%" (o-bold rel))
+                  (force-output)
+                  (system (format #f "cd ~a && diff -uN ~a before/~a after/~a | tail -n +3"
+                                  tmp (if (port-color? (current-output-port)) "--color=always" "")
+                                  rel rel))
+                  (newline))
+                (sort files string<?)))
+          (system (string-append "rm -rf " tmp))))))
 
 ;; Print the explain trace for one PATH: its final value and every op that
 ;; changed it.
@@ -760,8 +847,9 @@
 ;; op's content hash is taken as that op, tracing every path it changed;
 ;; otherwise parsed as a PATH. A hash prefix wins over a same-spelled single-
 ;; segment path; qualify with a `.` (or full path) to force path mode.
-(define (do-explain inv target)
-  (let ((ops (load-ops inv)))
+(define (do-explain inv target fmt differ)
+  (call-with-values (lambda () (load-ops+collected current-renderers inv))
+    (lambda (ops renderers)
     ;; Resolve BEFORE matching: `explain` folds anyway, and the fold is what
     ;; gives a deferred construct's produced ops their addresses.
     (call-with-values (lambda () (resolve-with-trace ops '()))
@@ -770,14 +858,8 @@
                        (let ((ms (hash-matches ops target))) (and (pair? ms) (car ms))))))
         (note ";; inventory: ~a~%" inv)
         (if op
-            (let ((paths (op-changed-paths op trace)))
-              (note ";; op:        ~a  ~a~%" (op-short-hash op hash-width) (op-display op))
-              (note ";; at:        ~a~%" (loc->string (op-loc op)))
-              (note ";; ~a path~p this op changed:~%~%" (length paths) (length paths))
-              (if (null? paths)
-                  (note ";; (this op fired no leaf delta — it's a wrapper; explain its children)~%")
-                  (for-each (lambda (path) (explain-path final trace path)) paths)))
-            (explain-path final trace (parse-path target))))))))
+            (explain-op op trace fmt renderers differ)
+            (explain-path final trace (parse-path target)))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; lint — reads that precede the write they depend on (see hexol/lint.scm)
@@ -806,8 +888,8 @@
 
 ;; Fold OPS once, discarding the state, so every deferred construct records the
 ;; ops it produced (`op-realized-children') and introspection can descend into
-;; them. OPT-IN ONLY (`tree --realize`, `tree -v`): a fold runs real effects —
-;; helm/yq, curl, sops — and plain `tree`/`ops` must stay side-effect free.
+;; them. A fold runs real effects — helm/yq, curl, sops — the same ones `render`
+;; runs; `tree --no-fold` and `ops` skip it and stay side-effect free.
 ;; A failing fold is reported, not raised: the tree is still worth printing,
 ;; just without the realized layer.
 (define* (realize-ops! ops #:optional (timings #f))
@@ -856,6 +938,11 @@
                      (state-diff (assq-ref a k) (assq-ref b k)
                                  (append path (list k))))
                    keys)))
+    ;; Two plain lists (e.g. kubernetes_resources): report only the elements
+    ;; removed / added, not both lists whole. ponytail: a pure reorder shows
+    ;; as () -> (); positional diff if that ever matters.
+    ((and (list? a) (list? b))
+     (list (list path (lset-difference equal? a b) (lset-difference equal? b a))))
     (else (list (list path a b)))))
 
 ;; Print the delta OP introduced where it fired in the trace — `before` is the
@@ -1176,7 +1263,7 @@ Writes the inventory to stdout:  hexol import -f app.yaml > app.scm")
 
 (register-verb!
  (make-verb "render" (cmd-is "render") (delegating-runner cmd-render)
-   "render [-o sexp|json|yaml|terraform|ansible] [--path a.b.c] [--validate] [-i INVENTORY]"))
+   "render [-o sexp|json|pretty-json|yaml|terraform|ansible] [--path a.b.c] [--validate] [-i INVENTORY]"))
 (register-verb!
  (make-verb "apply" (cmd-is "apply") (delegating-runner cmd-apply)
    "apply  [--only SPEC] [--dry-run] [--list] [-i INVENTORY]"))
@@ -1185,10 +1272,10 @@ Writes the inventory to stdout:  hexol import -f app.yaml > app.scm")
    "diff   [--only SPEC] [--explain] [-i INVENTORY]   (exit 0 clean, 1 drift, 2 error)"))
 (register-verb!
  (make-verb "tree" (cmd-is "tree") (delegating-runner cmd-tree)
-   "tree    [-v] [--realize] [-i INVENTORY]"))
+   "tree    [-v] [--no-fold] [-i INVENTORY]"))
 (register-verb!
  (make-verb "explain" (cmd-is "explain") (delegating-runner cmd-explain)
-   "explain PATH|HASH [-i INVENTORY]"))
+   "explain PATH|HASH [-o FORMAT] [--diff CMD] [-i INVENTORY]   (CMD default: $HEXOL_DIFF, else per-file `diff -u`)"))
 (register-verb!
  (make-verb "lint" (cmd-is "lint") (delegating-runner cmd-lint)
    "lint    [-i INVENTORY]"))
@@ -1375,11 +1462,18 @@ Global: --color[=always|never|auto] forces the human views' coloring.")
     ;; One render cache per invocation, scoped to this inventory's content, so
     ;; helm-template / remote-manifest shell-outs are reused across runs. #f (no
     ;; inventory, or an unusable cache dir) disables it — results are identical.
-    (let ((inv (peek-inventory rest)))
+    ;; `hexol -i FILE tree`: a leading inventory flag moves after the verb, so
+    ;; -i works from anywhere (verbs already accept it in any position).
+    (let* ((rest (match rest
+                   (((and flag (or "-i" "--inventory")) f . more) (append more (list flag f)))
+                   ((arg . more) (if (string-prefix? "--inventory=" arg) (append more (list arg)) rest))
+                   (_ rest)))
+           (inv (peek-inventory rest)))
       (parameterize ((current-render-cache
                       (and inv (file-exists? inv) (open-render-cache inv))))
         (match rest
-          (() (show-help inv) (exit 0))
+          ((or () ((or "-i" "--inventory") _) ((? (lambda (a) (string-prefix? "--inventory=" a)))))
+           (show-help inv) (exit 0))
           ;; A help request shows help for INV (so `hexol --help -i FILE` and
           ;; `hexol -i FILE help` both list that inventory's actions, not just
           ;; the $HEXOL_INVENTORY one).

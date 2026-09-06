@@ -123,12 +123,13 @@ the enclosing `with-namespace` (scope forms bind their parameter at build time
 *and* at fold time). A field that throws is blamed on the construct, the field,
 and the authored `FILE:LINE`.
 
-The positional `#:head` args stay eager: they are evaluated where the call is
-written, because they form the op's label (`"deployment api"`) and its content
-hash, which introspection needs before any fold. When a head arg (or a
-schema-less `body`/`block` form) has to read state, wrap the whole form in
-`(hx-late LABEL …)`, which builds its body at fold time — see
-[`authoring.md`](authoring.md).
+The positional `#:head` args evaluate at fold time too, so a name can be read
+from state. The op's content hash comes from the authored form, so it never
+depends on them; its label does — `"deployment api"` is recorded as the op
+fires (`op-realized-label`), and before that the op is labeled `"deployment"`.
+`hexol tree` folds once so it can print the resolved label. Only a
+schema-less `body`/`block` form has to be wrapped in `(hx-late LABEL …)`,
+which builds its body at fold time — see [`authoring.md`](authoring.md).
 
 > **Careful with load-time `parameterize`.** A macro of your own that bound a
 > library parameter around a body and bundled it with `compose-ops` —
@@ -257,7 +258,7 @@ k8s))`. It is still just Scheme procedures returning ops:
 | workload pod fields               | `deployment`/`daemonset`/`stateful-set`/`job`/`cron-job` share one `pod-template-alist`, so `security-context`, `container-security-context`, `node-selector`, `tolerations`, `affinity`, `annotations`, `pod-annotations`, `service-account` and `priority-class` mean the same thing on all of them. |
 | `tls-all`                         | A `transform-resources` walking Ingresses and deep-merging TLS sections. |
 | `annotate-all` / `label-all`      | Constructs with one `#:map` field over `transform-resources`, so the set can be computed from state: `(label-all (labels (env (get '(cfg env)))))`. |
-| `checksum-config`                 | A `make-op` that reads the resource list, hashes referenced CM/Secret data, and re-writes Deployments with a `config/checksum` annotation. |
+| `checksum-config`                 | A `make-op` that reads the resource list, hashes referenced CM/Secret data, and re-writes workloads (Deployment, DaemonSet, StatefulSet, Job) with a `config/checksum` annotation. |
 | `compliance-check name predicate` | A `make-op` walking resources, appending findings to `(compliance_findings)`. |
 | `compliance-all`                  | A `compose-ops` bundle of five named checks (resources set, mem limit = req, cpu limit ≥ req, image registry, no privileged). |
 
@@ -437,7 +438,7 @@ Because every op carries its own `source` form and (optionally) a
 ```
 hexol ops     INVENTORY   # flat list of top-level ops with kinds + source forms
 hexol tree    INVENTORY   # full nested tree, box-drawn, descending compose-ops + when/case bodies
-                          #   --realize folds once (running effects) to show what constructs produce
+                          #   folds once to show what constructs produce; --no-fold only loads
 hexol explain PATH INVENTORY   # which ops touched a given path in the final state?
 ```
 

@@ -169,8 +169,15 @@
                              '())))
          (list (cadr (state-get final '(rows r1 out)))
                (cadr (state-get final '(rows r2 out))))))
-(check "the head arg still names the op before any fold"
-       "thing api" (op-label (thing "api" (image "i"))))
+(check "before a fold the op is labeled by construct name alone"
+       "thing" (op-display-label (thing "api" (image "i"))))
+(let ((op (thing (str "api-" (get '(env))) (image "i"))))
+  (resolve (list (op:set '(env) "prod" '(set env)) op) '())
+  (check "a head arg read from state names the op once it has fired"
+         "thing api-prod" (op-display-label op))
+  (check "the content hash ignores the realized label"
+         (op-content-hash (thing (str "api-" (get '(env))) (image "i")))
+         (op-content-hash op)))
 (check "realized children are exposed after one fold"
        '(1 set)
        (let* ((op (thing "api" (image "i")))

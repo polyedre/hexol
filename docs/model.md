@@ -47,15 +47,17 @@ effect **and** its source form, label, and children:
 <op> = (kind, source, effect : state -> state, label, children)
 ```
 
-The fold runs `effect`; tooling (`explain`, `tree`, `ops`) reads `source`
-without executing anything — **loading an inventory has no side effects**, so
-`tree`/`ops` never shell out, curl, or decrypt.
+The fold runs `effect`; `ops` and `tree --no-fold` read `source` without
+executing anything — **loading an inventory has no side effects**, so they
+never shell out, curl, or decrypt.
 
-A construct discovers the ops it produces only by running, so an op also
-carries them (`op-realized-children`) — filled in on fire and excluded from the
-content hash. Seeing that layer therefore costs a fold, which is why it is
-opt-in: `hexol tree --realize` (and `tree -v`, which has to fold to time
-anything). Both run real effects, decryption included. This is the price that buys back introspection —
+A construct discovers its head-arg label and the ops it produces only by
+running, so an op also carries them (`op-realized-label`,
+`op-realized-children`) — filled in on fire and excluded from the content
+hash, which comes from the authored form. Seeing that layer costs a fold, so
+`hexol tree` folds once by default (as `explain` and `show` always have); the
+fold is fast and runs the same effects `render` runs, decryption included.
+`--no-fold` opts out. This is the price that buys back introspection —
 without it the inventory would be an opaque black box. It is the property that
 separates this from Helm/Kustomize: **rendering is not opaque**, every effect
 is a labelled record, not a string substitution buried in a template.
@@ -80,10 +82,10 @@ position means:
 ```
 
 So `$` is a marker the *config-tree* layer needs and nothing else: the seam is
-which layer you are in, not when things run. Two things still evaluate where
-they are written — a constructor's positional head args (they label the op
-before the fold) and a `#:value` construct (it returns data for the construct
-around it).
+which layer you are in, not when things run. One thing still evaluates where
+it is written — a `#:value` construct (it returns data for the construct
+around it). A constructor's positional head args evaluate at fold time like
+its fields; until then the op is labeled by its construct name alone.
 
 ## Why ordering is load-bearing
 

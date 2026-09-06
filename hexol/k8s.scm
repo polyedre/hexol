@@ -1261,9 +1261,15 @@ the workload it produced (via `service-from-workload')."
 (define (hash-hex s)
   (number->string (string-hash s) 16))
 
+;; Kinds whose pod template sits at spec.template (CronJob nests it under
+;; spec.jobTemplate and is left alone).
+(define pod-template-kinds '("Deployment" "DaemonSet" "StatefulSet" "Job"))
+(define (pod-template-kind? r) (member (assq-ref r 'kind) pod-template-kinds))
+
 (define (checksum-config)
-  "Return an op that annotates each Deployment's pod template with a hash of
-the ConfigMaps/Secrets it references (envFrom + volumes)."
+  "Return an op that annotates each workload's (Deployment, DaemonSet,
+StatefulSet, Job) pod template with a hash of the ConfigMaps/Secrets it
+references (envFrom + volumes)."
   (make-op 'checksum-config '(checksum-config)
     (lambda (state)
       (let* ((rs    (or (state-get state '(kubernetes_resources)) '()))
@@ -1282,7 +1288,7 @@ the ConfigMaps/Secrets it references (envFrom + volumes)."
                                           (string-append (symbol->string (car b)) (cdr b))))))
               "\n")))
         (define (dangling-findings r)
-          (if (equal? (assq-ref r 'kind) "Deployment")
+          (if (pod-template-kind? r)
               (filter-map
                 (lambda (ref)
                   (and (not (assoc-ref index (ref->index-key ref)))
@@ -1298,7 +1304,7 @@ the ConfigMaps/Secrets it references (envFrom + volumes)."
         (let ((state* (append-findings state (concatenate (map dangling-findings rs)))))
           (state-set state* '(kubernetes_resources)
             (map (lambda (r)
-                   (if (equal? (assq-ref r 'kind) "Deployment")
+                   (if (pod-template-kind? r)
                        (let ((refs (deployment-config-refs r)))
                          (if (null? refs)
                              r

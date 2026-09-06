@@ -16,6 +16,7 @@
   #:export (;; ops
             make-op op? op-kind op-source op-effect op-label op-children op-loc
             op-realized-children set-op-realized-children!
+            op-realized-label set-op-realized-label! op-display-label
             current-author-loc stamp-loc relabel
             current-state
             op-content-hash op-short-hash fnv1a-64
@@ -113,7 +114,7 @@ SOURCE is the authored form for debugging, LABEL an optional one-line
 description (#f falls back to KIND), and CHILDREN the nested ops for
 introspection.  The op's source location is snapshotted from
 `current-author-loc'."
-  (%make-op kind source effect label children (current-author-loc) (list '())))
+  (%make-op kind source effect label children (current-author-loc) (list '() #f)))
 
 (define (op-realized-children op)
   "The ops OP's effect produced the last time it fired, or '() if it has not
@@ -125,6 +126,20 @@ declared, so it is excluded from `op-content-hash'."
   "Record OPS as the ops OP's effect produced while firing."
   (set-car! (op-realized op) ops))
 
+(define (op-realized-label op)
+  "A label OP's effect computed while firing (a construct's head args are
+read from state then), or #f.  Discovered like the realized children, so
+excluded from `op-content-hash'; `op-display-label' prefers it."
+  (cadr (op-realized op)))
+
+(define (set-op-realized-label! op label)
+  (set-car! (cdr (op-realized op)) label))
+
+(define (op-display-label op)
+  "OP's line in a listing: the realized label if it has fired, else the
+declared label, else the kind."
+  (or (op-realized-label op) (op-label op) (symbol->string (op-kind op))))
+
 ;; Stamps a domain identity ("resource Deployment/api", "tx Rent") onto an op
 ;; built by a generic constructor (op:append/op:merge) that otherwise carries a
 ;; bland label. Unlike make-op, keeps the original op-loc rather than
@@ -135,7 +150,8 @@ children, and source location."
   ;; A fresh realized box: the copy is its own op, and sharing the box would
   ;; make one of them report ops the other produced.
   (%make-op (op-kind op) (op-source op) (op-effect op)
-            label (op-children op) (op-loc op) (list (op-realized-children op))))
+            label (op-children op) (op-loc op)
+            (list (op-realized-children op) (op-realized-label op))))
 
 ;; (stamp-loc form) evaluates form with current-author-loc bound to form's own
 ;; source location, so ops built while it runs are blamed on the authored line.

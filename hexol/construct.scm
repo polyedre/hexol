@@ -58,8 +58,9 @@
 ;;;                     (replicas (get '(cfg replicas))))
 ;;;
 ;;; — reading whatever the merges before it in the fold have written. The
-;;; positional HEAD args stay eager: they name the thing, and the op's label
-;;; ("deployment api") has to exist before the fold.
+;;; positional HEAD args evaluate then too, so a name can come from state;
+;;; the op's label ("deployment api") is recorded as it fires, and before that
+;;; the op is labeled by its construct name alone.
 ;;;
 ;;; A `#:value` construct is the exception: it returns data for an enclosing
 ;;; construct to consume (a sql column, a Gateway listener), so it evaluates
@@ -348,23 +349,31 @@
 ;; ---------- fold-time construct ops ----------
 ;;
 ;; A deferred construct call expands into `construct-op`: the authored form is
-;; the op's source (so its content hash is per-call-site), the label is the
-;; construct name plus its head args (computed at load, before any fold), and
-;; the effect runs THUNK — the `%…-impl` call, i.e. defaults, coercions and
-;; every field expression — with `current-state` bound, then folds whatever it
-;; returned (one op or a list of ops).
+;; the op's source (so its content hash is per-call-site), the load-time label
+;; is the construct name, and the effect — with `current-state` bound —
+;; evaluates the head args (recording "name arg …" as the realized label), then
+;; runs the `%…-impl` call, i.e. defaults, coercions and every field
+;; expression, and folds whatever it returned (one op or a list of ops).
 
 (define (construct-label name args)
   "The op label for a construct call: NAME plus its head ARGS, e.g.
-\"deployment api\".  Head args are evaluated where the call is written, so
-the label exists before any fold."
+\"deployment api\"."
   (string-join (cons name (map (lambda (a) (format #f "~a" a)) args)) " "))
 
-(define (construct-op label source thunk)
-  "Return an op that runs THUNK at fold time with `current-state' bound and
-folds the op (or list of ops) it returns.  A thin naming of the kernel's
-`op:late'."
-  (op:late 'construct source thunk label))
+(define (construct-op name source proc)
+  "Return an op that, at fold time with `current-state' bound, calls PROC
+with a one-argument procedure LABEL!: PROC evaluates the head args, hands
+them to LABEL! (which records \"NAME arg …\" as the op's realized label),
+then returns the op (or list of ops) to fold.  Before it fires the op is
+labeled NAME alone; the content hash uses the authored SOURCE and never
+changes.  A thin naming of the kernel's `op:late'."
+  (letrec ((op (op:late 'construct source
+                        (lambda ()
+                          (proc (lambda (args)
+                                  (set-op-realized-label!
+                                    op (construct-label name args)))))
+                        name)))
+    op))
 
 ;; Wraps one field expression so a failure names the construct and the field.
 ;; Pre-unwind (a throw handler, not a catch) so the original stack survives for
@@ -473,18 +482,22 @@ folds the op (or list of ops) it returns.  A thin naming of the kernel's
            (if value?
                ;; A value construct evaluates where it is written.
                #`(#,impl #,@pos #,@field-forms #,extra-form)
-               ;; Everything else becomes an op: head args eagerly (they make
-               ;; the label), fields inside the fold-time thunk.
+               ;; Everything else becomes an op: head args AND fields evaluate
+               ;; inside the fold-time thunk, so a name can be read from state.
+               ;; The heads are bound first (once) and reported as the op's
+               ;; realized label before the fields run.
                ;; `impl' is an identifier, so it is a valid datum->syntax
                ;; context (the whole call `s' is a list, and would not wrap).
                (let ((pos-ids (map (lambda (i)
                                      (datum->syntax impl (string->symbol
                                                            (format #f "%hx-pos~a" i))))
-                                   (iota (length pos)))))
-                 #`(let #,(map (lambda (id p) #`(#,id #,p)) pos-ids pos)
-                     (construct-op
-                       (construct-label #,(symbol->string name) (list #,@pos-ids))
-                       '#,(datum->syntax impl (syntax->datum s))
-                       (lambda ()
+                                   (iota (length pos))))
+                     (label-id (datum->syntax impl '%hx-label!)))
+                 #`(construct-op
+                     #,(symbol->string name)
+                     '#,(datum->syntax impl (syntax->datum s))
+                     (lambda (#,label-id)
+                       (let #,(map (lambda (id p) #`(#,id #,p)) pos-ids pos)
+                         (#,label-id (list #,@pos-ids))
                          (#,impl #,@pos-ids #,@field-forms #,extra-form))))))))))))
 

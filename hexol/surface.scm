@@ -326,22 +326,16 @@ Usable inside (when …) as a cross-cutting transform."
 
 ;; (hx-late LABEL body ...) -> ONE op, labeled LABEL, whose body is BUILT and
 ;; folded at fold time with the state bound — so `get`/`attr` work anywhere in
-;; it, including the two places field deferral cannot reach:
-;;
-;;   • a construct's positional head args, which stay eager because they name
-;;     the op before the fold:
-;;       (hx-late "vault CR"
-;;         (custom-resource (str "vault-" (get '(env))) (api "v1") (kind "Vault")))
-;;   • the schema-less `body`/`block` surface (terraform-resource,
-;;     terraform-settings/provider, the ansible `task`), which has no per-field
-;;     schema to defer:
+;; it, including the one place field deferral cannot reach: the schema-less
+;; `body`/`block` surface (terraform-resource, terraform-settings/provider, the
+;; ansible `task`), which has no per-field schema to defer:
 ;;       (hx-late "db"
 ;;         (terraform-resource "aws_db_instance" "main"
 ;;           (instance_class (get '(db class)))))
 ;;
 ;; Body slots splice and stamp like `hx-ops`, and the ops it builds show up
-;; under `hexol tree --realize` like a construct's do. LABEL is evaluated where
-;; written (it names the op before the fold, as a construct's head args do).
+;; under `hexol tree` like a construct's do. LABEL is evaluated where written:
+;; it is the op's name, printed even by `tree --no-fold`.
 (define-syntax hx-late
   (syntax-rules ()
     ((_ label body ...)

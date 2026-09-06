@@ -12,9 +12,8 @@
 ;;; So `secret-ref` bakes a cheap `<secret-ref>` marker into the resource, and
 ;;; `resolve-secret-refs` (last in the inventory) walks the resolved state
 ;;; swapping each marker for plaintext. It runs only inside `resolve`, so
-;;; `tree`/`ops` stay sops-free — with the two flags that explicitly ask for a
-;;; fold as the exception: `tree --realize` and `tree -v` resolve, and
-;;; therefore decrypt, like `render` does.
+;;; `ops` and `tree --no-fold` stay sops-free; a plain `tree` folds once, and
+;;; therefore decrypts, like `render` does.
 ;;;
 ;;; One shared envelope: the whole store is ONE sops document — a single
 ;;; age-encrypted data key and one MAC cover every secret, so each added
@@ -353,8 +352,8 @@ ciphertext (keyed by id or path), decrypts the store once, and substitutes the
 plaintext.  Place it last in the inventory — it must run after the resources
 that reference secrets.  A no-op when `secret-resolution-disabled' is set (so
 the secret tooling can read the marker layout), and sops-free for a plain
-`tree'/`ops' since it only fires during `resolve' (which `tree --realize' and
-`tree -v' do run)."
+`ops' / `tree --no-fold' since it only fires during `resolve' (which a plain
+`tree' does run)."
   (make-op 'resolve-secret-refs '(resolve-secret-refs)
     (lambda (state)
       (if (secret-resolution-disabled)
